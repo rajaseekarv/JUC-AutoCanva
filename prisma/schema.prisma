@@ -1,0 +1,114 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  code      String   @unique
+  status    String   @default("ACTIVE")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branches  Branch[]
+  users     User[]
+  campaigns Campaign[]
+
+  @@map("organizations")
+}
+
+model Branch {
+  id             String       @id @default(cuid())
+  organizationId String
+  name           String
+  code           String
+  address        String?
+  city           String?
+  state          String?
+  pincode        String?
+  phone          String?
+  whatsapp       String?
+  email          String?
+  googleMapsUrl  String?
+  timezone       String        @default("Asia/Kolkata")
+  status         String        @default("ACTIVE")
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  users        UserBranchAccess[]
+  campaigns    CampaignBranch[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@map("branches")
+}
+
+model User {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  email          String   @unique
+  status         String   @default("ACTIVE")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchAccess UserBranchAccess[]
+
+  @@index([organizationId])
+  @@map("users")
+}
+
+model UserBranchAccess {
+  userId   String
+  branchId String
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@id([userId, branchId])
+  @@map("user_branch_access")
+}
+
+model Campaign {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  campaignType   String   @default("CENTRAL")
+  status         String   @default("DRAFT")
+  startDate      DateTime?
+  endDate        DateTime?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branches     CampaignBranch[]
+
+  @@index([organizationId])
+  @@map("campaigns")
+}
+
+model CampaignBranch {
+  id         String   @id @default(cuid())
+  campaignId String
+  branchId   String
+  status     String   @default("ASSIGNED")
+  customData Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  branch   Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, branchId])
+  @@index([branchId])
+  @@map("campaign_branches")
+}
