@@ -15,15 +15,149 @@ model Organization {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  branches  Branch[]
-  users     User[]
-  campaigns Campaign[]
+  branches           Branch[]
+  users              User[]
+  campaigns          Campaign[]
+  roles              Role[]
+  brandProfile       BrandProfile?
+  assets             Asset[]
+  templates          Template[]
+  creatives          Creative[]
+  workflows          Workflow[]
+  workflowInstances  WorkflowInstance[]
+  approvalDecisions  ApprovalDecision[]
+  changeRequests     ChangeRequest[]
+  creativeComments   CreativeComment[]
+  auditLogs          AuditLog[]
+  notifications      InAppNotification[]
+  canvaConnection    CanvaConnection?
+  canvaJobs          CanvaJob[]
+  canvaOAuthAttempts CanvaOAuthAttempt[]
 
   @@map("organizations")
 }
 
+enum TemplateStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum TemplateUnit {
+  PX
+  MM
+  CM
+  IN
+}
+
+enum TemplateFieldType {
+  TEXT
+  MULTILINE_TEXT
+  IMAGE
+  LOGO
+  PHONE
+  URL
+  DATE
+  NUMBER
+  BOOLEAN
+  COLOR
+}
+
+enum TemplateDataSource {
+  ORGANIZATION_BRAND
+  EFFECTIVE_BRAND
+  BRANCH
+  CUSTOM
+}
+
+enum ReviewDecisionType {
+  APPROVED
+  CHANGES_REQUESTED
+}
+
+enum ChangeRequestStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CANCELLED
+}
+
+model Template {
+  id                   String         @id @default(cuid())
+  organizationId       String
+  name                 String
+  code                 String
+  description          String?
+  category             String?
+  status               TemplateStatus @default(DRAFT)
+  formatName           String
+  width                Int
+  height               Int
+  unit                 TemplateUnit   @default(PX)
+  currentVersionNumber Int            @default(1)
+  activeVersionNumber  Int?
+  createdById          String
+  updatedById          String
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  versions     TemplateVersion[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId, status, updatedAt])
+  @@map("templates")
+}
+
+model TemplateVersion {
+  id            String       @id @default(cuid())
+  templateId    String
+  versionNumber Int
+  name          String
+  description   String?
+  category      String?
+  formatName    String
+  width         Int
+  height        Int
+  unit          TemplateUnit @default(PX)
+  immutableAt   DateTime?
+  createdById   String
+  createdAt     DateTime     @default(now())
+
+  template          Template           @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  fields            TemplateField[]
+  creativeRevisions CreativeRevision[]
+
+  @@unique([templateId, versionNumber])
+  @@index([templateId, versionNumber])
+  @@map("template_versions")
+}
+
+model TemplateField {
+  id              String              @id @default(cuid())
+  versionId       String
+  key             String
+  label           String
+  type            TemplateFieldType
+  required        Boolean             @default(false)
+  defaultValue    Json?
+  validationRules Json?
+  helpText        String?
+  displayOrder    Int                 @default(0)
+  dataSource      TemplateDataSource?
+  sourceKey       String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  version TemplateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  @@unique([versionId, key])
+  @@index([versionId, displayOrder])
+  @@map("template_fields")
+}
+
 model Branch {
-  id             String       @id @default(cuid())
+  id             String   @id @default(cuid())
   organizationId String
   name           String
   code           String
@@ -35,18 +169,92 @@ model Branch {
   whatsapp       String?
   email          String?
   googleMapsUrl  String?
-  timezone       String        @default("Asia/Kolkata")
-  status         String        @default("ACTIVE")
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  timezone       String   @default("Asia/Kolkata")
+  status         String   @default("ACTIVE")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  users        UserBranchAccess[]
-  campaigns    CampaignBranch[]
+  organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  users             UserBranchAccess[]
+  canvaJobs         CanvaJob[]
+  campaigns         CampaignBranch[]
+  creatives         Creative[]
+  workflowInstances WorkflowInstance[]
+  approvalDecisions ApprovalDecision[]
+  changeRequests    ChangeRequest[]
+  creativeComments  CreativeComment[]
+  brandOverride     BranchBrandOverride?
+  assets            Asset[]
 
   @@unique([organizationId, code])
   @@index([organizationId])
   @@map("branches")
+}
+
+model BrandProfile {
+  id             String   @id @default(cuid())
+  organizationId String   @unique
+  displayName    String?
+  primaryColor   String?
+  secondaryColor String?
+  accentColor    String?
+  fontFamily     String?
+  websiteUrl     String?
+  logoAssetId    String?  @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  logoAsset    Asset?       @relation("OrganizationBrandLogo", fields: [logoAssetId], references: [id], onDelete: SetNull)
+
+  @@map("brand_profiles")
+}
+
+model BranchBrandOverride {
+  id             String   @id @default(cuid())
+  branchId       String   @unique
+  displayName    String?
+  primaryColor   String?
+  secondaryColor String?
+  accentColor    String?
+  fontFamily     String?
+  websiteUrl     String?
+  logoAssetId    String?  @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  branch    Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  logoAsset Asset? @relation("BranchBrandLogo", fields: [logoAssetId], references: [id], onDelete: SetNull)
+
+  @@map("branch_brand_overrides")
+}
+
+model Asset {
+  id             String    @id @default(cuid())
+  organizationId String
+  branchId       String?
+  uploadedById   String
+  originalName   String
+  storageKey     String    @unique
+  mimeType       String
+  sizeBytes      Int
+  width          Int?
+  height         Int?
+  checksumSha256 String
+  status         String    @default("ACTIVE")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organization     Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch           Branch?              @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  uploadedBy       User                 @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+  organizationLogo BrandProfile?        @relation("OrganizationBrandLogo")
+  branchLogo       BranchBrandOverride? @relation("BranchBrandLogo")
+
+  @@index([organizationId, status, createdAt])
+  @@index([branchId, status, createdAt])
+  @@map("assets")
 }
 
 model User {
@@ -54,15 +262,106 @@ model User {
   organizationId String
   name           String
   email          String   @unique
+  passwordHash   String?
   status         String   @default("ACTIVE")
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  branchAccess UserBranchAccess[]
+  organization            Organization                @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchAccess            UserBranchAccess[]
+  roleAssignments         UserRole[]
+  authSessions            AuthSession[]
+  uploadedAssets          Asset[]
+  createdWorkflows        Workflow[]                  @relation("WorkflowCreator")
+  assignedWorkflowTasks   WorkflowTask[]              @relation("WorkflowTaskAssignee")
+  workflowHistory         WorkflowTransitionHistory[]
+  reviewDecisions         ApprovalDecision[]          @relation("ApprovalReviewer")
+  createdChangeRequests   ChangeRequest[]             @relation("ChangeRequestCreator")
+  resolvedChangeRequests  ChangeRequest[]             @relation("ChangeRequestResolver")
+  cancelledChangeRequests ChangeRequest[]             @relation("ChangeRequestCanceller")
+  startedChangeRequests   ChangeRequest[]             @relation("ChangeRequestStarter")
+  creativeComments        CreativeComment[]           @relation("CreativeCommentAuthor")
+  completedWorkflowTasks  WorkflowTask[]              @relation("WorkflowTaskCompleter")
+  notifications           InAppNotification[]
+  canvaOAuthAttempts      CanvaOAuthAttempt[]
+  canvaCandidates         CanvaConnectionCandidate[]
+  canvaCredentials        CanvaCredential[]
 
+  // Target of composite foreign keys that pin Canva OAuth rows to the
+  // user's own organization. Trivially satisfied: id is already unique.
+  @@unique([id, organizationId])
   @@index([organizationId])
   @@map("users")
+}
+
+model Role {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  users        UserRole[]
+  permissions  RolePermission[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model UserRole {
+  userId String
+  roleId String
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model AuthSession {
+  id        String    @id @default(cuid())
+  userId    String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user               User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  canvaOAuthAttempts CanvaOAuthAttempt[]
+  canvaCandidates    CanvaConnectionCandidate[]
+
+  // Target of composite foreign keys that pin Canva OAuth rows to the
+  // session's own user. Trivially satisfied: id is already unique.
+  @@unique([id, userId])
+  @@index([userId, expiresAt])
+  @@map("auth_sessions")
 }
 
 model UserBranchAccess {
@@ -77,20 +376,21 @@ model UserBranchAccess {
 }
 
 model Campaign {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   organizationId String
   name           String
   description    String?
-  campaignType   String   @default("CENTRAL")
-  status         String   @default("DRAFT")
+  campaignType   String    @default("CENTRAL")
+  status         String    @default("DRAFT")
   startDate      DateTime?
   endDate        DateTime?
   createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   branches     CampaignBranch[]
+  creatives    Creative[]
 
   @@index([organizationId])
   @@map("campaigns")
@@ -111,4 +411,608 @@ model CampaignBranch {
   @@unique([campaignId, branchId])
   @@index([branchId])
   @@map("campaign_branches")
+}
+
+model Creative {
+  id                String   @id @default(cuid())
+  organizationId    String
+  branchId          String
+  campaignId        String?
+  name              String
+  status            String   @default("DRAFT")
+  currentRevisionId String?
+  createdById       String
+  updatedById       String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch            Branch             @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  campaign          Campaign?          @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  revisions         CreativeRevision[] @relation("CreativeRevisionHistory")
+  workflowInstances WorkflowInstance[]
+  approvalDecisions ApprovalDecision[]
+  changeRequests    ChangeRequest[]
+  comments          CreativeComment[]
+  currentRevision   CreativeRevision?  @relation("CreativeCurrentRevision", fields: [id, currentRevisionId], references: [creativeId, id], onDelete: Restrict)
+  canvaJobs         CanvaJob[]
+
+  @@unique([id, currentRevisionId])
+  @@index([organizationId, branchId, updatedAt])
+  @@index([campaignId, branchId])
+  @@map("creatives")
+}
+
+model CreativeRevision {
+  id                String   @id @default(cuid())
+  creativeId        String
+  revisionNumber    Int
+  templateVersionId String
+  values            Json
+  summary           String?
+  createdById       String
+  createdAt         DateTime @default(now())
+
+  creative          Creative           @relation("CreativeRevisionHistory", fields: [creativeId], references: [id], onDelete: Cascade)
+  templateVersion   TemplateVersion    @relation(fields: [templateVersionId], references: [id], onDelete: Restrict)
+  currentFor        Creative?          @relation("CreativeCurrentRevision")
+  workflowInstances WorkflowInstance[]
+  approvalDecisions ApprovalDecision[]
+  changeRequests    ChangeRequest[]
+  comments          CreativeComment[]
+  canvaJobs         CanvaJob[]
+
+  @@unique([creativeId, revisionNumber])
+  @@unique([creativeId, id])
+  @@index([templateVersionId])
+  @@map("creative_revisions")
+}
+
+model Workflow {
+  id                   String   @id @default(cuid())
+  organizationId       String
+  name                 String
+  description          String?
+  status               String   @default("DRAFT")
+  currentVersionNumber Int      @default(1)
+  enabledVersionNumber Int?
+  createdById          String
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User               @relation("WorkflowCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  versions     WorkflowVersion[]
+  instances    WorkflowInstance[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, status, updatedAt])
+  @@map("workflows")
+}
+
+model WorkflowVersion {
+  id            String    @id @default(cuid())
+  workflowId    String
+  versionNumber Int
+  immutableAt   DateTime?
+  createdById   String
+  createdAt     DateTime  @default(now())
+
+  workflow    Workflow                    @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  stages      WorkflowStage[]
+  transitions WorkflowTransition[]
+  instances   WorkflowInstance[]
+  history     WorkflowTransitionHistory[]
+
+  @@unique([workflowId, versionNumber])
+  @@index([workflowId, versionNumber])
+  @@map("workflow_versions")
+}
+
+model WorkflowStage {
+  id                 String   @id @default(cuid())
+  versionId          String
+  key                String
+  name               String
+  displayOrder       Int
+  isEntry            Boolean  @default(false)
+  isTerminal         Boolean  @default(false)
+  requiredPermission String?
+  assignedUserId     String?
+  assignedPermission String?
+  requiresReview     Boolean  @default(false)
+  createdAt          DateTime @default(now())
+
+  version     WorkflowVersion             @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  outgoing    WorkflowTransition[]        @relation("WorkflowTransitionSource")
+  incoming    WorkflowTransition[]        @relation("WorkflowTransitionDestination")
+  instances   WorkflowInstance[]
+  tasks       WorkflowTask[]
+  historyFrom WorkflowTransitionHistory[] @relation("WorkflowHistoryFrom")
+  historyTo   WorkflowTransitionHistory[] @relation("WorkflowHistoryTo")
+
+  @@unique([versionId, key])
+  @@unique([versionId, displayOrder])
+  @@index([versionId, displayOrder])
+  @@map("workflow_stages")
+}
+
+model WorkflowTransition {
+  id                 String              @id @default(cuid())
+  versionId          String
+  key                String
+  label              String
+  sourceStageId      String
+  destinationStageId String
+  requiredPermission String?
+  reviewDecision     ReviewDecisionType?
+  createdAt          DateTime            @default(now())
+
+  version     WorkflowVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  sourceStage WorkflowStage   @relation("WorkflowTransitionSource", fields: [sourceStageId], references: [id], onDelete: Cascade)
+  destination WorkflowStage   @relation("WorkflowTransitionDestination", fields: [destinationStageId], references: [id], onDelete: Cascade)
+
+  @@unique([versionId, key])
+  @@index([versionId, sourceStageId])
+  @@map("workflow_transitions")
+}
+
+model WorkflowInstance {
+  id                 String    @id @default(cuid())
+  organizationId     String
+  branchId           String
+  creativeId         String
+  creativeRevisionId String
+  workflowId         String
+  workflowVersionId  String
+  currentStageId     String
+  status             String    @default("RUNNING")
+  startedById        String
+  startedAt          DateTime  @default(now())
+  completedAt        DateTime?
+  updatedAt          DateTime  @updatedAt
+
+  organization      Organization                @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch            Branch                      @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  creative          Creative                    @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+  revision          CreativeRevision            @relation(fields: [creativeRevisionId], references: [id], onDelete: Restrict)
+  workflow          Workflow                    @relation(fields: [workflowId], references: [id], onDelete: Restrict)
+  version           WorkflowVersion             @relation(fields: [workflowVersionId], references: [id], onDelete: Restrict)
+  currentStage      WorkflowStage               @relation(fields: [currentStageId], references: [id], onDelete: Restrict)
+  tasks             WorkflowTask[]
+  history           WorkflowTransitionHistory[]
+  approvalDecisions ApprovalDecision[]
+  changeRequests    ChangeRequest[]
+
+  @@unique([id, creativeId])
+  @@index([organizationId, branchId, status, updatedAt])
+  @@index([creativeId, status])
+  @@map("workflow_instances")
+}
+
+model WorkflowTask {
+  id                 String    @id @default(cuid())
+  instanceId         String
+  stageId            String
+  assignedUserId     String?
+  requiredPermission String?
+  status             String    @default("OPEN")
+  completedAt        DateTime?
+  completedById      String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  instance       WorkflowInstance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  stage          WorkflowStage     @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  assignedUser   User?             @relation("WorkflowTaskAssignee", fields: [assignedUserId], references: [id], onDelete: Restrict)
+  completedBy    User?             @relation("WorkflowTaskCompleter", fields: [completedById], references: [id], onDelete: Restrict)
+  decision       ApprovalDecision?
+  changeRequests ChangeRequest[]
+
+  @@unique([id, instanceId])
+  @@index([assignedUserId, status, createdAt])
+  @@index([instanceId, status])
+  @@map("workflow_tasks")
+}
+
+model ApprovalDecision {
+  id                 String             @id @default(cuid())
+  organizationId     String
+  branchId           String
+  creativeId         String
+  creativeRevisionId String
+  revisionNumber     Int
+  workflowInstanceId String
+  workflowTaskId     String
+  reviewerId         String
+  decision           ReviewDecisionType
+  reason             String?
+  createdAt          DateTime           @default(now())
+
+  organization  Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch        Branch           @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  creative      Creative         @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+  revision      CreativeRevision @relation(fields: [creativeId, creativeRevisionId], references: [creativeId, id], onDelete: Restrict)
+  instance      WorkflowInstance @relation(fields: [workflowInstanceId, creativeId], references: [id, creativeId], onDelete: Cascade)
+  task          WorkflowTask     @relation(fields: [workflowTaskId, workflowInstanceId], references: [id, instanceId], onDelete: Cascade)
+  reviewer      User             @relation("ApprovalReviewer", fields: [reviewerId], references: [id], onDelete: Restrict)
+  changeRequest ChangeRequest?
+
+  @@unique([workflowTaskId, workflowInstanceId])
+  @@index([organizationId, branchId, creativeId, createdAt])
+  @@index([workflowInstanceId, createdAt])
+  @@map("approval_decisions")
+}
+
+model ChangeRequest {
+  id                    String              @id @default(cuid())
+  organizationId        String
+  branchId              String
+  creativeId            String
+  creativeRevisionId    String
+  revisionNumber        Int
+  workflowInstanceId    String
+  workflowTaskId        String
+  originatingDecisionId String?             @unique
+  requestedChanges      String
+  explanation           String?
+  status                ChangeRequestStatus @default(OPEN)
+  createdById           String
+  createdAt             DateTime            @default(now())
+  startedById           String?
+  startedAt             DateTime?
+  resolvedById          String?
+  resolvedAt            DateTime?
+  cancelledById         String?
+  cancelledAt           DateTime?
+
+  organization        Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch              Branch            @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  creative            Creative          @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+  revision            CreativeRevision  @relation(fields: [creativeId, creativeRevisionId], references: [creativeId, id], onDelete: Restrict)
+  instance            WorkflowInstance  @relation(fields: [workflowInstanceId, creativeId], references: [id, creativeId], onDelete: Cascade)
+  task                WorkflowTask      @relation(fields: [workflowTaskId, workflowInstanceId], references: [id, instanceId], onDelete: Cascade)
+  originatingDecision ApprovalDecision? @relation(fields: [originatingDecisionId], references: [id], onDelete: SetNull)
+  creator             User              @relation("ChangeRequestCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  starter             User?             @relation("ChangeRequestStarter", fields: [startedById], references: [id], onDelete: Restrict)
+  resolver            User?             @relation("ChangeRequestResolver", fields: [resolvedById], references: [id], onDelete: Restrict)
+  canceller           User?             @relation("ChangeRequestCanceller", fields: [cancelledById], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, branchId, creativeId, status, createdAt])
+  @@index([workflowInstanceId, workflowTaskId])
+  @@map("change_requests")
+}
+
+model CreativeComment {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  branchId           String
+  creativeId         String
+  creativeRevisionId String
+  parentId           String?
+  authorId           String
+  text               String
+  createdAt          DateTime @default(now())
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch       Branch            @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  creative     Creative          @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+  revision     CreativeRevision  @relation(fields: [creativeId, creativeRevisionId], references: [creativeId, id], onDelete: Restrict)
+  parent       CreativeComment?  @relation("CommentThread", fields: [parentId, creativeId, creativeRevisionId], references: [id, creativeId, creativeRevisionId], onDelete: Restrict)
+  replies      CreativeComment[] @relation("CommentThread")
+  author       User              @relation("CreativeCommentAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+
+  @@unique([id, creativeId, creativeRevisionId])
+  @@index([organizationId, branchId, creativeId, creativeRevisionId, createdAt])
+  @@index([parentId, createdAt])
+  @@map("creative_comments")
+}
+
+model WorkflowTransitionHistory {
+  id          String   @id @default(cuid())
+  instanceId  String
+  versionId   String
+  fromStageId String?
+  toStageId   String
+  actorId     String
+  actionKey   String
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  instance  WorkflowInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  version   WorkflowVersion  @relation(fields: [versionId], references: [id], onDelete: Restrict)
+  fromStage WorkflowStage?   @relation("WorkflowHistoryFrom", fields: [fromStageId], references: [id], onDelete: Restrict)
+  toStage   WorkflowStage    @relation("WorkflowHistoryTo", fields: [toStageId], references: [id], onDelete: Restrict)
+  actor     User             @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([instanceId, createdAt])
+  @@map("workflow_transition_history")
+}
+
+// Audit rows intentionally retain scalar identifiers instead of cascading
+// business/user foreign keys, so deleting a business record cannot erase history.
+model AuditLog {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  actorUserId        String?
+  action             String
+  entityType         String
+  entityId           String
+  branchId           String?
+  creativeId         String?
+  creativeRevisionId String?
+  workflowInstanceId String?
+  changeRequestId    String?
+  metadata           Json
+  createdAt          DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, createdAt, id])
+  @@index([organizationId, branchId, createdAt, id])
+  @@index([organizationId, actorUserId, createdAt])
+  @@index([organizationId, action, createdAt])
+  @@index([organizationId, entityType, entityId, createdAt])
+  @@map("audit_logs")
+}
+
+model InAppNotification {
+  id                 String    @id @default(cuid())
+  recipientUserId    String
+  organizationId     String
+  eventKey           String
+  type               String
+  title              String
+  message            String
+  entityType         String
+  entityId           String
+  branchId           String?
+  creativeId         String?
+  creativeRevisionId String?
+  workflowInstanceId String?
+  changeRequestId    String?
+  createdAt          DateTime  @default(now())
+  readAt             DateTime?
+
+  recipient    User         @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@unique([recipientUserId, eventKey])
+  @@index([recipientUserId, organizationId, createdAt, id])
+  @@index([recipientUserId, readAt, createdAt])
+  @@index([organizationId, branchId, createdAt])
+  @@map("in_app_notifications")
+}
+
+enum CanvaConnectionStatus {
+  CONNECTED
+  DISCONNECTED
+  REAUTHORIZATION_REQUIRED
+}
+
+enum CanvaJobStatus {
+  QUEUED
+  PROCESSING
+  SUCCEEDED
+  FAILED
+}
+
+model CanvaConnection {
+  id             String                @id @default(cuid())
+  organizationId String                @unique
+  status         CanvaConnectionStatus @default(DISCONNECTED)
+  mode           String                @default("MOCK")
+  connectedById  String?
+  connectedAt    DateTime?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  // Real Canva OAuth (docs/integrations/canva-oauth-persistence-proposal.md).
+  // credentialVersion advances on every credential write; generation only on
+  // activation, disconnect, and reauthorization marks.
+  credentialVersion         Int       @default(0)
+  connectionGeneration      Int       @default(0)
+  // invalid_grant | undecryptable | rotation_lost | identity_mismatch
+  reauthorizationReason     String?
+  reauthorizationRequiredAt DateTime?
+  // configuration
+  lastProviderErrorKind     String?
+  lastProviderErrorAt       DateTime?
+
+  organization       Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  credential         CanvaCredential?
+  candidate          CanvaConnectionCandidate?
+  pendingRevocations CanvaPendingRevocation[]
+
+  @@map("canva_connections")
+}
+
+// One OAuth attempt. Created at authorize with only a one-time launch token
+// hash; the state hash, browser-binding hash, and sealed PKCE verifier are
+// set at launch. Raw state, launch token, and verifier are never stored.
+model CanvaOAuthAttempt {
+  id                     String    @id @default(cuid())
+  launchTokenHash        String    @unique
+  stateHash              String?   @unique
+  browserBindingHash     String?
+  organizationId         String
+  userId                 String
+  sessionId              String
+  baseGeneration         Int
+  codeVerifierKeyVersion Int?
+  codeVerifierIv         String?
+  codeVerifierCiphertext String?
+  codeVerifierTag        String?
+  redirectUri            String
+  createdAt              DateTime  @default(now())
+  launchExpiresAt        DateTime
+  launchedAt             DateTime?
+  expiresAt              DateTime?
+  consumedAt             DateTime?
+
+  organization Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  user         User                      @relation(fields: [userId, organizationId], references: [id, organizationId], onDelete: Cascade, onUpdate: Restrict)
+  session      AuthSession               @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Restrict)
+  candidate    CanvaConnectionCandidate?
+
+  @@index([organizationId, launchExpiresAt])
+  @@index([organizationId, expiresAt])
+  @@map("canva_oauth_attempts")
+}
+
+// A grant awaiting administrator confirmation. Exists only while pending.
+model CanvaConnectionCandidate {
+  id                     String   @id @default(cuid())
+  organizationId         String   @unique
+  attemptId              String   @unique
+  userId                 String
+  sessionId              String
+  baseGeneration         Int
+  chainId                String   @unique
+  writeId                String   @unique
+  keyVersion             Int
+  accessTokenIv          String
+  accessTokenCiphertext  String
+  accessTokenTag         String
+  refreshTokenIv         String
+  refreshTokenCiphertext String
+  refreshTokenTag        String
+  accessTokenExpiresAt   DateTime
+  // Empty: Canva did not report granted scopes.
+  scopes                 String[]
+  canvaUserId            String   @unique
+  canvaTeamId            String
+  // Sanitized; never logged or audited.
+  canvaDisplayName       String?
+  hasAutofill            Boolean
+  hasBrandTemplates      Boolean
+  createdAt              DateTime @default(now())
+  expiresAt              DateTime
+
+  connection CanvaConnection   @relation(fields: [organizationId], references: [organizationId], onDelete: Cascade, onUpdate: Restrict)
+  account    CanvaAccount      @relation(fields: [canvaUserId, organizationId], references: [canvaUserId, organizationId], onDelete: Restrict, onUpdate: Restrict)
+  attempt    CanvaOAuthAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  user       User              @relation(fields: [userId, organizationId], references: [id, organizationId], onDelete: Cascade, onUpdate: Restrict)
+  session    AuthSession       @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Restrict)
+
+  @@map("canva_connection_candidates")
+}
+
+// The active grant. Access and refresh tokens are sealed separately.
+model CanvaCredential {
+  id                     String    @id @default(cuid())
+  organizationId         String    @unique
+  connectedById          String
+  chainId                String    @unique
+  writeId                String
+  version                Int
+  keyVersion             Int
+  accessTokenIv          String
+  accessTokenCiphertext  String
+  accessTokenTag         String
+  refreshTokenIv         String
+  refreshTokenCiphertext String
+  refreshTokenTag        String
+  accessTokenExpiresAt   DateTime
+  scopes                 String[]
+  canvaUserId            String    @unique
+  canvaTeamId            String
+  refreshLeaseOwner      String?
+  refreshLeaseUntil      DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  connection  CanvaConnection @relation(fields: [organizationId], references: [organizationId], onDelete: Cascade, onUpdate: Restrict)
+  account     CanvaAccount    @relation(fields: [canvaUserId, organizationId], references: [canvaUserId, organizationId], onDelete: Restrict, onUpdate: Restrict)
+  connectedBy User            @relation(fields: [connectedById, organizationId], references: [id, organizationId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([keyVersion])
+  @@map("canva_credentials")
+}
+
+// Durable revocation queue. Only the worker sends revocations, and only
+// after the same-user guard under the Canva user's account lock.
+model CanvaPendingRevocation {
+  id                     String    @id @default(cuid())
+  organizationId         String
+  chainId                String
+  canvaUserId            String
+  // disconnect | replaced_other_user | candidate_rejected | candidate_expired |
+  // candidate_superseded | connect_conflict | connect_failed |
+  // connect_ineligible | orphaned_rotation
+  reason                 String
+  // queued | in_flight | exhausted | finished
+  state                  String    @default("queued")
+  keyVersion             Int?
+  refreshTokenIv         String?
+  refreshTokenCiphertext String?
+  refreshTokenTag        String?
+  attempts               Int       @default(0)
+  nextAttemptAt          DateTime  @default(now())
+  claimToken             String?
+  claimedUntil           DateTime?
+  callStartedAt          DateTime?
+  // Only ever increases; see the possible-effect window in the proposal.
+  possibleEffectUntil    DateTime?
+  // revoked | not_revocable | skipped_shared_consent | undecryptable |
+  // dismissed | abandoned
+  outcome                String?
+  lastErrorKind          String?
+  createdAt              DateTime  @default(now())
+  finishedAt             DateTime?
+
+  connection CanvaConnection @relation(fields: [organizationId], references: [organizationId], onDelete: Cascade, onUpdate: Restrict)
+  account    CanvaAccount    @relation(fields: [canvaUserId], references: [canvaUserId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([chainId, reason])
+  @@index([state, nextAttemptAt])
+  @@index([canvaUserId, state])
+  @@index([organizationId, finishedAt])
+  @@map("canva_pending_revocations")
+}
+
+// One row per Canva user AdFlow has seen: the ownership record (the only
+// organization that may hold this user's credential or candidate; NULL when
+// unheld) and the lock that serializes every decision about the user.
+model CanvaAccount {
+  canvaUserId    String   @id
+  organizationId String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  credentials CanvaCredential[]
+  candidates  CanvaConnectionCandidate[]
+  revocations CanvaPendingRevocation[]
+
+  @@unique([canvaUserId, organizationId])
+  @@index([organizationId])
+  @@map("canva_accounts")
+}
+
+model CanvaJob {
+  id                 String         @id @default(cuid())
+  organizationId     String
+  branchId           String
+  creativeId         String
+  creativeRevisionId String
+  idempotencyKey     String
+  status             CanvaJobStatus @default(QUEUED)
+  mode               String         @default("MOCK")
+  externalDesignId   String?
+  errorCode          String?
+  errorMessage       String?
+  createdById        String
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  organization     Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branch           Branch           @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  creative         Creative         @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+  creativeRevision CreativeRevision @relation(fields: [creativeRevisionId], references: [id], onDelete: Restrict)
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, branchId, createdAt])
+  @@index([creativeId, creativeRevisionId])
+  @@map("canva_jobs")
 }
