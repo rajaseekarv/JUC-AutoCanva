@@ -1,0 +1,14 @@
+# Store and check out text files with LF on every platform, overriding a
+# local core.autocrlf. Committed content is already LF; this only stops
+# Windows checkouts from drifting to CRLF.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
