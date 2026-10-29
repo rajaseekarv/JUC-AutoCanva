@@ -30,61 +30,84 @@ Plan update: this stage extends the Sprint 9 boundary only as far as preparing r
 
 ## Canva OAuth Stages 2 and 2.1 (real Canva still disabled)
 
-Plan update, at the user's explicit direction: these stages implement durable OAuth storage (schema and migration files, not applied), administrator confirmation in the web app, the durable revocation queue and worker, the key reseal job, and an operator command (`pnpm --filter @adflow/api canva:ops`), all fail-closed. Mock mode stays the default; real mode, durable storage, and the worker are each disabled by configuration; no live Canva request has been made and no migration has been applied. Everything is covered by mocked tests only; the PostgreSQL gates are written but have not been run. See `docs/integrations/canva.md`.
+Plan update, at the user's explicit direction: these stages implement durable OAuth storage (schema and migration files, not applied), administrator confirmation in the web app, the durable revocation queue and worker, the key reseal job, and an operator command (`pnpm --filter @adflow/api canva:ops`), all fail-closed. Mock mode stays the default; real mode, durable storage, and the worker are each disabled by configuration; no live Canva request has been made, and the two Canva OAuth migrations have not been applied to any development, shared, or production database.
+
+PostgreSQL evidence: all 27 PostgreSQL gates passed on an isolated, disposable PostgreSQL 18.6 cluster in Stage 2.5 (2026-10-28), which applied the migrations only to throwaway gate schemas. Stage 2.9 reran batches 3 and 6 (20 gates) on a new isolated 18.6 cluster after the Stage 2.8 changes, and all passed; the other batches were not rerun. Results and limits are in `docs/integrations/canva-postgresql-gate-runbook.md` (§11–§13). Everything else is covered by mocked tests. Real Canva remains disabled: the scheduler, monitoring, Canva app registration, and an eligible-account consent test are still outstanding (`docs/integrations/canva.md`, "Remaining steps before real use").
 
 ## Prerequisites
 
 Sprint 9 adds a mock-only Canva integration foundation. It does not connect to Canva or create real designs; see `docs/integrations/canva.md` before planning real OAuth or Autofill work. No Canva credentials are needed for local use.
 
 - Node.js 24.21.0 (see `.nvmrc`)
-- pnpm 11.19.0 (pinned by `packageManager` in `package.json`)
+- pnpm 11.19.0 (pinned by `packageManager` in `package.json`). Run `corepack enable` once so `pnpm` is on `PATH`; the root `dev`, `build`, `typecheck`, `typecheck:api-tests`, and `test` scripts call `pnpm` themselves and fail when it is reachable only as `corepack pnpm`.
 - Docker Compose
 
-## Local setup
+## Local setup (mock mode)
 
-1. Install dependencies:
+Canva stays in mock mode throughout: leave `CANVA_PROVIDER_MODE` unset or `mock`, and leave `CANVA_OAUTH_PERSISTENCE_ENABLED` and `CANVA_REVOCATION_WORKER_ENABLED` unset or `false`. No Canva credentials are needed.
 
-   ```sh
-   pnpm install
-   ```
+The phases are separate on purpose. Phases 1 and 2 touch no database. Phases 4 and 5 change whichever database `DATABASE_URL` names, so check it first.
 
-2. Create the local environment file:
+### 1. Install and configure (no services)
 
-   ```sh
-   cp .env.example .env
-   ```
+```sh
+pnpm install --frozen-lockfile
+cp .env.example .env
+```
 
-   On Windows PowerShell use `Copy-Item .env.example .env`.
+On Windows PowerShell use `Copy-Item .env.example .env`. In the ignored `.env`, set `JWT_ACCESS_SECRET` to a random value of at least 32 characters, and `SEED_ADMIN_PASSWORD` and `SEED_BRANCH_USER_PASSWORD` to local-only passwords of at least 12 characters. Never commit `.env`.
 
-3. Start PostgreSQL and Redis:
+### 2. Offline checks (no database, Redis, or Canva)
 
-   ```sh
-   docker compose up -d postgres redis
-   ```
+```sh
+pnpm db:generate     # writes the Prisma client into node_modules; no connection
+pnpm db:validate     # schema check; no connection
+pnpm lint
+pnpm format:check
+pnpm typecheck
+pnpm typecheck:api-tests
+pnpm test
+```
 
-4. Generate the Prisma client, validate the schema, and apply the checked-in migration:
+These are the checks CI runs. The API test setup replaces `DATABASE_URL` with a blocked address, so `pnpm test` never reaches a database. The PostgreSQL gates are not part of `pnpm test`; they run only against an isolated cluster as described in `docs/integrations/canva-postgresql-gate-runbook.md`.
 
-   ```sh
-   pnpm db:generate
-   pnpm db:validate
-   pnpm db:deploy
-   ```
+### 3. Start local services
 
-   Use `pnpm db:migrate` during schema development to create a new migration.
+```sh
+docker compose up -d postgres redis
+```
 
-5. Set `JWT_ACCESS_SECRET` in the ignored local `.env` to a random value of at least 32 characters. Set `SEED_ADMIN_PASSWORD` and `SEED_BRANCH_USER_PASSWORD` to local-only passwords of at least 12 characters, then seed the sample organization, two branches, users, roles, and permissions:
+The Compose credentials are for local development only. The Compose file runs PostgreSQL 16, while the PostgreSQL gate evidence was recorded on 18.6 (see the runbook, §2). Redis is required by startup validation (`REDIS_URL`) but nothing connects to it yet.
 
-   ```sh
-   pnpm db:seed
-   ```
+### 4. Apply migrations (approval required)
 
-6. Start the API and web app:
+```sh
+pnpm db:deploy       # prisma migrate deploy
+```
 
-   ```sh
-   pnpm dev
-   ```
+`pnpm db:deploy` applies **every** pending migration in `prisma/migrations` to the `DATABASE_URL` database, including the two Canva OAuth migrations (`20261027120000_canva_reauthorization_status` and `20261027120100_canva_oauth_persistence`). Prisma cannot stop before them. Under the plan in `AGENTS.md`, no migration is applied without separate explicit approval, so this is not an automatic first-run step:
 
-   Open [http://localhost:5173](http://localhost:5173). The web app calls `GET http://localhost:3000/api/v1/health` and displays API status. Sign in with `admin@example.local` or `branch@example.local` and the corresponding local passwords configured in `.env`.
+- Get approval before running it against any database, and confirm `DATABASE_URL` points at the intended one.
+- On a non-disposable database (anything holding data you need), back it up first; the Canva migrations are additive, and the procedure is in `docs/integrations/canva.md` ("Database migration").
+- Run it from a clean checkout. The repository's `.gitattributes` keeps migration files LF; files converted to CRLF by an older checkout differ byte for byte from the committed ones.
+
+`pnpm db:migrate` (`prisma migrate dev`) is for schema development only. It creates new migrations and can offer to reset (erase) a database that has drifted, so use it only on a disposable database.
+
+### 5. Seed (changes data)
+
+```sh
+pnpm db:seed
+```
+
+The seed upserts the sample organization, two branches, users, roles, and permissions. For the two seeded users (matched by the `SEED_*_EMAIL` addresses), it resets the password to the `.env` value and the name and `ACTIVE` status to fixed values. It is idempotent, but run it only against a local development database, never a shared or production one.
+
+### 6. Run the apps
+
+```sh
+pnpm dev
+```
+
+Open [http://localhost:5173](http://localhost:5173). The web app calls `GET http://localhost:3000/api/v1/health` and displays API status. Sign in with `admin@example.local` or `branch@example.local` and the corresponding local passwords configured in `.env`.
 
 Both development servers bind to loopback by default. To intentionally expose them on your LAN, set `API_HOST=0.0.0.0` in the local `.env` and start the web app with `pnpm --filter @adflow/web dev -- --host 0.0.0.0`. Ensure your network firewall allows only intended clients.
 

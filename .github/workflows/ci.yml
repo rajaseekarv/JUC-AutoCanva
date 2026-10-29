@@ -8,14 +8,16 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [feat/adflow-foundation-canva-oauth]
+    branches: [main]
 
 permissions:
   contents: read
 
+# A newer push to the same pull request cancels its older run; every push to
+# main runs to completion so each merged commit gets a result.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   checks:
@@ -29,17 +31,21 @@ jobs:
       CANVA_PROVIDER_MODE: mock
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
     steps:
+      # Each of these majors runs on Node.js 24 (Node.js 20 actions are
+      # deprecated on GitHub-hosted runners). pnpm/action-setup v6 is the first
+      # major that supports pnpm 11. setup-node v6 caches only what `cache`
+      # names, as v4 did.
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
       # Reads the pnpm version from package.json#packageManager.
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version-file: .nvmrc
           cache: pnpm
