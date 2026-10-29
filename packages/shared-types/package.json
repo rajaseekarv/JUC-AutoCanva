@@ -1,0 +1,9 @@
+{
+  "name": "@adflow/shared-types",
+  "version": "0.0.0",
+  "private": true,
+  "types": "./src/index.ts",
+  "files": [
+    "src"
+  ]
+}

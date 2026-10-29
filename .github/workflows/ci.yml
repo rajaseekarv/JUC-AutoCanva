@@ -1,0 +1,75 @@
+# Offline checks only: no deployment, release, migration, PostgreSQL gate, or
+# Canva call. The isolated PostgreSQL gates stay manual (see
+# docs/integrations/canva-postgresql-gate-runbook.md), so no ADFLOW_PG_*
+# variable is set here, and the workflow uses no secrets.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feat/adflow-foundation-canva-oauth]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, typecheck, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Harmless placeholders. Port 1 on loopback refuses connections, and the
+      # API test setup replaces DATABASE_URL with its own blocked URL.
+      DATABASE_URL: postgresql://ci-must-not-connect@127.0.0.1:1/ci_offline
+      CANVA_PROVIDER_MODE: mock
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Reads the pnpm version from package.json#packageManager.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm db:generate
+
+      - name: Validate Prisma schema
+        run: pnpm db:validate
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      - name: Typecheck API
+        run: pnpm --filter @adflow/api typecheck
+
+      - name: Typecheck API tests
+        run: pnpm --filter @adflow/api typecheck:test
+
+      - name: Typecheck web
+        run: pnpm --filter @adflow/web typecheck
+
+      - name: Test API
+        run: pnpm --filter @adflow/api test
+
+      - name: Test web
+        run: pnpm --filter @adflow/web test
