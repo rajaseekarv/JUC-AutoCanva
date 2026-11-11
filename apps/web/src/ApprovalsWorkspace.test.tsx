@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   cleanup,
   fireEvent,
@@ -8,6 +8,7 @@ import {
 } from '@testing-library/react';
 import type { AuthenticatedUserResponse } from '@adflow/shared-types';
 import ApprovalsWorkspace from './ApprovalsWorkspace';
+import { imageReply, statusReply, stubObjectUrls } from './assetTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -192,5 +193,174 @@ describe('ApprovalsWorkspace', () => {
         expect.objectContaining({ method: 'POST' }),
       ),
     );
+  });
+});
+
+describe('ApprovalsWorkspace images', () => {
+  let objectUrls: ReturnType<typeof stubObjectUrls>;
+  beforeEach(() => {
+    objectUrls = stubObjectUrls();
+  });
+  afterEach(() => {
+    // Unmount first: images release their object URLs as they unmount.
+    cleanup();
+    objectUrls.restore();
+  });
+
+  const imageReview = {
+    ...review,
+    revision: {
+      ...review.revision,
+      values: { headline: 'Fresh offer', logo: 'asset-3' },
+      templateVersion: {
+        fields: [
+          { key: 'headline', label: 'Headline', type: 'TEXT' },
+          { key: 'logo', label: 'Logo', type: 'LOGO' },
+        ],
+      },
+    },
+  };
+
+  function serveReview() {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/assets/asset-3/content')) return imageReply('asset-3');
+      if (url.endsWith('/assets/asset-3'))
+        return statusReply(200, {
+          id: 'asset-3',
+          organizationId: 'org-1',
+          branchId: 'branch-1',
+          originalName: 'spring-logo.webp',
+          mimeType: 'image/webp',
+          sizeBytes: 900,
+          width: 400,
+          height: 200,
+          status: 'ACTIVE',
+          createdAt: '2026-01-01T00:00:00Z',
+          updatedAt: '2026-01-01T00:00:00Z',
+        });
+      if (url.endsWith('/approvals/tasks')) return statusReply(200, [task]);
+      if (url.endsWith('/approvals/tasks/task-1'))
+        return statusReply(200, imageReview);
+      return statusReply(200, []);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('shows the reviewed revision image and file name instead of the asset ID', async () => {
+    serveReview();
+    render(
+      <ApprovalsWorkspace
+        session={{
+          accessToken: 'token',
+          user: { ...user, permissions: [...user.permissions, 'assets:read'] },
+        }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Review' }));
+    expect(
+      await screen.findByRole('img', { name: 'Logo: spring-logo.webp' }),
+    ).toHaveAttribute('src', expect.stringMatching(/^blob:test\/asset-3\//));
+    expect(screen.getByText('WebP · 400 × 200 px · 900 B')).toBeInTheDocument();
+    expect(screen.queryByText('asset-3')).not.toBeInTheDocument();
+  });
+
+  it('requests no image without the asset read permission', async () => {
+    const fetchMock = serveReview();
+    render(
+      <ApprovalsWorkspace
+        session={{ accessToken: 'token', user }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Review' }));
+    expect(
+      await screen.findByText(
+        'Image selected · you do not have permission to view assets',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('asset-3')).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).includes('/assets/')),
+    ).toBe(false);
+  });
+});
+
+describe('ApprovalsWorkspace review feedback', () => {
+  function serveReview(reviewBody: unknown) {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/approvals/tasks')) return statusReply(200, [task]);
+      if (url.endsWith('/approvals/tasks/task-1'))
+        return statusReply(200, reviewBody);
+      if (url.endsWith('/revisions/1/comments'))
+        return statusReply(200, [
+          {
+            id: 'comment-1',
+            text: 'Revision one: enlarge the logo',
+            parentId: null,
+            createdAt: '2026-11-05T10:00:00.000Z',
+            author: { name: 'Rita Reviewer' },
+          },
+          {
+            id: 'comment-2',
+            text: 'Done in the next revision',
+            parentId: 'comment-1',
+            createdAt: '2026-11-05T10:05:00.000Z',
+            author: { name: 'Sam Submitter' },
+          },
+        ]);
+      return statusReply(200, []);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('lets a reviewer read an earlier revision thread while reviewing the new one', async () => {
+    serveReview(review);
+    render(
+      <ApprovalsWorkspace
+        session={{ accessToken: 'token', user }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Review' }));
+    const selector = await screen.findByRole('combobox', {
+      name: 'Feedback revision',
+    });
+    expect(selector).toHaveValue('3');
+    fireEvent.change(selector, { target: { value: '1' } });
+    expect(
+      await screen.findByText('Revision one: enlarge the logo'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('list', { name: 'Replies to Rita Reviewer' }),
+    ).toHaveTextContent('Done in the next revision');
+    expect(
+      screen.getByRole('button', { name: 'Request changes' }),
+    ).toBeInTheDocument();
+  });
+
+  it('hides decision controls when the viewer submitted the run', async () => {
+    serveReview({ ...review, submittedByViewer: true });
+    render(
+      <ApprovalsWorkspace
+        session={{ accessToken: 'token', user }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Review' }));
+    expect(
+      await screen.findByText(
+        'You submitted this creative, so another reviewer must decide.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: 'Request changes' }),
+    ).toBeNull();
+    expect(
+      screen.queryByLabelText('Decision reason or requested changes'),
+    ).toBeNull();
   });
 });

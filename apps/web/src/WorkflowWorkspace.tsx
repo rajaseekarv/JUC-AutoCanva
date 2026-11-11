@@ -1,10 +1,17 @@
 import { useEffect, useState } from 'react';
 import type {
   AuthenticatedUserResponse,
+  CreativeResponse,
   BranchResponse,
 } from '@adflow/shared-types';
 import StatusBadge from './StatusBadge';
+import {
+  useOtherScreenChanges,
+  type DataChange,
+  type DataChangeSource,
+} from './dataChanges';
 import { statusLabel } from './statusDisplay';
+import { approvalSummaryText } from './approvalText';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -45,12 +52,16 @@ type Workflow = {
   enabledVersionNumber: number | null;
   versions: Version[];
 };
-type Creative = {
-  id: string;
-  name: string;
-  status: string;
-  currentRevisionId: string | null;
-};
+type Creative = Pick<
+  CreativeResponse,
+  | 'id'
+  | 'name'
+  | 'status'
+  | 'currentRevisionId'
+  | 'currentRevision'
+  | 'approvedRevision'
+  | 'currentRevisionApproved'
+>;
 type Instance = {
   id: string;
   status: string;
@@ -106,12 +117,19 @@ function defaultDefinition(): string {
 export default function WorkflowWorkspace({
   session,
   branch,
+  dataChange,
+  onDataChanged,
   onUnauthorized,
 }: {
   session: Session;
   branch: BranchResponse | null;
+  dataChange?: DataChange;
+  onDataChanged?: (source: DataChangeSource) => void;
   onUnauthorized: () => void;
 }) {
+  // Bumped to reload the selected creative's run after another screen
+  // changed it.
+  const [instanceKey, setInstanceKey] = useState(0);
   const canRead = session.user.permissions.includes('workflows:read');
   const canManage = session.user.permissions.includes('workflows:manage');
   const canStart = session.user.permissions.includes('workflows:start');
@@ -152,7 +170,10 @@ export default function WorkflowWorkspace({
           : (body?.message ?? 'Unable to complete workflow request.'),
       );
     }
-    return response.json() as Promise<T>;
+    // The API sends an empty body for null, for example a creative that has
+    // never had a workflow run.
+    const text = await response.text();
+    return (text ? JSON.parse(text) : null) as T;
   }
 
   async function reload(): Promise<void> {
@@ -250,7 +271,34 @@ export default function WorkflowWorkspace({
         ),
       );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [creativeId, session.accessToken]);
+  }, [creativeId, session.accessToken, instanceKey]);
+
+  // Another screen changed review data: refresh the creative picker and the
+  // selected creative's run. Definitions and selections are kept.
+  async function refreshFromOtherScreen(): Promise<void> {
+    if (
+      branch &&
+      (canStart || session.user.permissions.includes('creatives:read'))
+    ) {
+      try {
+        setCreatives(
+          await request<Creative[]>(
+            `/creatives?branchId=${encodeURIComponent(branch.id)}`,
+          ),
+        );
+      } catch (cause) {
+        setError(
+          cause instanceof Error ? cause.message : 'Unable to load workflows.',
+        );
+      }
+    }
+    if (creativeId) setInstanceKey((key) => key + 1);
+  }
+  useOtherScreenChanges(
+    dataChange,
+    'workflows',
+    () => void refreshFromOtherScreen(),
+  );
 
   async function saveDefinition(): Promise<void> {
     setBusy(true);
@@ -335,6 +383,7 @@ export default function WorkflowWorkspace({
       setInstance(started);
       setMessage('Workflow started against the selected creative revision.');
       await reload();
+      onDataChanged?.('workflows');
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : 'Unable to start workflow.',
@@ -357,6 +406,7 @@ export default function WorkflowWorkspace({
       setInstance(changed);
       setMessage('Workflow moved to ' + changed.currentStage.name + '.');
       await reload();
+      onDataChanged?.('workflows');
     } catch (cause) {
       setError(
         cause instanceof Error
@@ -503,7 +553,13 @@ export default function WorkflowWorkspace({
                 <option value="">Choose creative</option>
                 {creatives.map((item) => (
                   <option key={item.id} value={item.id}>
-                    {item.name} · {statusLabel(item.status)}
+                    {[
+                      item.name,
+                      statusLabel(item.status),
+                      approvalSummaryText(item),
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
                   </option>
                 ))}
               </select>
@@ -511,7 +567,10 @@ export default function WorkflowWorkspace({
           ) : (
             <p>Select a branch to view its creatives.</p>
           )}
-          {creativeId && !instance && canStart && (
+          {/* Only one run may be active per creative; after a run completes
+              (for example with changes requested) a new run can start
+              against the creative's latest revision. */}
+          {creativeId && instance?.status !== 'RUNNING' && canStart && (
             <>
               <label>
                 Enabled workflow

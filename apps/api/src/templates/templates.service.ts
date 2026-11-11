@@ -890,6 +890,9 @@ export class TemplatesService {
   ): Promise<{
     versionId: string;
     values: Record<string, Prisma.InputJsonValue>;
+    // IDs stored by image and logo fields; the caller locks them while it
+    // writes the revision so they cannot be deleted concurrently.
+    assetIds: string[];
   }> {
     const version = await this.prisma.templateVersion.findFirst({
       where: {
@@ -918,6 +921,7 @@ export class TemplatesService {
       );
 
     const values: Record<string, Prisma.InputJsonValue> = {};
+    const assetIds: string[] = [];
     for (const field of version.fields) {
       const value = Object.hasOwn(supplied, field.key)
         ? supplied[field.key]
@@ -942,6 +946,7 @@ export class TemplatesService {
             `${field.label} must reference an image asset`,
           );
         await this.assets.assertCreativeAsset(user, value, branchId);
+        assetIds.push(value);
       } else if (field.type === TemplateFieldType.NUMBER) {
         if (typeof value !== 'number' || !Number.isFinite(value))
           throw new BadRequestException(`${field.label} must be a number`);
@@ -1009,7 +1014,7 @@ export class TemplatesService {
       }
       values[field.key] = value as Prisma.InputJsonValue;
     }
-    return { versionId: version.id, values };
+    return { versionId: version.id, values, assetIds };
   }
 
   async preview(

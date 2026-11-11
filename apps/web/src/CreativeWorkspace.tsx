@@ -7,11 +7,27 @@ import type {
   TemplateFieldResponse,
   TemplateResponse,
 } from '@adflow/shared-types';
+import type { AssetSource } from './assetFiles';
+import { AssetReference } from './AssetImage';
+import ReviewFeedback, { type FeedbackChangeRequest } from './ReviewFeedback';
 import StatusBadge from './StatusBadge';
+import {
+  useOtherScreenChanges,
+  type DataChange,
+  type DataChangeSource,
+} from './dataChanges';
+import ApprovalSummary from './ApprovalSummary';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
 type Session = { accessToken: string; user: AuthenticatedUserResponse };
+// The creative's latest workflow run, as GET /creatives/:id/workflow returns it.
+type LatestRun = {
+  id: string;
+  status: string;
+  workflowId: string;
+  creativeRevisionId: string;
+};
 type AssetOption = {
   id: string;
   originalName: string;
@@ -22,16 +38,33 @@ export default function CreativeWorkspace({
   session,
   branch,
   templateRefreshKey = 0,
+  dataChange,
+  onDataChanged,
   onUnauthorized,
 }: {
   session: Session;
   branch: BranchResponse | null;
   templateRefreshKey?: number;
+  dataChange?: DataChange;
+  onDataChanged?: (source: DataChangeSource) => void;
   onUnauthorized: () => void;
 }) {
   const canRead = session.user.permissions.includes('creatives:read');
   const canCreate = session.user.permissions.includes('creatives:create');
   const canUpdate = session.user.permissions.includes('creatives:update');
+  const canReadAssets = session.user.permissions.includes('assets:read');
+  const canReadWorkflows = session.user.permissions.includes('workflows:read');
+  const canStartWorkflow = session.user.permissions.includes('workflows:start');
+  const canReadFeedback = [
+    'comments:read',
+    'approvals:read',
+    'change_requests:read',
+  ].some((permission) => session.user.permissions.includes(permission));
+  const assetSource: AssetSource = {
+    apiBase,
+    accessToken: session.accessToken,
+    onUnauthorized,
+  };
   const [creatives, setCreatives] = useState<CreativeResponse[]>([]);
   const [templates, setTemplates] = useState<TemplateResponse[]>([]);
   const [templateDetail, setTemplateDetail] = useState<TemplateResponse | null>(
@@ -47,6 +80,11 @@ export default function CreativeWorkspace({
   const [inspectedRevision, setInspectedRevision] =
     useState<CreativeRevisionResponse | null>(null);
   const [assets, setAssets] = useState<AssetOption[]>([]);
+  // Bumped after a save or resubmission so revision history, workflow state
+  // and review feedback for the selected creative reload.
+  const [reviewKey, setReviewKey] = useState(0);
+  const [latestRun, setLatestRun] = useState<LatestRun | null>(null);
+  const [openRequests, setOpenRequests] = useState<FeedbackChangeRequest[]>([]);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const loadSequence = useRef(0);
@@ -151,6 +189,32 @@ export default function CreativeWorkspace({
     }
   }
 
+  // Another screen changed review data: refresh only the creatives list and
+  // the open creative's review state. Templates, assets, the selection and
+  // unsaved form values are kept.
+  async function refreshFromOtherScreen(): Promise<void> {
+    if (!canRead || !branch) return;
+    const sequence = loadSequence.current;
+    try {
+      const list = await request<CreativeResponse[]>(
+        '/creatives?branchId=' + encodeURIComponent(branch.id),
+      );
+      if (sequence !== loadSequence.current) return;
+      setCreatives(list);
+    } catch (cause) {
+      if (sequence !== loadSequence.current) return;
+      setError(
+        cause instanceof Error ? cause.message : 'Unable to load creatives.',
+      );
+    }
+    if (selectedId) setReviewKey((key) => key + 1);
+  }
+  useOtherScreenChanges(
+    dataChange,
+    'creatives',
+    () => void refreshFromOtherScreen(),
+  );
+
   useEffect(() => {
     // Everything tied to the previous branch or session is cleared before the
     // reload, so no stale creative, asset, or revision can be selected or
@@ -240,8 +304,30 @@ export default function CreativeWorkspace({
             : 'Unable to load revision history.',
         ),
       );
-    // History reloads when the selected ID or access token changes.
+    // History reloads when the selected ID, access token, or review key changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, session.accessToken, reviewKey]);
+  useEffect(() => {
+    setLatestRun(null);
+    if (!selected || !canReadWorkflows) return;
+    let cancelled = false;
+    void request<LatestRun | null>(
+      '/creatives/' + encodeURIComponent(selected.id) + '/workflow',
+    )
+      .then((run) => {
+        if (!cancelled) setLatestRun(run);
+      })
+      .catch(() => {
+        // Without the workflow state, resubmission is simply not offered.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Workflow state follows the selected creative, session and review key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, session.accessToken, reviewKey]);
+  useEffect(() => {
+    setOpenRequests([]);
   }, [selectedId, session.accessToken]);
 
   function chooseCreative(id: string): void {
@@ -309,9 +395,60 @@ export default function CreativeWorkspace({
         selected ? 'A new immutable revision was saved.' : 'Creative created.',
       );
       setSummary('');
+      if (selected) setReviewKey((key) => key + 1);
+      onDataChanged?.('creatives');
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : 'Unable to save creative.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Starts a new run of the previous workflow for the current revision. The
+  // API resolves the change requests on older revisions in the same
+  // transaction, and leaves them open if the run cannot be created.
+  async function resubmit(): Promise<void> {
+    if (!selected?.currentRevisionId || !latestRun) return;
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const run = await request<{
+        currentStage?: { name: string; requiresReview?: boolean } | null;
+      } | null>(
+        '/creatives/' + encodeURIComponent(selected.id) + '/workflows',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            workflowId: latestRun.workflowId,
+            creativeRevisionId: selected.currentRevisionId,
+          }),
+        },
+      );
+      const revision =
+        'Revision ' + (selected.currentRevision?.revisionNumber ?? '');
+      // The run starts at the workflow's entry stage. Only a review stage
+      // reaches a reviewer; otherwise say where the run is waiting.
+      const stage = run?.currentStage;
+      setMessage(
+        !stage || stage.requiresReview
+          ? revision + ' was resubmitted for review.'
+          : revision +
+              ' was resubmitted. Its workflow is at the ' +
+              stage.name +
+              ' stage; move it on from Workflows to send it to a reviewer.',
+      );
+      setReviewKey((key) => key + 1);
+      // The creative's status changed with the new run.
+      void reload();
+      onDataChanged?.('creatives');
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : 'Unable to resubmit for review.',
       );
     } finally {
       setBusy(false);
@@ -332,7 +469,12 @@ export default function CreativeWorkspace({
         <label key={field.id}>
           {field.label}
           {readonly ? (
-            <p>{String(value ?? '—')}</p>
+            <AssetReference
+              assetId={value}
+              label={field.label}
+              source={assetSource}
+              canReadAssets={canReadAssets}
+            />
           ) : (
             <select
               aria-label={field.label}
@@ -354,6 +496,14 @@ export default function CreativeWorkspace({
                   </option>
                 ))}
             </select>
+          )}
+          {!readonly && typeof value === 'string' && value && (
+            <AssetReference
+              assetId={value}
+              label={field.label + ' preview'}
+              source={assetSource}
+              canReadAssets={canReadAssets}
+            />
           )}
         </label>
       );
@@ -478,6 +628,7 @@ export default function CreativeWorkspace({
                         <StatusBadge status={creative.status} /> Revision{' '}
                         {creative.currentRevision?.revisionNumber ?? 0}
                       </span>
+                      <ApprovalSummary creative={creative} />
                     </div>
                     <button
                       className="secondary-button"
@@ -504,6 +655,13 @@ export default function CreativeWorkspace({
               onSubmit={(event) => void save(event)}
             >
               <h3>{selected ? 'Edit ' + selected.name : 'Create creative'}</h3>
+              {selected && (
+                <p className="creative-review-state">
+                  <StatusBadge status={selected.status} /> Current revision{' '}
+                  {selected.currentRevision?.revisionNumber ?? 0}{' '}
+                  <ApprovalSummary creative={selected} />
+                </p>
+              )}
               <label>
                 Name
                 <input
@@ -671,7 +829,108 @@ export default function CreativeWorkspace({
               )}
             </section>
           )}
+          {selected && openRequests.length > 0 && (
+            <ChangeRequestBanner
+              requests={openRequests}
+              currentRevisionNumber={
+                selected.currentRevision?.revisionNumber ?? 0
+              }
+              runActive={latestRun?.status === 'RUNNING'}
+              canResubmit={
+                canStartWorkflow &&
+                canReadWorkflows &&
+                latestRun !== null &&
+                latestRun.status !== 'RUNNING'
+              }
+              busy={busy}
+              onResubmit={() => void resubmit()}
+            />
+          )}
+          {selected && canReadFeedback && (
+            <section className="admin-card">
+              <ReviewFeedback
+                session={session}
+                creativeId={selected.id}
+                latestRevisionNumber={
+                  selected.currentRevision?.revisionNumber ?? 1
+                }
+                onUnauthorized={onUnauthorized}
+                refreshKey={reviewKey}
+                onChangeRequests={(requests) =>
+                  setOpenRequests(
+                    requests.filter(
+                      (request) =>
+                        request.status === 'OPEN' ||
+                        request.status === 'IN_PROGRESS',
+                    ),
+                  )
+                }
+              />
+            </section>
+          )}
         </div>
+      )}
+    </section>
+  );
+}
+
+// Open change requests for the selected creative and what to do next. The
+// resubmit action is offered only once a newer revision than every request's
+// revision is saved, no run is active, and the user may start workflows.
+function ChangeRequestBanner({
+  requests,
+  currentRevisionNumber,
+  runActive,
+  canResubmit,
+  busy,
+  onResubmit,
+}: {
+  requests: FeedbackChangeRequest[];
+  currentRevisionNumber: number;
+  runActive: boolean;
+  canResubmit: boolean;
+  busy: boolean;
+  onResubmit: () => void;
+}) {
+  const answered = requests.every(
+    (request) => request.revisionNumber < currentRevisionNumber,
+  );
+  return (
+    <section
+      className="change-request-banner"
+      aria-label="Open change requests"
+    >
+      <h3>Changes requested</h3>
+      <ul>
+        {requests.map((request) => (
+          <li key={request.id}>
+            Revision {request.revisionNumber}: {request.requestedChanges}
+            {request.explanation ? ' (' + request.explanation + ')' : ''}
+          </li>
+        ))}
+      </ul>
+      {!answered ? (
+        <p>
+          Save a new revision with the requested changes, then resubmit it for
+          review.
+        </p>
+      ) : runActive ? (
+        <p>A review is already running for this creative.</p>
+      ) : canResubmit ? (
+        <div className="inline-actions">
+          <p>
+            Revision {currentRevisionNumber} is saved. Resubmit it to send it
+            for review and resolve these requests.
+          </p>
+          <button type="button" disabled={busy} onClick={onResubmit}>
+            Resubmit for review
+          </button>
+        </div>
+      ) : (
+        <p>
+          Revision {currentRevisionNumber} is saved. Someone who can start
+          workflows needs to resubmit it for review.
+        </p>
       )}
     </section>
   );

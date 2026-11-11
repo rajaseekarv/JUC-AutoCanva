@@ -11,6 +11,12 @@ import { PERMISSIONS } from '../auth/permissions';
 import { PrismaService } from '../prisma/prisma.service';
 import { TemplatesService } from '../templates/templates.service';
 import { AuditService } from '../audit/audit.service';
+import { lockActiveAssetsForReference } from '../assets/asset-locks';
+import { transactionContentionException } from '../prisma/transaction-errors';
+import {
+  UNREVIEWED_REVISION_STATUS,
+  withReviewState,
+} from './creative-review-state';
 
 type CreativeInput = {
   name: string;
@@ -118,7 +124,7 @@ export class CreativesService {
     );
     if (branchId && !ids.includes(branchId))
       throw new NotFoundException('Branch not found');
-    return this.prisma.creative.findMany({
+    const creatives = await this.prisma.creative.findMany({
       where: { organizationId: user.organizationId, branchId: { in: ids } },
       include: {
         ...detailInclude,
@@ -127,6 +133,41 @@ export class CreativesService {
       },
       orderBy: { updatedAt: 'desc' },
     });
+    return withReviewState(this.prisma, user.organizationId, creatives);
+  }
+
+  // Revision writes run SERIALIZABLE. A transaction PostgreSQL rolls back
+  // for contention (for example, an asset deleted while this one waited on
+  // its row lock) answers 409 instead of 500; nothing was written.
+  private async serializable<T>(
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await this.prisma.$transaction(work, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      });
+    } catch (error: unknown) {
+      throw transactionContentionException(error) ?? error;
+    }
+  }
+
+  // Validation ran before the transaction; re-check the referenced assets
+  // under a shared row lock so none can be deleted before this revision
+  // commits (see lockActiveAssetsForReference).
+  private async lockReferencedAssets(
+    tx: Prisma.TransactionClient,
+    user: AuthenticatedPrincipal,
+    branchId: string,
+    assetIds: readonly string[],
+  ): Promise<void> {
+    const locked = await lockActiveAssetsForReference(
+      tx,
+      user.organizationId,
+      branchId,
+      assetIds,
+    );
+    if (assetIds.some((assetId) => !locked.has(assetId)))
+      throw new BadRequestException('Select an in-scope active image asset');
   }
 
   async get(user: AuthenticatedPrincipal, id: string) {
@@ -137,7 +178,12 @@ export class CreativesService {
     });
     if (!creative) throw new NotFoundException('Creative not found');
     await this.assertBranch(user, creative.branchId);
-    return creative;
+    const [withState] = await withReviewState(
+      this.prisma,
+      user.organizationId,
+      [creative],
+    );
+    return withState;
   }
 
   async create(user: AuthenticatedPrincipal, input: CreativeInput) {
@@ -150,98 +196,107 @@ export class CreativesService {
       input.templateVersionId,
       input.values,
     );
-    return this.prisma.$transaction(
-      async (tx) => {
-        const branch = await tx.branch.findFirst({
+    return this.serializable(async (tx) => {
+      const branch = await tx.branch.findFirst({
+        where: {
+          id: input.branchId,
+          organizationId: user.organizationId,
+          status: 'ACTIVE',
+        },
+        select: { id: true },
+      });
+      if (!branch) throw new NotFoundException('Branch not found');
+      if (!user.permissions.includes(PERMISSIONS.BRANCH_MANAGE)) {
+        const grant = await tx.userBranchAccess.findFirst({
+          where: { userId: user.id, branchId: input.branchId },
+          select: { branchId: true },
+        });
+        if (!grant) throw new NotFoundException('Branch not found');
+      }
+      if (input.campaignId) {
+        const assignment = await tx.campaignBranch.findFirst({
           where: {
-            id: input.branchId,
-            organizationId: user.organizationId,
-            status: 'ACTIVE',
+            campaignId: input.campaignId,
+            branchId: input.branchId,
+            status: 'ASSIGNED',
+            campaign: { organizationId: user.organizationId },
+            branch: { organizationId: user.organizationId },
           },
           select: { id: true },
         });
-        if (!branch) throw new NotFoundException('Branch not found');
-        if (!user.permissions.includes(PERMISSIONS.BRANCH_MANAGE)) {
-          const grant = await tx.userBranchAccess.findFirst({
-            where: { userId: user.id, branchId: input.branchId },
-            select: { branchId: true },
-          });
-          if (!grant) throw new NotFoundException('Branch not found');
-        }
-        if (input.campaignId) {
-          const assignment = await tx.campaignBranch.findFirst({
-            where: {
-              campaignId: input.campaignId,
-              branchId: input.branchId,
-              status: 'ASSIGNED',
-              campaign: { organizationId: user.organizationId },
-              branch: { organizationId: user.organizationId },
-            },
-            select: { id: true },
-          });
-          if (!assignment)
-            throw new BadRequestException(
-              'Campaign is not assigned to this branch',
-            );
-        }
-        const version = await tx.templateVersion.findFirst({
-          where: {
-            id: validated.versionId,
-            immutableAt: { not: null },
-            template: {
-              organizationId: user.organizationId,
-              status: TemplateStatus.ACTIVE,
-            },
-          },
-          include: { template: true },
-        });
-        if (
-          !version ||
-          version.template.activeVersionNumber !== version.versionNumber
-        )
-          throw new ConflictException('Template version is no longer active');
-        const creative = await tx.creative.create({
-          data: {
+        if (!assignment)
+          throw new BadRequestException(
+            'Campaign is not assigned to this branch',
+          );
+      }
+      const version = await tx.templateVersion.findFirst({
+        where: {
+          id: validated.versionId,
+          immutableAt: { not: null },
+          template: {
             organizationId: user.organizationId,
-            branchId: input.branchId,
-            campaignId: input.campaignId ?? null,
-            name: input.name,
-            createdById: user.id,
-            updatedById: user.id,
+            status: TemplateStatus.ACTIVE,
           },
-        });
-        const revision = await tx.creativeRevision.create({
-          data: {
-            creativeId: creative.id,
-            revisionNumber: 1,
-            templateVersionId: version.id,
-            values: validated.values,
-            summary: input.summary ?? null,
-            createdById: user.id,
-          },
-        });
-        await this.audit.write(tx, {
+        },
+        include: { template: true },
+      });
+      if (
+        !version ||
+        version.template.activeVersionNumber !== version.versionNumber
+      )
+        throw new ConflictException('Template version is no longer active');
+      await this.lockReferencedAssets(
+        tx,
+        user,
+        input.branchId,
+        validated.assetIds,
+      );
+      const creative = await tx.creative.create({
+        data: {
           organizationId: user.organizationId,
-          actorUserId: user.id,
-          action: 'creative.created',
-          entityType: 'creative',
-          entityId: creative.id,
-          branchId: creative.branchId,
+          branchId: input.branchId,
+          campaignId: input.campaignId ?? null,
+          name: input.name,
+          createdById: user.id,
+          updatedById: user.id,
+        },
+      });
+      const revision = await tx.creativeRevision.create({
+        data: {
           creativeId: creative.id,
-          creativeRevisionId: revision.id,
-          metadata: {
-            revisionNumber: revision.revisionNumber,
-            templateVersionId: version.id,
-          },
-        });
-        return tx.creative.update({
-          where: { id: creative.id },
-          data: { currentRevisionId: revision.id },
-          include: detailInclude,
-        });
-      },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-    );
+          revisionNumber: 1,
+          templateVersionId: version.id,
+          values: validated.values,
+          summary: input.summary ?? null,
+          createdById: user.id,
+        },
+      });
+      await this.audit.write(tx, {
+        organizationId: user.organizationId,
+        actorUserId: user.id,
+        action: 'creative.created',
+        entityType: 'creative',
+        entityId: creative.id,
+        branchId: creative.branchId,
+        creativeId: creative.id,
+        creativeRevisionId: revision.id,
+        metadata: {
+          revisionNumber: revision.revisionNumber,
+          templateVersionId: version.id,
+        },
+      });
+      const created = await tx.creative.update({
+        where: { id: creative.id },
+        data: { currentRevisionId: revision.id },
+        include: detailInclude,
+      });
+      // A new creative has no runs or decisions yet.
+      return {
+        ...created,
+        approvedRevision: null,
+        currentRevisionApproved: false,
+      };
+    });
   }
 
   async update(
@@ -278,93 +333,105 @@ export class CreativesService {
       sourceValues as Record<string, unknown>,
       creative.currentRevision.templateVersionId,
     );
-    return this.prisma.$transaction(
-      async (tx) => {
-        const branch = await tx.branch.findFirst({
-          where: {
-            id: creative.branchId,
-            organizationId: user.organizationId,
-            status: 'ACTIVE',
-          },
-          select: { id: true },
-        });
-        if (!branch) throw new NotFoundException('Creative not found');
-        const activeWorkflow = await tx.workflowInstance.findFirst({
-          where: { creativeId: id, status: 'RUNNING' },
-          select: { id: true },
-        });
-        if (activeWorkflow)
-          throw new ConflictException(
-            'Creative revisions cannot change while a workflow is running',
-          );
-        if (!user.permissions.includes(PERMISSIONS.BRANCH_MANAGE)) {
-          const grant = await tx.userBranchAccess.findFirst({
-            where: { userId: user.id, branchId: creative.branchId },
-            select: { branchId: true },
-          });
-          if (!grant) throw new NotFoundException('Creative not found');
-        }
-        const version = await tx.templateVersion.findFirst({
-          where: {
-            id: validated.versionId,
-            immutableAt: { not: null },
-            template: { organizationId: user.organizationId },
-          },
-          include: { template: true },
-        });
-        if (
-          !version ||
-          (version.id !== creative.currentRevision!.templateVersionId &&
-            (version.template.status !== TemplateStatus.ACTIVE ||
-              version.template.activeVersionNumber !== version.versionNumber))
-        )
-          throw new ConflictException(
-            'A changed template version must be active',
-          );
-        const latest = await tx.creativeRevision.findFirst({
-          where: { creativeId: id },
-          orderBy: { revisionNumber: 'desc' },
-          select: { revisionNumber: true },
-        });
-        const revision = await tx.creativeRevision.create({
-          data: {
-            creativeId: id,
-            revisionNumber: (latest?.revisionNumber ?? 0) + 1,
-            templateVersionId: version.id,
-            values: validated.values,
-            summary: input.summary ?? null,
-            createdById: user.id,
-          },
-        });
-        await tx.creative.update({
-          where: { id },
-          data: {
-            ...(input.name ? { name: input.name } : {}),
-            updatedById: user.id,
-            currentRevisionId: revision.id,
-          },
-        });
-        await this.audit.write(tx, {
+    return this.serializable(async (tx) => {
+      const branch = await tx.branch.findFirst({
+        where: {
+          id: creative.branchId,
           organizationId: user.organizationId,
-          actorUserId: user.id,
-          action: 'creative.revised',
-          entityType: 'creative',
-          entityId: id,
-          branchId: creative.branchId,
+          status: 'ACTIVE',
+        },
+        select: { id: true },
+      });
+      if (!branch) throw new NotFoundException('Creative not found');
+      const activeWorkflow = await tx.workflowInstance.findFirst({
+        where: { creativeId: id, status: 'RUNNING' },
+        select: { id: true },
+      });
+      if (activeWorkflow)
+        throw new ConflictException(
+          'Creative revisions cannot change while a workflow is running',
+        );
+      if (!user.permissions.includes(PERMISSIONS.BRANCH_MANAGE)) {
+        const grant = await tx.userBranchAccess.findFirst({
+          where: { userId: user.id, branchId: creative.branchId },
+          select: { branchId: true },
+        });
+        if (!grant) throw new NotFoundException('Creative not found');
+      }
+      const version = await tx.templateVersion.findFirst({
+        where: {
+          id: validated.versionId,
+          immutableAt: { not: null },
+          template: { organizationId: user.organizationId },
+        },
+        include: { template: true },
+      });
+      if (
+        !version ||
+        (version.id !== creative.currentRevision!.templateVersionId &&
+          (version.template.status !== TemplateStatus.ACTIVE ||
+            version.template.activeVersionNumber !== version.versionNumber))
+      )
+        throw new ConflictException(
+          'A changed template version must be active',
+        );
+      await this.lockReferencedAssets(
+        tx,
+        user,
+        creative.branchId,
+        validated.assetIds,
+      );
+      const latest = await tx.creativeRevision.findFirst({
+        where: { creativeId: id },
+        orderBy: { revisionNumber: 'desc' },
+        select: { revisionNumber: true },
+      });
+      const revision = await tx.creativeRevision.create({
+        data: {
           creativeId: id,
-          creativeRevisionId: revision.id,
-          metadata: {
-            revisionNumber: revision.revisionNumber,
-            templateVersionId: version.id,
-          },
-        });
-        return tx.creative.findUniqueOrThrow({
-          where: { id },
-          include: detailInclude,
-        });
-      },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-    );
+          revisionNumber: (latest?.revisionNumber ?? 0) + 1,
+          templateVersionId: version.id,
+          values: validated.values,
+          summary: input.summary ?? null,
+          createdById: user.id,
+        },
+      });
+      await tx.creative.update({
+        where: { id },
+        data: {
+          ...(input.name ? { name: input.name } : {}),
+          updatedById: user.id,
+          currentRevisionId: revision.id,
+          // The status described the revision the last run reviewed; the
+          // new revision has not entered a workflow. Decisions are kept.
+          status: UNREVIEWED_REVISION_STATUS,
+        },
+      });
+      await this.audit.write(tx, {
+        organizationId: user.organizationId,
+        actorUserId: user.id,
+        action: 'creative.revised',
+        entityType: 'creative',
+        entityId: id,
+        branchId: creative.branchId,
+        creativeId: id,
+        creativeRevisionId: revision.id,
+        metadata: {
+          revisionNumber: revision.revisionNumber,
+          templateVersionId: version.id,
+          previousStatus: creative.status,
+          status: UNREVIEWED_REVISION_STATUS,
+        },
+      });
+      const revised = await tx.creative.findUniqueOrThrow({
+        where: { id },
+        include: detailInclude,
+      });
+      const [withState] = await withReviewState(tx, user.organizationId, [
+        revised,
+      ]);
+      return withState;
+    });
   }
 
   async revisions(user: AuthenticatedPrincipal, id: string) {

@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { createReadStream } from 'node:fs';
-import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 
@@ -41,8 +40,11 @@ export class LocalAssetStorage implements AssetStorage {
     await writeFile(path, content, { flag: 'wx', mode: 0o600 });
   }
 
+  // Opening before streaming turns a missing file into a rejected promise the
+  // caller can answer with 404, instead of an 'error' event on a piped stream.
   async get(key: string): Promise<Readable> {
-    return createReadStream(resolveAssetPath(this.root, key));
+    const file = await open(resolveAssetPath(this.root, key), 'r');
+    return file.createReadStream();
   }
 
   async remove(key: string): Promise<void> {

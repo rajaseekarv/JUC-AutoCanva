@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { Prisma } from '@prisma/client';
 import {
   NotFoundException,
   ForbiddenException,
@@ -9,6 +10,7 @@ import { PERMISSIONS } from '../auth/permissions';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { TemplatesService } from '../templates/templates.service';
 import { CreativesService } from './creatives.service';
+import { transactionConflictMessage } from '../prisma/transaction-errors';
 
 const principal: AuthenticatedPrincipal = {
   id: 'user-1',
@@ -28,6 +30,8 @@ const creative = {
   organizationId: 'org-1',
   branchId: 'branch-1',
   name: 'Spring',
+  // Stage of the latest run, which approved revision 1.
+  status: 'approved',
   currentRevisionId: 'revision-1',
   currentRevision: {
     id: 'revision-1',
@@ -40,7 +44,13 @@ const creative = {
 
 function setup() {
   const tx = {
-    workflowInstance: { findFirst: vi.fn().mockResolvedValue(null) },
+    // Asset lock query: returns the IDs it locked.
+    $queryRaw: vi.fn().mockResolvedValue([] as Array<{ id: string }>),
+    workflowInstance: {
+      findFirst: vi.fn().mockResolvedValue(null),
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    approvalDecision: { findMany: vi.fn().mockResolvedValue([]) },
     branch: { findFirst: vi.fn().mockResolvedValue({ id: 'branch-1' }) },
     userBranchAccess: {
       findFirst: vi.fn().mockResolvedValue({ branchId: 'branch-1' }),
@@ -87,6 +97,8 @@ function setup() {
       findMany: vi.fn().mockResolvedValue([]),
       findUnique: vi.fn().mockResolvedValue(null),
     },
+    approvalDecision: { findMany: vi.fn().mockResolvedValue([]) },
+    workflowInstance: { findMany: vi.fn().mockResolvedValue([]) },
     $transaction: vi.fn(async (callback: (transaction: typeof tx) => unknown) =>
       callback(tx),
     ),
@@ -95,6 +107,7 @@ function setup() {
     validateCreativeValues: vi.fn().mockResolvedValue({
       versionId: 'version-1',
       values: { headline: 'Hello' },
+      assetIds: [] as string[],
     }),
   };
   const audit = { write: vi.fn().mockResolvedValue({ id: 'audit-1' }) };
@@ -110,6 +123,142 @@ function setup() {
     audit,
   };
 }
+
+// Regression (Stage 11 E2E): a creative approved on revision 3 kept showing
+// "Approved" after revision 4 was saved, although revision 4 was never
+// reviewed.
+describe('CreativesService revision-specific approval', () => {
+  const approvalOfRevision1 = {
+    creativeId: 'creative-1',
+    creativeRevisionId: 'revision-1',
+    revisionNumber: 1,
+    decision: 'APPROVED',
+    createdAt: new Date('2026-11-10T10:00:00Z'),
+    reviewer: { id: 'reviewer-1', name: 'Rita Reviewer' },
+  };
+
+  it('resets the status to DRAFT when a revision is saved and records the previous status', async () => {
+    const { service, tx, audit } = setup();
+    await service.update(principal, 'creative-1', {
+      values: { headline: 'Revised' },
+    });
+    expect(tx.creative.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          currentRevisionId: 'revision-2',
+          status: 'DRAFT',
+        }),
+      }),
+    );
+    expect(audit.write).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        action: 'creative.revised',
+        metadata: expect.objectContaining({
+          revisionNumber: 2,
+          previousStatus: 'approved',
+          status: 'DRAFT',
+        }),
+      }),
+    );
+  });
+
+  it('returns the approved older revision, and the current revision as not approved, after a revision save', async () => {
+    const { service, tx } = setup();
+    tx.creative.findUniqueOrThrow.mockResolvedValueOnce({
+      ...creative,
+      status: 'DRAFT',
+      currentRevisionId: 'revision-2',
+    });
+    tx.approvalDecision.findMany.mockResolvedValueOnce([approvalOfRevision1]);
+    tx.workflowInstance.findMany.mockResolvedValueOnce([
+      {
+        creativeId: 'creative-1',
+        creativeRevisionId: 'revision-1',
+        status: 'COMPLETED',
+      },
+    ]);
+    const saved = await service.update(principal, 'creative-1', {
+      values: { headline: 'Revised' },
+    });
+    expect(saved).toMatchObject({
+      status: 'DRAFT',
+      currentRevisionApproved: false,
+      approvedRevision: {
+        revisionId: 'revision-1',
+        revisionNumber: 1,
+        reviewer: { name: 'Rita Reviewer' },
+      },
+    });
+  });
+
+  it('reports an existing stale "approved" status as DRAFT when the latest finished run reviewed an older revision', async () => {
+    const { service, prisma } = setup();
+    prisma.creative.findFirst.mockResolvedValueOnce({
+      ...creative,
+      status: 'approved',
+      currentRevisionId: 'revision-2',
+    });
+    prisma.approvalDecision.findMany.mockResolvedValueOnce([
+      approvalOfRevision1,
+    ]);
+    prisma.workflowInstance.findMany.mockResolvedValueOnce([
+      {
+        creativeId: 'creative-1',
+        creativeRevisionId: 'revision-1',
+        status: 'COMPLETED',
+      },
+    ]);
+    await expect(service.get(principal, 'creative-1')).resolves.toMatchObject({
+      status: 'DRAFT',
+      currentRevisionApproved: false,
+      approvedRevision: { revisionNumber: 1 },
+    });
+  });
+
+  it('keeps the approved status when the current revision is the approved one', async () => {
+    const { service, prisma } = setup();
+    prisma.approvalDecision.findMany.mockResolvedValueOnce([
+      approvalOfRevision1,
+    ]);
+    prisma.workflowInstance.findMany.mockResolvedValueOnce([
+      {
+        creativeId: 'creative-1',
+        creativeRevisionId: 'revision-1',
+        status: 'COMPLETED',
+      },
+    ]);
+    await expect(service.get(principal, 'creative-1')).resolves.toMatchObject({
+      status: 'approved',
+      currentRevisionApproved: true,
+      approvedRevision: { revisionNumber: 1 },
+    });
+  });
+
+  it('adds review state to a whole list with two organization-scoped queries', async () => {
+    const { service, prisma } = setup();
+    prisma.creative.findMany.mockResolvedValueOnce([
+      creative,
+      { ...creative, id: 'creative-2', currentRevisionId: 'revision-9' },
+    ]);
+    const list = await service.list(principal);
+    expect(list).toHaveLength(2);
+    expect(prisma.approvalDecision.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.workflowInstance.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.approvalDecision.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          organizationId: 'org-1',
+          creativeId: { in: ['creative-1', 'creative-2'] },
+        },
+      }),
+    );
+    expect(list[1]).toMatchObject({
+      approvedRevision: null,
+      currentRevisionApproved: false,
+    });
+  });
+});
 
 describe('CreativesService', () => {
   it('hides creatives outside the authenticated organization', async () => {
@@ -285,5 +434,147 @@ describe('CreativesService', () => {
         campaignId: 'campaign-1',
       }),
     ).rejects.toThrow('Campaign is not assigned to this branch');
+  });
+
+  describe('referenced asset locking', () => {
+    const withAssets = (
+      context: ReturnType<typeof setup>,
+      assetIds: string[],
+      lockedIds: string[],
+    ) => {
+      vi.mocked(context.templates.validateCreativeValues).mockResolvedValue({
+        versionId: 'version-1',
+        values: { logo: assetIds[0] ?? null, hero: assetIds[1] ?? null },
+        assetIds,
+      });
+      vi.mocked(context.tx.$queryRaw).mockResolvedValue(
+        lockedIds.map((id) => ({ id })),
+      );
+    };
+    const lockCall = (context: ReturnType<typeof setup>) => {
+      const [strings, ...values] = vi.mocked(context.tx.$queryRaw).mock
+        .calls[0] as unknown as [TemplateStringsArray, ...unknown[]];
+      return Prisma.sql(strings, ...values);
+    };
+    const createInput = {
+      name: 'Spring',
+      branchId: 'branch-1',
+      templateVersionId: 'version-1',
+      values: {},
+    };
+
+    it('share-locks referenced assets in the creation transaction before writing', async () => {
+      const context = setup();
+      withAssets(context, ['asset-b', 'asset-a'], ['asset-a', 'asset-b']);
+      await context.service.create(principal, createInput);
+      const lock = lockCall(context);
+      expect(lock.sql).toMatch(/FOR SHARE\s*$/);
+      expect(lock.values).toEqual(
+        expect.arrayContaining(['asset-a', 'asset-b', 'org-1', 'branch-1']),
+      );
+      expect(
+        vi.mocked(context.tx.$queryRaw).mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        vi.mocked(context.tx.creative.create).mock.invocationCallOrder[0] ??
+          -Infinity,
+      );
+    });
+
+    it('rejects creation without writes when an asset was deleted after validation', async () => {
+      const context = setup();
+      withAssets(context, ['asset-a', 'asset-b'], ['asset-a']);
+      await expect(
+        context.service.create(principal, createInput),
+      ).rejects.toThrow('Select an in-scope active image asset');
+      expect(context.tx.creative.create).not.toHaveBeenCalled();
+      expect(context.tx.creativeRevision.create).not.toHaveBeenCalled();
+      expect(context.audit.write).not.toHaveBeenCalled();
+    });
+
+    it('share-locks the assets of a new revision before writing it', async () => {
+      const context = setup();
+      withAssets(context, ['asset-a'], ['asset-a']);
+      await context.service.update(principal, 'creative-1', {
+        values: { logo: 'asset-a' },
+      });
+      expect(lockCall(context).values).toEqual(
+        expect.arrayContaining(['asset-a', 'org-1', 'branch-1']),
+      );
+      expect(
+        vi.mocked(context.tx.$queryRaw).mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        vi.mocked(context.tx.creativeRevision.create).mock
+          .invocationCallOrder[0] ?? -Infinity,
+      );
+    });
+
+    it('rejects a revision without writes when an asset was deleted after validation', async () => {
+      const context = setup();
+      withAssets(context, ['asset-a'], []);
+      await expect(
+        context.service.update(principal, 'creative-1', {
+          values: { logo: 'asset-a' },
+        }),
+      ).rejects.toThrow('Select an in-scope active image asset');
+      expect(context.tx.creativeRevision.create).not.toHaveBeenCalled();
+      expect(context.tx.creative.update).not.toHaveBeenCalled();
+    });
+
+    it('takes no asset lock for a revision without image or logo values', async () => {
+      const context = setup();
+      await context.service.update(principal, 'creative-1', { name: 'New' });
+      expect(context.tx.$queryRaw).not.toHaveBeenCalled();
+      expect(context.tx.creativeRevision.create).toHaveBeenCalled();
+    });
+  });
+
+  describe('transaction contention', () => {
+    const serializationFailure = () =>
+      new Prisma.PrismaClientKnownRequestError('Raw query failed', {
+        code: 'P2010',
+        clientVersion: 'test',
+        meta: {
+          code: '40001',
+          message: 'could not serialize access due to concurrent update',
+        },
+      });
+
+    it('answers 409 when the asset lock fails to serialize behind a deletion', async () => {
+      const context = setup();
+      vi.mocked(context.prisma.$transaction).mockRejectedValueOnce(
+        serializationFailure(),
+      );
+      const result = context.service.create(principal, {
+        name: 'Spring',
+        branchId: 'branch-1',
+        templateVersionId: 'version-1',
+        values: {},
+      });
+      await expect(result).rejects.toBeInstanceOf(ConflictException);
+      await expect(result).rejects.toThrow(transactionConflictMessage);
+    });
+
+    it('answers 409 for a revision rolled back the same way, and keeps SERIALIZABLE', async () => {
+      const context = setup();
+      vi.mocked(context.prisma.$transaction).mockRejectedValueOnce(
+        serializationFailure(),
+      );
+      await expect(
+        context.service.update(principal, 'creative-1', { name: 'New' }),
+      ).rejects.toThrow(transactionConflictMessage);
+      expect(context.prisma.$transaction).toHaveBeenCalledWith(
+        expect.any(Function),
+        { isolationLevel: 'Serializable' },
+      );
+    });
+
+    it('still rethrows unrelated failures unchanged', async () => {
+      const context = setup();
+      const failure = new Error('unrelated');
+      vi.mocked(context.prisma.$transaction).mockRejectedValueOnce(failure);
+      await expect(
+        context.service.update(principal, 'creative-1', { name: 'New' }),
+      ).rejects.toBe(failure);
+    });
   });
 });

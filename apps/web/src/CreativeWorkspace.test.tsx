@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import type {
   AuthenticatedUserResponse,
@@ -14,6 +15,7 @@ import type {
   TemplateResponse,
 } from '@adflow/shared-types';
 import CreativeWorkspace from './CreativeWorkspace';
+import { imageReply, statusReply, stubObjectUrls } from './assetTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -563,5 +565,606 @@ describe('CreativeWorkspace branch changes', () => {
     expect(patches(fetchMock)).toEqual([
       expect.stringContaining('/creatives/creative-9'),
     ]);
+  });
+});
+
+describe('CreativeWorkspace images', () => {
+  let objectUrls: ReturnType<typeof stubObjectUrls>;
+  beforeEach(() => {
+    objectUrls = stubObjectUrls();
+  });
+  afterEach(() => {
+    // Unmount first: images release their object URLs as they unmount.
+    cleanup();
+    objectUrls.restore();
+  });
+
+  const imageVersion = {
+    ...version,
+    fields: [
+      ...version.fields,
+      {
+        ...version.fields[0]!,
+        id: 'field-2',
+        key: 'hero',
+        label: 'Hero image',
+        type: 'IMAGE' as const,
+        required: false,
+        displayOrder: 1,
+      },
+    ],
+  };
+  const imageDetail: TemplateResponse = {
+    ...template,
+    versions: [imageVersion],
+  };
+  const assetRecord = (id: string, originalName: string) => ({
+    id,
+    organizationId: 'org-1',
+    branchId: 'branch-1',
+    originalName,
+    mimeType: 'image/png',
+    sizeBytes: 4096,
+    width: 1080,
+    height: 1080,
+    status: 'ACTIVE',
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+  });
+  const assetsById: Record<string, ReturnType<typeof assetRecord>> = {
+    'asset-old': assetRecord('asset-old', 'old-hero.png'),
+    'asset-new': assetRecord('asset-new', 'new-hero.png'),
+  };
+  const firstRevision: CreativeRevisionResponse = {
+    ...revision,
+    templateVersion: imageVersion,
+    values: { headline: 'Original', hero: 'asset-old' },
+  };
+  const secondRevision: CreativeRevisionResponse = {
+    ...firstRevision,
+    id: 'revision-2',
+    revisionNumber: 2,
+    values: { headline: 'Revised', hero: 'asset-new' },
+  };
+  const imageCreative: CreativeResponse = {
+    ...creative,
+    currentRevisionId: secondRevision.id,
+    currentRevision: secondRevision,
+  };
+
+  function serveCreative(missing: string[] = []) {
+    const fetchMock = vi.fn(async (url: string) => {
+      const assetMatch = /\/assets\/([^/?]+)(\/content)?$/.exec(url);
+      if (assetMatch) {
+        const assetId = decodeURIComponent(assetMatch[1] ?? '');
+        const record = assetsById[assetId];
+        if (!record || missing.includes(assetId))
+          return statusReply(404, { message: 'Asset not found' });
+        return assetMatch[2] ? imageReply(assetId) : statusReply(200, record);
+      }
+      if (url.includes('/creatives?')) return statusReply(200, [imageCreative]);
+      if (url.endsWith('/templates')) return statusReply(200, [template]);
+      if (url.includes('/assets?'))
+        return statusReply(200, Object.values(assetsById));
+      if (url.endsWith('/templates/template-1'))
+        return statusReply(200, imageDetail);
+      if (url.endsWith('/creatives/creative-1/revisions'))
+        return statusReply(200, [secondRevision, firstRevision]);
+      return statusReply(200, []);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('shows each historical revision its own referenced image, not the latest one', async () => {
+    const fetchMock = serveCreative();
+    render(
+      <CreativeWorkspace
+        session={{ accessToken: 'token', user }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+    // The editor previews the current revision's selection.
+    expect(
+      await screen.findByRole('img', {
+        name: 'Hero image preview: new-hero.png',
+      }),
+    ).toHaveAttribute('src', expect.stringMatching(/^blob:test\/asset-new\//));
+
+    const inspectButtons = await screen.findAllByRole('button', {
+      name: 'Inspect',
+    });
+    fireEvent.click(inspectButtons[1]!);
+    await screen.findByText('Revision 1 · read only');
+    const inspection = screen
+      .getByText('Revision 1 · read only')
+      .closest('.creative-inspection') as HTMLElement;
+    expect(
+      await within(inspection).findByRole('img', {
+        name: 'Hero image: old-hero.png',
+      }),
+    ).toHaveAttribute('src', expect.stringMatching(/^blob:test\/asset-old\//));
+    expect(within(inspection).getByText('old-hero.png')).toBeInTheDocument();
+    expect(within(inspection).queryByText('new-hero.png')).toBeNull();
+    expect(within(inspection).queryByText('asset-old')).toBeNull();
+
+    fireEvent.click(inspectButtons[0]!);
+    await screen.findByText('Revision 2 · read only');
+    expect(
+      await within(inspection).findByRole('img', {
+        name: 'Hero image: new-hero.png',
+      }),
+    ).toHaveAttribute('src', expect.stringMatching(/^blob:test\/asset-new\//));
+    expect(within(inspection).queryByText('old-hero.png')).toBeNull();
+
+    for (const [url, init] of fetchMock.mock.calls as unknown as [
+      string,
+      RequestInit,
+    ][])
+      if (url.includes('/assets/asset-'))
+        expect(init.headers).toEqual({ Authorization: 'Bearer token' });
+  });
+
+  it('explains a revision image whose asset is no longer available', async () => {
+    serveCreative(['asset-old']);
+    render(
+      <CreativeWorkspace
+        session={{ accessToken: 'token', user }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+    const inspectButtons = await screen.findAllByRole('button', {
+      name: 'Inspect',
+    });
+    fireEvent.click(inspectButtons[1]!);
+    expect(
+      await screen.findByText(
+        'Image unavailable — the asset was removed or cannot be found',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('asset-old')).toBeNull();
+  });
+
+  it('shows no image and requests none without asset read permission', async () => {
+    const fetchMock = serveCreative();
+    render(
+      <CreativeWorkspace
+        session={{
+          accessToken: 'token',
+          user: {
+            ...user,
+            permissions: user.permissions.filter(
+              (permission) => permission !== 'assets:read',
+            ),
+          },
+        }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+    const inspectButtons = await screen.findAllByRole('button', {
+      name: 'Inspect',
+    });
+    fireEvent.click(inspectButtons[1]!);
+    await screen.findByText('Revision 1 · read only');
+    expect(
+      screen.getAllByText(
+        'Image selected · you do not have permission to view assets',
+      ).length,
+    ).toBeGreaterThan(0);
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).includes('/assets/')),
+    ).toBe(false);
+  });
+});
+
+describe('CreativeWorkspace review feedback and resubmission', () => {
+  const submitter: AuthenticatedUserResponse = {
+    ...user,
+    permissions: [
+      'creatives:read',
+      'creatives:update',
+      'templates:read',
+      'comments:read',
+      'comments:create',
+      'approvals:read',
+      'change_requests:read',
+      'workflows:read',
+      'workflows:start',
+    ],
+  };
+  const revisionTwo: CreativeRevisionResponse = {
+    ...revision,
+    id: 'revision-2',
+    revisionNumber: 2,
+    values: { headline: 'Revised' },
+  };
+  const atRevision = (current: CreativeRevisionResponse): CreativeResponse => ({
+    ...creative,
+    currentRevisionId: current.id,
+    currentRevision: current,
+  });
+  type Request = {
+    id: string;
+    revisionNumber: number;
+    requestedChanges: string;
+    explanation: string | null;
+    status: string;
+  };
+
+  // A creative whose latest run ended with changes requested on revision 1.
+  // Starting a run for a newer revision resolves the request, as the API does.
+  function serveReview(
+    options: {
+      current?: CreativeRevisionResponse;
+      runStatus?: string;
+      startStatus?: number;
+      requests?: Request[];
+      // The stage the started run is at, as the API returns it.
+      startStage?: { key: string; name: string; requiresReview: boolean };
+      // Extra fields of the creative as the list returns it.
+      listed?: Partial<CreativeResponse>;
+    } = {},
+  ) {
+    let current = options.current ?? revisionTwo;
+    let runStatus = options.runStatus ?? 'COMPLETED';
+    let creativeStatus = 'changes';
+    const requests = options.requests ?? [
+      {
+        id: 'request-1',
+        revisionNumber: 1,
+        requestedChanges: 'Logo is too small',
+        explanation: 'Use the large variant',
+        status: 'OPEN',
+      },
+    ];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? 'GET';
+      if (
+        url.endsWith('/creatives/creative-1/workflows') &&
+        method === 'POST'
+      ) {
+        if (options.startStatus)
+          return statusReply(options.startStatus, {
+            message: 'Enabled workflow not found',
+          });
+        runStatus = 'RUNNING';
+        creativeStatus = options.startStage?.key ?? 'review';
+        for (const request of requests)
+          if (request.revisionNumber < current.revisionNumber)
+            request.status = 'RESOLVED';
+        return statusReply(201, {
+          id: 'instance-2',
+          ...(options.startStage ? { currentStage: options.startStage } : {}),
+        });
+      }
+      if (url.endsWith('/creatives/creative-1') && method === 'PATCH') {
+        current = revisionTwo;
+        return statusReply(200, atRevision(current));
+      }
+      if (url.includes('/creatives?'))
+        return statusReply(200, [
+          { ...atRevision(current), status: creativeStatus, ...options.listed },
+        ]);
+      if (url.endsWith('/templates')) return statusReply(200, [template]);
+      if (url.endsWith('/templates/template-1'))
+        return statusReply(200, detail);
+      if (url.endsWith('/creatives/creative-1/revisions'))
+        return statusReply(
+          200,
+          current.revisionNumber === 2 ? [revisionTwo, revision] : [revision],
+        );
+      if (url.endsWith('/creatives/creative-1/workflow'))
+        return statusReply(200, {
+          id: 'instance-1',
+          status: runStatus,
+          workflowId: 'workflow-1',
+          creativeRevisionId: 'revision-1',
+        });
+      if (url.endsWith('/revisions/1/comments'))
+        return statusReply(200, [
+          {
+            id: 'comment-1',
+            text: 'Please enlarge the logo',
+            parentId: null,
+            createdAt: '2026-11-05T10:00:00.000Z',
+            author: { name: 'Rita Reviewer' },
+          },
+        ]);
+      if (url.endsWith('/comments')) return statusReply(200, []);
+      if (url.endsWith('/decisions'))
+        return statusReply(200, [
+          {
+            id: 'decision-1',
+            revisionNumber: 1,
+            decision: 'CHANGES_REQUESTED',
+            reason: 'Logo is too small',
+            createdAt: '2026-11-05T10:00:00.000Z',
+            reviewer: { name: 'Rita Reviewer' },
+          },
+        ]);
+      if (url.endsWith('/change-requests'))
+        return statusReply(
+          200,
+          requests.map((request) => ({ ...request })),
+        );
+      return statusReply(200, []);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return { fetchMock, requests };
+  }
+
+  async function openCreative(session = submitter) {
+    render(
+      <CreativeWorkspace
+        session={{ accessToken: 'token', user: session }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+  }
+  const banner = () =>
+    screen.findByRole('region', { name: 'Open change requests' });
+
+  // Regression (Stage 11 E2E): approval is revision-specific. After an
+  // approved revision 1 a newer revision 2 was still badged "Approved".
+  it('shows the current revision as Draft and names the older approved revision', async () => {
+    serveReview({
+      listed: {
+        status: 'DRAFT',
+        approvedRevision: {
+          revisionId: 'revision-1',
+          revisionNumber: 1,
+          approvedAt: '2026-11-05T10:00:00.000Z',
+          reviewer: { id: 'reviewer-1', name: 'Rita Reviewer' },
+        },
+        currentRevisionApproved: false,
+      },
+      requests: [],
+    });
+    await openCreative();
+    const row = screen.getByRole('button', { name: 'Open' }).closest('li')!;
+    expect(row).toHaveTextContent('Draft');
+    expect(row).not.toHaveTextContent('Approved');
+    expect(row).toHaveTextContent(
+      'Revision 1 approved · current revision 2 not yet approved',
+    );
+    // The open creative's detail states the current revision's status too.
+    await waitFor(() =>
+      expect(document.querySelector('p.creative-review-state')).not.toBeNull(),
+    );
+    const detail = document.querySelector('p.creative-review-state')!;
+    expect(detail).toHaveTextContent('Draft Current revision 2');
+    expect(detail).toHaveTextContent(
+      'Revision 1 approved · current revision 2 not yet approved',
+    );
+  });
+
+  it('says the current revision is approved when it is', async () => {
+    serveReview({
+      listed: {
+        status: 'approved',
+        approvedRevision: {
+          revisionId: 'revision-2',
+          revisionNumber: 2,
+          approvedAt: '2026-11-05T10:00:00.000Z',
+          reviewer: { id: 'reviewer-1', name: 'Rita Reviewer' },
+        },
+        currentRevisionApproved: true,
+      },
+      requests: [],
+    });
+    await openCreative();
+    const row = screen.getByRole('button', { name: 'Open' }).closest('li')!;
+    expect(row).toHaveTextContent('Current revision 2 approved');
+    expect(row).not.toHaveTextContent('not yet approved');
+  });
+
+  it('lets the submitter read reviewer comments and decisions after the review closed', async () => {
+    serveReview();
+    await openCreative();
+    const feedback = await screen.findByRole('region', {
+      name: 'Review feedback',
+    });
+    expect(
+      await within(feedback).findByText(
+        /Revision 1 · Changes requested by Rita Reviewer/,
+      ),
+    ).toBeInTheDocument();
+    fireEvent.change(
+      within(feedback).getByRole('combobox', { name: 'Feedback revision' }),
+      { target: { value: '1' } },
+    );
+    expect(
+      await within(feedback).findByText('Please enlarge the logo'),
+    ).toBeInTheDocument();
+    expect(
+      within(feedback).getByRole('button', {
+        name: "Reply to Rita Reviewer's comment",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it('resubmits a newer revision with the previous workflow and clears the banner', async () => {
+    const { fetchMock, requests } = serveReview();
+    await openCreative();
+    const openBanner = await banner();
+    expect(openBanner).toHaveTextContent(
+      'Revision 1: Logo is too small (Use the large variant)',
+    );
+    expect(openBanner).toHaveTextContent('Revision 2 is saved.');
+    fireEvent.click(
+      within(openBanner).getByRole('button', { name: 'Resubmit for review' }),
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Revision 2 was resubmitted for review.',
+    );
+    const start = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url).endsWith('/creatives/creative-1/workflows') &&
+        (init as RequestInit | undefined)?.method === 'POST',
+    )!;
+    expect(JSON.parse(String((start[1] as RequestInit).body))).toEqual({
+      workflowId: 'workflow-1',
+      creativeRevisionId: 'revision-2',
+    });
+    expect(requests[0]!.status).toBe('RESOLVED');
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('region', { name: 'Open change requests' }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  // Regression (Stage 11 E2E): a run starts at the workflow's entry stage.
+  // When that is not a review stage (Draft → Review), the screen claimed the
+  // revision was "resubmitted for review" although no reviewer had a task,
+  // and the list kept the old status badge.
+  it('says where the run waits when resubmission lands on a non-review stage, and refreshes the list', async () => {
+    const { fetchMock } = serveReview({
+      startStage: { key: 'draft', name: 'Draft', requiresReview: false },
+    });
+    await openCreative();
+    const listCalls = () =>
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes('/creatives?'),
+      ).length;
+    const before = listCalls();
+    fireEvent.click(
+      within(await banner()).getByRole('button', {
+        name: 'Resubmit for review',
+      }),
+    );
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent(
+      'Revision 2 was resubmitted. Its workflow is at the Draft stage; move it on from Workflows to send it to a reviewer.',
+    );
+    expect(status).not.toHaveTextContent('resubmitted for review');
+    await waitFor(() => expect(listCalls()).toBeGreaterThan(before));
+    // The list row (found from its Open button) shows the new status.
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Open' }).closest('li'),
+      ).toHaveTextContent(/Draft/),
+    );
+  });
+
+  it('still says "resubmitted for review" when the run starts at a review stage', async () => {
+    serveReview({
+      startStage: { key: 'review', name: 'Review', requiresReview: true },
+    });
+    await openCreative();
+    fireEvent.click(
+      within(await banner()).getByRole('button', {
+        name: 'Resubmit for review',
+      }),
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Revision 2 was resubmitted for review.',
+    );
+  });
+
+  it('keeps the request open and explains a failed resubmission', async () => {
+    const { requests } = serveReview({ startStatus: 404 });
+    await openCreative();
+    fireEvent.click(
+      within(await banner()).getByRole('button', {
+        name: 'Resubmit for review',
+      }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Enabled workflow not found',
+    );
+    expect(requests[0]!.status).toBe('OPEN');
+    expect(await banner()).toBeInTheDocument();
+  });
+
+  it('asks for a new revision before offering resubmission', async () => {
+    serveReview({ current: revision });
+    await openCreative();
+    const openBanner = await banner();
+    expect(openBanner).toHaveTextContent(
+      'Save a new revision with the requested changes, then resubmit it for review.',
+    );
+    expect(
+      within(openBanner).queryByRole('button', { name: 'Resubmit for review' }),
+    ).toBeNull();
+  });
+
+  it('offers resubmission once a newer revision is saved', async () => {
+    serveReview({ current: revision });
+    await openCreative();
+    await banner();
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Headline' }), {
+      target: { value: 'Revised' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save new revision' }));
+    expect(
+      await within(await banner()).findByRole('button', {
+        name: 'Resubmit for review',
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it('does not offer resubmission while a run is active', async () => {
+    serveReview({ runStatus: 'RUNNING' });
+    await openCreative();
+    const openBanner = await banner();
+    expect(
+      await within(openBanner).findByText(
+        'A review is already running for this creative.',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(openBanner).queryByRole('button', { name: 'Resubmit for review' }),
+    ).toBeNull();
+  });
+
+  it('does not offer resubmission without workflows:start', async () => {
+    const { fetchMock } = serveReview();
+    await openCreative({
+      ...submitter,
+      permissions: submitter.permissions.filter(
+        (permission) => permission !== 'workflows:start',
+      ),
+    });
+    const openBanner = await banner();
+    expect(openBanner).toHaveTextContent(
+      'Someone who can start workflows needs to resubmit it for review.',
+    );
+    expect(
+      within(openBanner).queryByRole('button', { name: 'Resubmit for review' }),
+    ).toBeNull();
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'POST',
+      ),
+    ).toBe(false);
+  });
+
+  it('shows no feedback panel or banner without review read permissions', async () => {
+    const { fetchMock } = serveReview();
+    await openCreative({
+      ...submitter,
+      permissions: ['creatives:read', 'creatives:update', 'templates:read'],
+    });
+    await screen.findByRole('textbox', { name: 'Headline' });
+    expect(
+      screen.queryByRole('region', { name: 'Review feedback' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('region', { name: 'Open change requests' }),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        /\/(comments|decisions|change-requests|workflow)$/.test(String(url)),
+      ),
+    ).toBe(false);
   });
 });
