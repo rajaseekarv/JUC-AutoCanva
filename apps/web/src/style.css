@@ -1033,6 +1033,18 @@ input[type='file'] {
    ========================================================================== */
 /* Element-qualified so list text styles such as `.admin-list span` do not
    override the badge colors. */
+.approval-summary {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+}
+
+.creative-review-state .approval-summary {
+  display: inline;
+  margin-left: 0.25rem;
+}
+
 span.badge,
 strong.badge {
   display: inline-flex;
@@ -1273,4 +1285,252 @@ p[role='status'][aria-busy='true'] {
   align-items: center;
   gap: var(--space-2);
   font-size: var(--text-sm);
+}
+
+/* Brand assets */
+.admin-list .asset-in-use {
+  color: var(--color-warning);
+}
+.admin-list li.asset-row {
+  flex-wrap: wrap;
+}
+.asset-usage {
+  flex-basis: 100%;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+.asset-usage h4 {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--text-sm);
+}
+.asset-usage h4:first-child {
+  margin-top: 0;
+}
+.asset-usage ul {
+  margin: 0;
+  padding-left: var(--space-5);
+}
+.admin-list .asset-usage li {
+  display: list-item;
+  padding: var(--space-1) 0;
+  border-bottom: 0;
+}
+
+/* Asset images: thumbnails, previews, logos, and their fallbacks */
+.asset-image {
+  display: block;
+  flex: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-muted);
+  object-fit: contain;
+}
+.asset-image-thumbnail {
+  width: 64px;
+  height: 64px;
+}
+.asset-image-logo {
+  width: 120px;
+  height: 72px;
+}
+.asset-image-preview {
+  width: 100%;
+  max-width: 480px;
+  height: auto;
+  max-height: 360px;
+}
+/* Two classes so list text styles such as `.admin-list span` do not apply. */
+.asset-image.asset-image-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-1);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  line-height: 1.2;
+  text-align: center;
+  hyphens: auto;
+  overflow: hidden;
+}
+.asset-image-preview.asset-image-fallback {
+  min-height: 160px;
+}
+/* The thumbnail comes first, so the details repeat the first-child layout. */
+.admin-list li.asset-row .asset-row-details {
+  display: grid;
+  flex: 1 1 12rem;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* A grid stretched across the row: a shrink-to-fit flex line would size the
+   100%-wide image against itself and leave a gap below it. */
+.asset-preview {
+  display: grid;
+  grid-template-columns: minmax(0, 480px) minmax(0, 1fr);
+  flex-basis: 100%;
+  align-self: stretch;
+  align-items: start;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+/* List rows become columns here. Wrapping a column starts a new column, and a
+   flex basis becomes a height, so asset rows stack their parts instead. */
+@media (max-width: 640px) {
+  .admin-list li.asset-row {
+    flex-wrap: nowrap;
+  }
+  .admin-list li.asset-row .asset-row-details {
+    flex: none;
+  }
+  .asset-preview,
+  .asset-usage {
+    flex-basis: auto;
+    align-self: stretch;
+  }
+  .asset-preview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.asset-preview-details {
+  display: grid;
+  align-content: start;
+  justify-items: start;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.brand-logo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+.brand-logo figcaption {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+.asset-reference {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-1);
+  font-weight: 400;
+}
+.asset-reference-details {
+  display: grid;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.asset-reference-details span,
+.asset-reference-note {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
+/* Review feedback: comment threads, decision history and change requests */
+.review-feedback {
+  display: grid;
+  gap: var(--space-4);
+}
+.review-feedback-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.review-feedback-heading h3 {
+  margin: 0;
+}
+.feedback-block {
+  display: grid;
+  gap: var(--space-2);
+}
+.feedback-block h4 {
+  margin: 0;
+  font-size: var(--text-md);
+}
+.comment-threads,
+.comment-replies,
+.feedback-history {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.comment-threads > li {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.comment-threads > li:last-child {
+  border-bottom: 0;
+}
+.comment-replies {
+  justify-self: stretch;
+  gap: var(--space-2);
+  margin-left: var(--space-5);
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--color-border-strong);
+}
+.comment {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.comment p {
+  margin: 0;
+}
+.comment-meta {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+.comment-meta strong {
+  color: var(--color-text);
+}
+.comment-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.comment-reply-form {
+  display: grid;
+  justify-self: stretch;
+  gap: var(--space-2);
+}
+.feedback-history li {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.change-request-banner {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-md);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+.change-request-banner h3,
+.change-request-banner p,
+.change-request-banner ul {
+  margin: 0;
+}
+.change-request-banner ul {
+  padding-left: var(--space-5);
+  overflow-wrap: anywhere;
+}
+.change-request-banner .inline-actions {
+  flex-wrap: wrap;
+}
+@media (max-width: 640px) {
+  .comment-replies {
+    margin-left: var(--space-2);
+  }
 }
