@@ -76,7 +76,7 @@ Templates are organization-scoped records with a unique organization code, forma
 
 Template field mappings use a constrained source enum and allowlisted keys for organization brand, effective branch brand, or branch identity/contact data. Custom mappings accept explicit preview values only. Mapping metadata is never executed as an expression. Branch previews verify branch membership and organization scope on the API. Image/logo values resolve to asset metadata only after validating organization and branch scope.
 
-Template creation, metadata update, new draft version creation (`template.version_created`), activation (including the previous active version number), and archival are audited transactionally. Template field changes remain a future audit coverage extension.
+Template creation, metadata update, new draft version creation (`template.version_created`), activation (including the previous active version number), and archival are audited transactionally. Template field additions, updates (with changed keys and before/after snapshots) and removals are audited in the same draft-version transaction as the change.
 
 ## Creatives and revisions
 
@@ -84,7 +84,7 @@ Creatives are branch-scoped, organization-owned records. They may reference an e
 
 ## Sprint 8 audit and in-app notifications
 
-`AuditLog` rows are append-only through application APIs and retain scalar entity identifiers so entity/user deletion cannot cascade-delete history. The seeded organization administrator alone receives `audit:read`. Queries derive organization scope from the authenticated principal and constrain branch-linked rows to permitted branches. Metadata is object-shaped, capped at 4 KB, and rejects credential/file-content-like keys. Critical audit writes, including successful session creation/revocation, share a Prisma transaction with their business mutation.
+`AuditLog` rows are append-only through application APIs and retain scalar entity identifiers so entity/user deletion cannot cascade-delete history. The seeded organization administrator alone receives `audit:read`. Queries derive organization scope from the authenticated principal and constrain branch-linked rows to permitted branches. Metadata is object-shaped, capped at 4 KB, and rejects credential/file-content-like keys. Critical audit writes, including session creation (`auth.login`) and revocation (`auth.logout`), share a Prisma transaction with their business mutation. A refused login for an existing account is recorded as `auth.login_failed` with only a reason code (`INVALID_PASSWORD`, `INACTIVE`, `PASSWORD_NOT_SET`) and a null actor; unknown emails are not recorded, the 401 response does not vary, and a failed write of that record is logged and never changes the response.
 
 `InAppNotification` is recipient-scoped, unique by recipient and event key, and supports idempotent read/read-all operations. Recipients come from explicit task assignments or known workflow participants. Permission-based tasks do not identify one person and are not broadcast. Notifications are in-app only; email, push, sockets, and cleanup are out of scope.
 

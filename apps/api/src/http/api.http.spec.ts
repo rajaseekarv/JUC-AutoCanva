@@ -3,6 +3,7 @@ import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { Readable } from 'node:stream';
+import * as argon2 from 'argon2';
 import request from 'supertest';
 import {
   afterAll,
@@ -198,6 +199,175 @@ describe('HTTP API with mocked Prisma', () => {
           }),
         }),
       );
+    });
+  });
+
+  // Stage 11: exact audit writes for session creation, refused logins and
+  // revocation. Every write the request could make is a spy on a strict
+  // client, so an unexpected write fails the request.
+  describe('session audit', () => {
+    const PASSWORD = 'correct-horse-battery-staple';
+    let passwordHash = '';
+    beforeAll(async () => {
+      passwordHash = await argon2.hash(PASSWORD, { type: argon2.argon2id });
+    });
+    const account = (extra: Record<string, unknown> = {}) => ({
+      id: 'user-1',
+      organizationId: 'org-1',
+      name: 'Operator',
+      email: 'operator@example.local',
+      passwordHash,
+      status: 'ACTIVE',
+      branchAccess: [],
+      roleAssignments: [],
+      ...extra,
+    });
+    // The transaction client a login or logout runs against.
+    const mockWrites = (sessionUpdated = 1) => {
+      const writes = {
+        authSession: strict('tx.authSession', {
+          create: vi.fn(async () => ({ id: 'session-new' })),
+          updateMany: vi.fn(async () => ({ count: sessionUpdated })),
+        }),
+        auditLog: strict('tx.auditLog', {
+          create: vi.fn(async () => ({ id: 'audit-1' })),
+        }),
+      };
+      const tx = strict('tx', writes);
+      prismaRoot.$transaction = vi.fn(
+        async (work: (client: typeof tx) => Promise<unknown>) => work(tx),
+      );
+      return {
+        sessionCreate: writes.authSession.create as MockFn,
+        sessionRevoke: writes.authSession.updateMany as MockFn,
+        auditCreate: writes.auditLog.create as MockFn,
+      };
+    };
+    const login = (email: string, password: string) =>
+      request(server()).post('/api/v1/auth/login').send({ email, password });
+    const refusedBody = {
+      statusCode: 401,
+      error: 'Unauthorized',
+      message: 'Invalid email or password',
+    };
+
+    it('records one auth.login for a new session', async () => {
+      model('user').findUnique = vi.fn(async () => account());
+      const { sessionCreate, auditCreate } = mockWrites();
+      const response = await login('operator@example.local', PASSWORD).expect(
+        200,
+      );
+      expect(response.body.accessToken).toEqual(expect.any(String));
+      expect(sessionCreate).toHaveBeenCalledTimes(1);
+      expect(auditCreate).toHaveBeenCalledTimes(1);
+      expect(auditCreate).toHaveBeenCalledWith({
+        data: {
+          organizationId: 'org-1',
+          actorUserId: 'user-1',
+          action: 'auth.login',
+          entityType: 'auth_session',
+          entityId: 'session-new',
+          metadata: { expiresAt: expect.any(String) },
+        },
+      });
+    });
+
+    it.each([
+      ['a wrong password', {}, 'wrong-password', 'INVALID_PASSWORD'],
+      ['an inactive account', { status: 'DISABLED' }, PASSWORD, 'INACTIVE'],
+      [
+        'an account without a password',
+        { passwordHash: null },
+        PASSWORD,
+        'PASSWORD_NOT_SET',
+      ],
+    ])(
+      'records one auth.login_failed for %s and creates no session',
+      async (_case, extra, password, reason) => {
+        model('user').findUnique = vi.fn(async () => account(extra));
+        const { sessionCreate, auditCreate } = mockWrites();
+        const response = await login('operator@example.local', password).expect(
+          401,
+        );
+        expect(response.body).toEqual(refusedBody);
+        expect(sessionCreate).not.toHaveBeenCalled();
+        expect(auditCreate).toHaveBeenCalledTimes(1);
+        expect(auditCreate).toHaveBeenCalledWith({
+          data: {
+            organizationId: 'org-1',
+            actorUserId: null,
+            action: 'auth.login_failed',
+            entityType: 'user',
+            entityId: 'user-1',
+            metadata: { reason },
+          },
+        });
+        const stored = JSON.stringify(auditCreate.mock.calls[0]);
+        expect(stored).not.toContain(password);
+        expect(stored).not.toContain('operator@example.local');
+        expect(stored).not.toMatch(/argon2|token/i);
+      },
+    );
+
+    it('records nothing for an unknown email and answers exactly as for a wrong password', async () => {
+      model('user').findUnique = vi.fn(async () => null);
+      mockWrites();
+      const unknown = await login('nobody@example.local', PASSWORD).expect(401);
+      expect(unknown.body).toEqual(refusedBody);
+      expect(prismaRoot.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('still answers the same 401 when the failed-login record cannot be written', async () => {
+      model('user').findUnique = vi.fn(async () => account());
+      const { auditCreate } = mockWrites();
+      auditCreate.mockRejectedValueOnce(new Error('database unavailable'));
+      const response = await login('operator@example.local', 'nope').expect(
+        401,
+      );
+      expect(response.body).toEqual(refusedBody);
+    });
+
+    it('records one auth.logout when the session is revoked', async () => {
+      const { sessionRevoke, auditCreate } = mockWrites(1);
+      await request(server())
+        .post('/api/v1/auth/logout')
+        .set(auth())
+        .expect(204);
+      expect(sessionRevoke).toHaveBeenCalledWith({
+        where: { id: 'session-1', userId: 'user-1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(auditCreate).toHaveBeenCalledTimes(1);
+      expect(auditCreate).toHaveBeenCalledWith({
+        data: {
+          organizationId: 'org-1',
+          actorUserId: 'user-1',
+          action: 'auth.logout',
+          entityType: 'auth_session',
+          entityId: 'session-1',
+          metadata: {},
+        },
+      });
+    });
+
+    it('refuses a repeated logout with the revoked token and writes nothing', async () => {
+      // The guard no longer finds the session once it is revoked.
+      model('authSession').findFirst = vi.fn(async () => null);
+      mockWrites();
+      await request(server())
+        .post('/api/v1/auth/logout')
+        .set(auth())
+        .expect(401);
+      expect(prismaRoot.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('writes no audit record when a concurrent logout revoked the session first', async () => {
+      const { auditCreate } = mockWrites(0);
+      await request(server())
+        .post('/api/v1/auth/logout')
+        .set(auth())
+        .expect(204);
+      expect(auditCreate).not.toHaveBeenCalled();
     });
   });
 
@@ -576,6 +746,102 @@ describe('HTTP API with mocked Prisma', () => {
         expect(JSON.stringify(response.body)).not.toMatch(
           /P2002|Unique constraint/,
         );
+      });
+
+      // Stage 11: refused field edits write no audit record; an accepted one
+      // writes exactly one.
+      describe('field edit audit', () => {
+        // Holds both draft locks and serves the fields read under them.
+        const lockedFields = () => {
+          const writes = {
+            create: vi.fn(
+              async ({ data }: { data: Record<string, unknown> }) => ({
+                id: 'field-2',
+                required: false,
+                defaultValue: null,
+                validationRules: null,
+                helpText: null,
+                ...data,
+              }),
+            ),
+            update: vi.fn(),
+            delete: vi.fn(),
+          };
+          const auditCreate = vi.fn(async () => ({ id: 'audit-1' }));
+          transactionWith({
+            $queryRaw: vi.fn(async () => [{ id: 'locked' }]),
+            template: strict('tx.template', {
+              findUniqueOrThrow: vi.fn(async () => draftTemplate),
+            }),
+            templateField: strict('tx.templateField', {
+              findMany: vi.fn(async () => [headline]),
+              ...writes,
+            }),
+            auditLog: strict('tx.auditLog', { create: auditCreate }),
+          });
+          return { writes, auditCreate };
+        };
+
+        it.each(fieldChanges)(
+          'writes no audit record when %s is refused because the version froze',
+          async (_action, send) => {
+            const auditCreate = vi.fn();
+            transactionWith({
+              $queryRaw: vi.fn(async () => []),
+              auditLog: strict('tx.auditLog', { create: auditCreate }),
+            });
+            await send().set(auth()).expect(409);
+            expect(auditCreate).not.toHaveBeenCalled();
+          },
+        );
+
+        it('writes no field and no audit record for a duplicate key found under the lock', async () => {
+          const { writes, auditCreate } = lockedFields();
+          const response = await request(server())
+            .post('/api/v1/templates/template-1/fields')
+            .set(auth())
+            .send({ key: 'headline', label: 'Second headline', type: 'TEXT' })
+            .expect(409);
+          expect(response.body.message).toBe(
+            'Field key already exists in this version',
+          );
+          expect(writes.create).not.toHaveBeenCalled();
+          expect(auditCreate).not.toHaveBeenCalled();
+        });
+
+        it('writes no audit record for a field that does not exist', async () => {
+          const { writes, auditCreate } = lockedFields();
+          await request(server())
+            .patch('/api/v1/templates/template-1/fields/field-missing')
+            .set(auth())
+            .send({ label: 'Renamed' })
+            .expect(404);
+          expect(writes.update).not.toHaveBeenCalled();
+          expect(auditCreate).not.toHaveBeenCalled();
+        });
+
+        it('writes exactly one template.field_added for an accepted field', async () => {
+          const { auditCreate } = lockedFields();
+          await request(server())
+            .post('/api/v1/templates/template-1/fields')
+            .set(auth())
+            .send({ key: 'offer', label: 'Offer', type: 'TEXT' })
+            .expect(201);
+          expect(auditCreate).toHaveBeenCalledTimes(1);
+          expect(auditCreate).toHaveBeenCalledWith({
+            data: expect.objectContaining({
+              organizationId: 'org-1',
+              actorUserId: 'user-1',
+              action: 'template.field_added',
+              entityType: 'template',
+              entityId: 'template-1',
+              metadata: expect.objectContaining({
+                versionNumber: 1,
+                fieldId: 'field-2',
+              }),
+            }),
+          });
+        });
       });
 
       const lockedActivation = (client: Record<string, unknown>) =>
