@@ -411,3 +411,392 @@ describe('WorkflowWorkspace starting another run', () => {
     ).toBeInTheDocument();
   });
 });
+
+// Stage 10.3: cancelling a running run from the Workflows screen.
+describe('WorkflowWorkspace run cancellation', () => {
+  const managerUser: AuthenticatedUserResponse = {
+    ...user,
+    id: 'manager-1',
+    permissions: ['workflows:read', 'workflows:manage', 'creatives:read'],
+  };
+  const runningRun = (extra: Record<string, unknown> = {}) => ({
+    ...running,
+    startedById: 'user-1',
+    _count: { approvalDecisions: 0 },
+    ...extra,
+  });
+  const cancelledRun = {
+    ...runningRun(),
+    status: 'CANCELLED',
+    tasks: [],
+    history: [
+      ...running.history,
+      {
+        id: 'history-cancel',
+        actionKey: 'CANCEL',
+        reason: 'Reviewer is away',
+        createdAt: '2026-10-22T11:00:00Z',
+        fromStage: stages[0],
+        toStage: stages[0],
+      },
+    ],
+  };
+  const errorReply = (status: number, message: string) => ({
+    ok: false,
+    status,
+    json: async () => ({ message }),
+    text: async () => JSON.stringify({ message }),
+  });
+
+  function serve(
+    options: {
+      run?: Record<string, unknown>;
+      cancelStatus?: number;
+      cancelMessage?: string;
+      holdCancel?: boolean;
+    } = {},
+  ) {
+    let run: Record<string, unknown> = options.run ?? runningRun();
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/workflow-instances/instance-1/cancel')) {
+        if (options.holdCancel) await held;
+        if (options.cancelStatus)
+          return errorReply(
+            options.cancelStatus,
+            options.cancelMessage ?? 'Workflow is not running',
+          );
+        run = cancelledRun;
+        return { ...okReply(cancelledRun), status: 201 };
+      }
+      if (url.endsWith('/workflows')) return okReply([workflow]);
+      if (url.includes('/creatives?branchId=')) return okReply([creative]);
+      if (url.endsWith('/creatives/creative-1/workflow')) return okReply(run);
+      if (url.endsWith('/transitions') && !init?.method) return okReply([]);
+      return okReply(null);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const cancels = () =>
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/cancel'));
+    return { fetchMock, cancels, release: () => release() };
+  }
+
+  async function openRun(
+    sessionUser: AuthenticatedUserResponse = managerUser,
+    onDataChanged = vi.fn(),
+  ) {
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user: sessionUser }}
+        branch={branch}
+        onDataChanged={onDataChanged}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: 'creative-1' } },
+    );
+    await screen.findByRole('heading', { name: /^Draft/ });
+    return onDataChanged;
+  }
+  const cancelButton = () =>
+    screen.queryByRole('button', { name: 'Cancel run' });
+  const reasonBox = () =>
+    screen.getByRole('textbox', { name: 'Reason for cancelling (required)' });
+  const confirm = () =>
+    screen.getByRole('button', { name: /Confirm cancellation|Cancelling…/ });
+
+  it('offers Cancel run to a workflow manager for a running run, even after decisions', async () => {
+    serve({ run: runningRun({ _count: { approvalDecisions: 2 } }) });
+    await openRun();
+    expect(cancelButton()).toBeInTheDocument();
+  });
+
+  it('offers Cancel run to the starter while the run has no decision', async () => {
+    serve();
+    await openRun(user);
+    expect(cancelButton()).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      'the starter once a decision is recorded',
+      user,
+      { _count: { approvalDecisions: 1 } },
+    ],
+    [
+      'the starter when the decision count is unknown',
+      user,
+      { _count: undefined },
+    ],
+    ['a user who did not start the run', { ...user, id: 'user-9' }, {}],
+    [
+      'the starter without workflows:start',
+      {
+        ...user,
+        permissions: [
+          'workflows:read',
+          'workflows:transition',
+          'creatives:read',
+        ],
+      },
+      {},
+    ],
+  ])('does not offer Cancel run to %s', async (_label, sessionUser, extra) => {
+    serve({ run: runningRun(extra) });
+    await openRun(sessionUser);
+    expect(cancelButton()).not.toBeInTheDocument();
+  });
+
+  it('does not offer Cancel run for a run that is not running', async () => {
+    serve({ run: { ...completed, startedById: 'user-1' } });
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user: managerUser }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: 'creative-1' } },
+    );
+    await screen.findByRole('heading', { name: /^Ready/ });
+    expect(cancelButton()).not.toBeInTheDocument();
+  });
+
+  it('requires a reason and sends nothing without one', async () => {
+    const { cancels } = serve();
+    await openRun();
+    fireEvent.click(cancelButton()!);
+    fireEvent.change(reasonBox(), { target: { value: '   ' } });
+    fireEvent.click(confirm());
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Enter a reason for cancelling this run.',
+    );
+    expect(reasonBox()).toHaveAttribute('aria-invalid', 'true');
+    expect(reasonBox()).toHaveAttribute('maxLength', '1000');
+    expect(cancels()).toEqual([]);
+  });
+
+  it('shows a server error next to the reason and keeps the form for a retry', async () => {
+    serve({
+      cancelStatus: 409,
+      cancelMessage: 'Workflow changed concurrently; reload and retry',
+    });
+    await openRun();
+    fireEvent.click(cancelButton()!);
+    fireEvent.change(reasonBox(), { target: { value: 'Stuck' } });
+    fireEvent.click(confirm());
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Workflow changed concurrently; reload and retry',
+    );
+    expect(reasonBox()).toHaveValue('Stuck');
+    expect(confirm()).toBeEnabled();
+  });
+
+  it('cancels with the trimmed reason, shows the cancelled run and its reason, and tells other screens', async () => {
+    const { cancels } = serve();
+    const onDataChanged = await openRun({
+      ...managerUser,
+      permissions: [...managerUser.permissions, 'workflows:start'],
+    });
+    fireEvent.click(cancelButton()!);
+    fireEvent.change(reasonBox(), {
+      target: { value: '  Reviewer is away  ' },
+    });
+    fireEvent.click(confirm());
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Run cancelled. The creative can be revised and submitted again.',
+    );
+    expect(cancels()).toHaveLength(1);
+    expect(JSON.parse(String((cancels()[0]![1] as RequestInit).body))).toEqual({
+      reason: 'Reviewer is away',
+    });
+    expect(
+      screen.getByRole('heading', { name: /^Draft · Cancelled/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Cancelled at Draft · .* · Reason: Reviewer is away/),
+    ).toBeInTheDocument();
+    expect(cancelButton()).not.toBeInTheDocument();
+    expect(onDataChanged).toHaveBeenCalledWith('workflows');
+    // A new run can be started for the recovered creative.
+    expect(
+      screen.getByRole('button', { name: 'Start workflow' }),
+    ).toBeInTheDocument();
+  });
+
+  it('sends one request when Confirm is clicked twice', async () => {
+    const { cancels, release } = serve({ holdCancel: true });
+    await openRun();
+    fireEvent.click(cancelButton()!);
+    fireEvent.change(reasonBox(), { target: { value: 'Stuck' } });
+    fireEvent.click(confirm());
+    fireEvent.click(confirm());
+    expect(confirm()).toBeDisabled();
+    expect(confirm()).toHaveTextContent('Cancelling…');
+    release();
+    await screen.findByRole('status');
+    expect(cancels()).toHaveLength(1);
+  });
+
+  it('closes the form without cancelling when Keep running is chosen', async () => {
+    const { cancels } = serve();
+    await openRun();
+    fireEvent.click(cancelButton()!);
+    fireEvent.change(reasonBox(), { target: { value: 'Maybe' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Keep running' }));
+    expect(
+      screen.queryByRole('textbox', {
+        name: 'Reason for cancelling (required)',
+      }),
+    ).not.toBeInTheDocument();
+    expect(cancelButton()).toBeInTheDocument();
+    expect(cancels()).toEqual([]);
+  });
+});
+
+// Stage 10.6: the API refuses a run for a revision whose change requests
+// are still OPEN or IN_PROGRESS; the screen explains it before Start.
+describe('WorkflowWorkspace start with unresolved change requests', () => {
+  const reader: AuthenticatedUserResponse = {
+    ...user,
+    permissions: [...user.permissions, 'change_requests:read'],
+  };
+  // The creative's current revision is 2.
+  const atRevisionTwo = { ...creative, currentRevision: { revisionNumber: 2 } };
+  const errorReply = (status: number, message: string) => ({
+    ok: false,
+    status,
+    json: async () => ({ message }),
+    text: async () => JSON.stringify({ message }),
+  });
+
+  function serve(
+    requests: { status: string; revisionNumber: number }[],
+    options: { startStatus?: number } = {},
+  ) {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (
+        url.endsWith('/creatives/creative-1/workflows') &&
+        init?.method === 'POST'
+      )
+        return options.startStatus
+          ? errorReply(
+              options.startStatus,
+              'Save a new revision with the requested changes before resubmitting.',
+            )
+          : okReply({ ...running, id: 'instance-2' });
+      if (url.endsWith('/creatives/creative-1/change-requests'))
+        return okReply(requests);
+      if (url.endsWith('/workflows')) return okReply([workflow]);
+      if (url.includes('/creatives?branchId=')) return okReply([atRevisionTwo]);
+      if (url.endsWith('/creatives/creative-1/workflow'))
+        return okReply(completed);
+      return okReply([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+  async function openStart(sessionUser = reader) {
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user: sessionUser }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: creative.id } },
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Workflow to start' }),
+      { target: { value: workflow.id } },
+    );
+  }
+  const startButton = () =>
+    screen.getByRole('button', { name: 'Start workflow' });
+  const explanation =
+    'Revision 2 has unresolved change requests. Save a new revision with the requested changes in Creatives before resubmitting it for review.';
+  const starts = (fetchMock: ReturnType<typeof serve>) =>
+    fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url).endsWith('/workflows') &&
+        (init as RequestInit | undefined)?.method === 'POST',
+    );
+
+  it.each(['OPEN', 'IN_PROGRESS'])(
+    'disables Start and explains why while the current revision has an %s request',
+    async (status) => {
+      const fetchMock = serve([{ status, revisionNumber: 2 }]);
+      await openStart();
+      const note = await screen.findByText(explanation);
+      await waitFor(() => expect(startButton()).toBeDisabled());
+      expect(startButton()).toHaveAttribute('aria-describedby', note.id);
+      fireEvent.click(startButton());
+      expect(starts(fetchMock)).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['a resolved request on the current revision', 'RESOLVED', 2],
+    ['a cancelled request on the current revision', 'CANCELLED', 2],
+    ['an open request on an older revision', 'OPEN', 1],
+  ])('keeps Start available for %s', async (_label, status, revisionNumber) => {
+    serve([{ status, revisionNumber }]);
+    await openStart();
+    await waitFor(() => expect(startButton()).toBeEnabled());
+    expect(screen.queryByText(explanation)).not.toBeInTheDocument();
+  });
+
+  it('without change_requests:read, requests none and shows the API 409, keeping the chosen workflow', async () => {
+    const fetchMock = serve([{ status: 'OPEN', revisionNumber: 2 }], {
+      startStatus: 409,
+    });
+    await openStart(user);
+    await waitFor(() => expect(startButton()).toBeEnabled());
+    fireEvent.click(startButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Save a new revision with the requested changes before resubmitting.',
+    );
+    expect(
+      screen.getByRole('combobox', { name: 'Workflow to start' }),
+    ).toHaveValue(workflow.id);
+    expect(starts(fetchMock)).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).endsWith('/change-requests'),
+      ),
+    ).toBe(false);
+  });
+
+  it('reloads the requests after a refused start, so a request added meanwhile is explained', async () => {
+    let requests: { status: string; revisionNumber: number }[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/creatives/creative-1/workflows') && init?.method)
+        return errorReply(
+          409,
+          'Save a new revision with the requested changes before resubmitting.',
+        );
+      if (url.endsWith('/change-requests')) return okReply(requests);
+      if (url.endsWith('/workflows')) return okReply([workflow]);
+      if (url.includes('/creatives?branchId=')) return okReply([atRevisionTwo]);
+      if (url.endsWith('/creatives/creative-1/workflow'))
+        return okReply(completed);
+      return okReply([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await openStart();
+    await waitFor(() => expect(startButton()).toBeEnabled());
+    requests = [{ status: 'OPEN', revisionNumber: 2 }];
+    fireEvent.click(startButton());
+    expect(await screen.findByText(explanation)).toBeInTheDocument();
+    expect(startButton()).toBeDisabled();
+  });
+});

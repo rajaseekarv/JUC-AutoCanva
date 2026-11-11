@@ -115,6 +115,12 @@ describe('validateWorkflowDefinition', () => {
           displayOrder: 1,
           isTerminal: true,
         },
+        {
+          key: 'changes',
+          name: 'Changes requested',
+          displayOrder: 2,
+          isTerminal: true,
+        },
       ],
       transitions: [
         {
@@ -123,6 +129,13 @@ describe('validateWorkflowDefinition', () => {
           from: 'review',
           to: 'approved',
           reviewDecision: 'APPROVED',
+        },
+        {
+          key: 'request',
+          label: 'Request changes',
+          from: 'review',
+          to: 'changes',
+          reviewDecision: 'CHANGES_REQUESTED',
         },
       ],
     };
@@ -136,7 +149,7 @@ describe('validateWorkflowDefinition', () => {
             assignedUserId: null,
             assignedPermission: null,
           },
-          reviewDefinition.stages[1]!,
+          ...reviewDefinition.stages.slice(1),
         ],
       }),
     ).toContain(
@@ -150,12 +163,311 @@ describe('validateWorkflowDefinition', () => {
             ...reviewDefinition.stages[0]!,
             assignedPermission: 'approvals:decide',
           },
-          reviewDefinition.stages[1]!,
+          ...reviewDefinition.stages.slice(1),
         ],
       }),
     ).toContain(
       'Review stage review requires exactly one reviewer assignment.',
     );
+  });
+
+  describe('review decisions', () => {
+    const reviewStage = {
+      key: 'review',
+      name: 'Review',
+      displayOrder: 1,
+      requiresReview: true,
+      assignedPermission: 'approvals:decide',
+    };
+    const base: WorkflowDefinitionInput = {
+      name: 'Two decisions',
+      stages: [
+        { key: 'draft', name: 'Draft', displayOrder: 0, isEntry: true },
+        reviewStage,
+        {
+          key: 'approved',
+          name: 'Approved',
+          displayOrder: 2,
+          isTerminal: true,
+        },
+        { key: 'changes', name: 'Changes', displayOrder: 3, isTerminal: true },
+      ],
+      transitions: [
+        { key: 'submit', label: 'Submit', from: 'draft', to: 'review' },
+        {
+          key: 'approve',
+          label: 'Approve',
+          from: 'review',
+          to: 'approved',
+          reviewDecision: 'APPROVED',
+        },
+        {
+          key: 'request',
+          label: 'Request changes',
+          from: 'review',
+          to: 'changes',
+          reviewDecision: 'CHANGES_REQUESTED',
+        },
+      ],
+    };
+    const without = (key: string) => ({
+      ...base,
+      transitions: base.transitions.filter((item) => item.key !== key),
+    });
+
+    it('accepts a review stage with exactly one approval and one changes-requested route', () => {
+      expect(validateWorkflowDefinition(base)).toEqual([]);
+    });
+
+    it('rejects a review stage that can only request changes', () => {
+      const errors = validateWorkflowDefinition({
+        ...without('approve'),
+        stages: base.stages.filter((stage) => stage.key !== 'approved'),
+      });
+      expect(errors).toEqual([
+        'Review stage review requires one APPROVED transition.',
+      ]);
+    });
+
+    it('rejects a review stage that can only approve', () => {
+      const errors = validateWorkflowDefinition({
+        ...without('request'),
+        stages: base.stages.filter((stage) => stage.key !== 'changes'),
+      });
+      expect(errors).toEqual([
+        'Review stage review requires one CHANGES_REQUESTED transition.',
+      ]);
+    });
+
+    it('reports both missing decisions for a review stage with untagged routes only', () => {
+      const errors = validateWorkflowDefinition({
+        ...base,
+        transitions: [
+          base.transitions[0]!,
+          { key: 'next', label: 'Next', from: 'review', to: 'approved' },
+        ],
+        stages: base.stages.filter((stage) => stage.key !== 'changes'),
+      });
+      expect(errors).toEqual(
+        expect.arrayContaining([
+          'Review stage review requires one APPROVED transition.',
+          'Review stage review requires one CHANGES_REQUESTED transition.',
+          'Every transition from review stage review must declare a review decision.',
+        ]),
+      );
+    });
+
+    it('still rejects two transitions for the same decision', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...base,
+          transitions: [
+            ...base.transitions,
+            {
+              key: 'approve-again',
+              label: 'Approve again',
+              from: 'review',
+              to: 'approved',
+              reviewDecision: 'APPROVED',
+            },
+          ],
+        }),
+      ).toContain('Review stage review has multiple APPROVED transitions.');
+    });
+
+    it('rejects a review stage that transitions to itself', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...base,
+          transitions: base.transitions.map((item) =>
+            item.key === 'approve' ? { ...item, to: 'review' } : item,
+          ),
+          stages: base.stages.filter((stage) => stage.key !== 'approved'),
+        }),
+      ).toContain(
+        'Review stage review cannot transition to itself; a decision must move the run to another stage.',
+      );
+    });
+
+    it('accepts an entry stage that is itself the review stage', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...base,
+          stages: [
+            { ...reviewStage, displayOrder: 0, isEntry: true },
+            ...base.stages.slice(2),
+          ],
+          transitions: base.transitions.slice(1),
+        }),
+      ).toEqual([]);
+    });
+
+    it('accepts several review stages, each with its own two decisions, and several terminal stages', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...base,
+          stages: [
+            ...base.stages,
+            {
+              key: 'legal',
+              name: 'Legal',
+              displayOrder: 4,
+              requiresReview: true,
+              assignedPermission: 'approvals:decide',
+            },
+            {
+              key: 'rejected',
+              name: 'Rejected',
+              displayOrder: 5,
+              isTerminal: true,
+            },
+          ],
+          transitions: [
+            base.transitions[0]!,
+            {
+              key: 'approve',
+              label: 'Approve',
+              from: 'review',
+              to: 'legal',
+              reviewDecision: 'APPROVED',
+            },
+            base.transitions[2]!,
+            {
+              key: 'legal-approve',
+              label: 'Approve',
+              from: 'legal',
+              to: 'approved',
+              reviewDecision: 'APPROVED',
+            },
+            {
+              key: 'legal-request',
+              label: 'Request changes',
+              from: 'legal',
+              to: 'rejected',
+              reviewDecision: 'CHANGES_REQUESTED',
+            },
+          ],
+        }),
+      ).toEqual([]);
+    });
+  });
+
+  describe('reachability', () => {
+    const stage = (key: string, displayOrder: number, extra = {}) => ({
+      key,
+      name: key,
+      displayOrder,
+      ...extra,
+    });
+
+    it('rejects a stage that cannot be reached from the entry', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...valid,
+          stages: [
+            ...valid.stages,
+            stage('orphan', 2),
+            stage('archived', 3, { isTerminal: true }),
+          ],
+          transitions: [
+            ...valid.transitions,
+            {
+              key: 'archive',
+              label: 'Archive',
+              from: 'orphan',
+              to: 'archived',
+            },
+          ],
+        }),
+      ).toEqual([
+        'Stage orphan is unreachable from the entry stage draft.',
+        'Stage archived is unreachable from the entry stage draft.',
+      ]);
+    });
+
+    it('rejects an unreachable terminal stage', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...valid,
+          stages: [...valid.stages, stage('spare', 2, { isTerminal: true })],
+        }),
+      ).toEqual(['Stage spare is unreachable from the entry stage draft.']);
+    });
+
+    it('rejects a cycle of non-review stages with no way to a terminal stage', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...valid,
+          stages: [...valid.stages, stage('a', 2), stage('b', 3)],
+          transitions: [
+            ...valid.transitions,
+            { key: 'to-a', label: 'To A', from: 'draft', to: 'a' },
+            { key: 'a-b', label: 'A to B', from: 'a', to: 'b' },
+            { key: 'b-a', label: 'B to A', from: 'b', to: 'a' },
+          ],
+        }),
+      ).toEqual([
+        'Stage a cannot reach a terminal stage, so a run there could never finish.',
+        'Stage b cannot reach a terminal stage, so a run there could never finish.',
+      ]);
+    });
+
+    it('rejects a non-review stage whose only transition is a self-loop', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...valid,
+          stages: [...valid.stages, stage('hold', 2)],
+          transitions: [
+            ...valid.transitions,
+            { key: 'hold', label: 'Hold', from: 'draft', to: 'hold' },
+            { key: 'wait', label: 'Wait', from: 'hold', to: 'hold' },
+          ],
+        }),
+      ).toEqual([
+        'Stage hold cannot reach a terminal stage, so a run there could never finish.',
+      ]);
+    });
+
+    it('accepts a non-review self-loop that also has a way out', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...valid,
+          stages: [...valid.stages, stage('hold', 2)],
+          transitions: [
+            ...valid.transitions,
+            { key: 'hold', label: 'Hold', from: 'draft', to: 'hold' },
+            { key: 'wait', label: 'Wait', from: 'hold', to: 'hold' },
+            { key: 'release', label: 'Release', from: 'hold', to: 'ready' },
+          ],
+        }),
+      ).toEqual([]);
+    });
+
+    it('accepts several terminal stages reached on different routes', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...valid,
+          stages: [...valid.stages, stage('dropped', 2, { isTerminal: true })],
+          transitions: [
+            ...valid.transitions,
+            { key: 'drop', label: 'Drop', from: 'draft', to: 'dropped' },
+          ],
+        }),
+      ).toEqual([]);
+    });
+
+    it('does not repeat the dead-end error as a reachability error', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...valid,
+          stages: [...valid.stages, stage('stuck', 2)],
+          transitions: [
+            ...valid.transitions,
+            { key: 'stick', label: 'Stick', from: 'draft', to: 'stuck' },
+          ],
+        }),
+      ).toEqual(['Non-terminal stage stuck requires an outgoing transition.']);
+    });
   });
 
   describe('changes-requested routes', () => {

@@ -5,7 +5,11 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ChangeRequestStatus, Prisma } from '@prisma/client';
+import {
+  ChangeRequestStatus,
+  Prisma,
+  ReviewDecisionType,
+} from '@prisma/client';
 import type { AuthenticatedPrincipal } from '../auth/auth.types';
 import { PERMISSIONS } from '../auth/permissions';
 import { PrismaService } from '../prisma/prisma.service';
@@ -16,6 +20,19 @@ import {
   type StageDefinition,
   type WorkflowDefinitionInput,
 } from './workflow-definition';
+import { UNREVIEWED_REVISION_STATUS } from '../creatives/creative-review-state';
+import { isRolledBackTransaction } from '../prisma/transaction-errors';
+
+export const CANCEL_REASON_MAX_LENGTH = 1000;
+// Run status after cancellation. It frees the creative for a new run (only
+// RUNNING runs are unique per creative) and never counts as an approval.
+export const CANCELLED_RUN_STATUS = 'CANCELLED';
+// History action key of a cancellation; the reason is stored with it.
+export const CANCEL_ACTION_KEY = 'CANCEL';
+// Why a run cannot start, or enter review, for a revision whose change
+// requests are still OPEN or IN_PROGRESS.
+export const UNRESOLVED_CHANGE_REQUEST_MESSAGE =
+  'Save a new revision with the requested changes before resubmitting.';
 
 const definitionInclude = {
   versions: {
@@ -43,9 +60,13 @@ export class WorkflowsService {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
       });
     } catch (error) {
+      // A unique-key race, or PostgreSQL rolling the transaction back
+      // (deadlock or serialization failure, however Prisma reports it):
+      // nothing was applied.
       if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        (error.code === 'P2034' || error.code === 'P2002')
+        (error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002') ||
+        isRolledBackTransaction(error)
       )
         throw new ConflictException(
           'Workflow changed concurrently; reload and retry',
@@ -399,16 +420,34 @@ export class WorkflowsService {
         throw new ConflictException(
           `Workflow ${workflow.name} cannot start new runs until it is updated and enabled again: ${definitionErrors.join(' ')}`,
         );
+      // Only the current revision can be reviewed: decide() refuses any
+      // other, so a run for an older revision could never be decided and
+      // would leave the creative locked.
+      if (!creative.currentRevisionId)
+        throw new ConflictException(
+          'Creative has no current revision to submit; save a revision first',
+        );
       const revision = await tx.creativeRevision.findFirst({
-        where: {
-          id: revisionId ?? creative.currentRevisionId ?? '',
-          creativeId,
-        },
+        where: { id: revisionId ?? creative.currentRevisionId, creativeId },
       });
       if (!revision)
         throw new BadRequestException(
           'Creative revision does not belong to this creative',
         );
+      if (revision.id !== creative.currentRevisionId) {
+        const current = await tx.creativeRevision.findFirst({
+          where: { id: creative.currentRevisionId, creativeId },
+          select: { revisionNumber: true },
+        });
+        throw new ConflictException(
+          `Only the current revision${current ? ` (${current.revisionNumber})` : ''} can be submitted for review; revision ${revision.revisionNumber} is an older revision`,
+        );
+      }
+      // Changes requested on this exact revision are still unanswered: a new
+      // run would only show the reviewer the same revision again. Requests
+      // on older revisions do not block; this run resolves them below.
+      if (await this.hasUnresolvedChangeRequest(tx, user, revision.id))
+        throw new ConflictException(UNRESOLVED_CHANGE_REQUEST_MESSAGE);
       const entry = version.stages.find((stage) => stage.isEntry);
       if (!entry) throw new ConflictException('Workflow has no entry stage');
       if (
@@ -591,6 +630,9 @@ export class WorkflowsService {
         orderBy: { createdAt: 'asc' as const },
         include: { fromStage: true, toStage: true },
       },
+      // Lets the client show cancellation to the run's starter only while
+      // no decision exists; cancel() enforces the same rule.
+      _count: { select: { approvalDecisions: true } },
     };
   }
 
@@ -720,6 +762,20 @@ export class WorkflowsService {
       transition.destination.assignedUserId,
       tx,
     );
+    // Entering a review with unanswered change requests on the run's own
+    // revision would ask for a decision on a revision already known to need
+    // changes. This also covers an approval that leads into a further review.
+    if (
+      transition.destination.requiresReview &&
+      (await this.hasUnresolvedChangeRequest(
+        tx,
+        user,
+        instance.creativeRevisionId,
+      ))
+    )
+      throw new ConflictException(
+        `Revision cannot enter review stage ${transition.destination.name} while it has unresolved change requests. ${UNRESOLVED_CHANGE_REQUEST_MESSAGE}`,
+      );
     const updated = await tx.workflowInstance.updateMany({
       where: {
         id,
@@ -801,9 +857,211 @@ export class WorkflowsService {
       where: { id: instance.creativeId },
       data: { status: transition.destination.key },
     });
+    if (transition.destination.isTerminal)
+      await this.notifyRunApproved(tx, user, instance);
     return tx.workflowInstance.findUniqueOrThrow({
       where: { id },
       include: this.instanceInclude(),
+    });
+  }
+
+  private async hasUnresolvedChangeRequest(
+    tx: Prisma.TransactionClient,
+    user: AuthenticatedPrincipal,
+    creativeRevisionId: string,
+  ): Promise<boolean> {
+    const unresolved = await tx.changeRequest.count({
+      where: {
+        organizationId: user.organizationId,
+        creativeRevisionId,
+        status: {
+          in: [ChangeRequestStatus.OPEN, ChangeRequestStatus.IN_PROGRESS],
+        },
+      },
+    });
+    return unresolved > 0;
+  }
+
+  // The "Creative approved" notice is sent when a run completes and, as in
+  // the Stage 10.1 approval rule, every decision recorded in it is an
+  // approval. An approval at an earlier review stage only moves the run on,
+  // so it announces nothing yet. The event key is per run, so the notice is
+  // created at most once.
+  private async notifyRunApproved(
+    tx: Prisma.TransactionClient,
+    user: AuthenticatedPrincipal,
+    run: {
+      id: string;
+      branchId: string;
+      creativeId: string;
+      creativeRevisionId: string;
+      startedById: string;
+    },
+  ): Promise<void> {
+    if (run.startedById === user.id) return;
+    const decisions = await tx.approvalDecision.findMany({
+      where: { workflowInstanceId: run.id },
+      select: {
+        id: true,
+        decision: true,
+        revisionNumber: true,
+        reviewer: { select: { name: true } },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    if (
+      !decisions.length ||
+      decisions.some((item) => item.decision !== ReviewDecisionType.APPROVED)
+    )
+      return;
+    const final = decisions[0]!;
+    const creative = await tx.creative.findUnique({
+      where: { id: run.creativeId },
+      select: { name: true },
+    });
+    await this.notifications.create(tx, {
+      recipientUserId: run.startedById,
+      organizationId: user.organizationId,
+      eventKey: `creative-approved:${run.id}`,
+      type: 'CREATIVE_APPROVED',
+      title: 'Creative approved',
+      message: `${final.reviewer.name} approved revision ${final.revisionNumber} of ${creative?.name ?? 'the creative'}.`,
+      entityType: 'approval_decision',
+      entityId: final.id,
+      branchId: run.branchId,
+      creativeId: run.creativeId,
+      creativeRevisionId: run.creativeRevisionId,
+      workflowInstanceId: run.id,
+    });
+  }
+
+  // Ends a RUNNING run without completing it, so a creative held by a run
+  // that cannot move on can be revised and resubmitted. A workflow manager
+  // may cancel any run in a branch they can access; whoever started the run
+  // may cancel it only while no review decision has been recorded in it.
+  // Decisions, change requests and history are kept; open tasks go stale.
+  async cancel(user: AuthenticatedPrincipal, id: string, reason: string) {
+    const manager = user.permissions.includes(PERMISSIONS.WORKFLOW_MANAGE);
+    if (!manager && !user.permissions.includes(PERMISSIONS.WORKFLOW_START))
+      throw new ForbiddenException('Permission denied');
+    const trimmed = reason.trim();
+    if (!trimmed || trimmed.length > CANCEL_REASON_MAX_LENGTH)
+      throw new BadRequestException(
+        `A cancellation reason of 1 to ${CANCEL_REASON_MAX_LENGTH} characters is required`,
+      );
+    return this.transaction(async (tx) => {
+      const instance = await tx.workflowInstance.findFirst({
+        where: { id, organizationId: user.organizationId },
+        include: {
+          currentStage: true,
+          workflow: { select: { id: true, name: true } },
+          creative: { select: { id: true, name: true } },
+        },
+      });
+      if (!instance) throw new NotFoundException('Workflow instance not found');
+      // Out-of-scope runs look the same as missing ones.
+      await this.assertBranch(user, instance.branchId, tx);
+      if (!manager && instance.startedById !== user.id)
+        throw new ForbiddenException(
+          'Only a workflow manager or the person who started this run can cancel it',
+        );
+      if (instance.status !== 'RUNNING')
+        throw new ConflictException('Workflow is not running');
+      if (!manager) {
+        const decisions = await tx.approvalDecision.count({
+          where: { workflowInstanceId: id },
+        });
+        if (decisions)
+          throw new ForbiddenException(
+            'A review decision has been recorded in this run; only a workflow manager can cancel it now',
+          );
+      }
+      // Guarded like a transition: a concurrent decision or transition
+      // (or another cancellation) changes the row first and this fails
+      // with 409 before anything else is written.
+      const cancelled = await tx.workflowInstance.updateMany({
+        where: {
+          id,
+          status: 'RUNNING',
+          currentStageId: instance.currentStageId,
+        },
+        data: { status: CANCELLED_RUN_STATUS, completedAt: new Date() },
+      });
+      if (cancelled.count !== 1)
+        throw new ConflictException(
+          'Workflow changed concurrently; reload and retry',
+        );
+      const openTasks = await tx.workflowTask.findMany({
+        where: { instanceId: id, status: 'OPEN' },
+        select: { assignedUserId: true },
+      });
+      await tx.workflowTask.updateMany({
+        where: { instanceId: id, status: 'OPEN' },
+        data: { status: 'STALE' },
+      });
+      await tx.workflowTransitionHistory.create({
+        data: {
+          instanceId: id,
+          versionId: instance.workflowVersionId,
+          fromStageId: instance.currentStageId,
+          toStageId: instance.currentStageId,
+          actorId: user.id,
+          actionKey: CANCEL_ACTION_KEY,
+          reason: trimmed,
+        },
+      });
+      // The run is the creative's latest (only one may be RUNNING), and its
+      // revision has left review without a result.
+      await tx.creative.update({
+        where: { id: instance.creativeId },
+        data: { status: UNREVIEWED_REVISION_STATUS },
+      });
+      await this.audit.write(tx, {
+        organizationId: user.organizationId,
+        actorUserId: user.id,
+        action: 'workflow.cancelled',
+        entityType: 'workflow_instance',
+        entityId: id,
+        branchId: instance.branchId,
+        creativeId: instance.creativeId,
+        creativeRevisionId: instance.creativeRevisionId,
+        workflowInstanceId: id,
+        metadata: {
+          workflowId: instance.workflow.id,
+          previousStage: instance.currentStage.key,
+          reason: trimmed,
+          cancelledAs: manager ? 'WORKFLOW_MANAGER' : 'STARTER',
+          staleTaskCount: openTasks.length,
+        },
+      });
+      const recipients = new Set(
+        [
+          instance.startedById,
+          ...openTasks.map((task) => task.assignedUserId),
+        ].filter(
+          (recipient): recipient is string =>
+            Boolean(recipient) && recipient !== user.id,
+        ),
+      );
+      for (const recipientUserId of recipients)
+        await this.notifications.create(tx, {
+          recipientUserId,
+          organizationId: user.organizationId,
+          eventKey: `workflow-cancelled:${id}`,
+          type: 'WORKFLOW_CANCELLED',
+          title: 'Workflow cancelled',
+          message: `${user.name} cancelled the ${instance.workflow.name} run for ${instance.creative.name} at the ${instance.currentStage.name} stage: ${trimmed}`,
+          entityType: 'workflow_instance',
+          entityId: id,
+          branchId: instance.branchId,
+          creativeId: instance.creativeId,
+          creativeRevisionId: instance.creativeRevisionId,
+          workflowInstanceId: id,
+        });
+      return tx.workflowInstance.findUniqueOrThrow({
+        where: { id },
+        include: this.instanceInclude(),
+      });
     });
   }
 

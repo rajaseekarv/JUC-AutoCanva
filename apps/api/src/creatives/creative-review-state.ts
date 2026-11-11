@@ -6,6 +6,9 @@ import type { Prisma } from '@prisma/client';
 // active, the current revision has not entered any workflow yet.
 export const UNREVIEWED_REVISION_STATUS = 'DRAFT';
 
+// The run status that means the run reached a terminal stage.
+export const COMPLETED_RUN_STATUS = 'COMPLETED';
+
 export type ApprovedRevision = {
   revisionId: string;
   revisionNumber: number;
@@ -23,32 +26,68 @@ export type DecisionRecord = {
   creativeId: string;
   creativeRevisionId: string;
   revisionNumber: number;
+  workflowInstanceId: string;
   decision: 'APPROVED' | 'CHANGES_REQUESTED';
   createdAt: Date;
   reviewer: { id: string; name: string };
 };
 
-export type LatestRunRecord = {
+export type RunRecord = {
+  id: string;
   creativeId: string;
   creativeRevisionId: string;
   status: string;
 };
 
-// `decisions` must be ordered newest first.
+// The final approval of a run that approved its revision, or null.
+//
+// A revision is approved only by a whole run: the run must have completed,
+// and every review decision recorded in it must be an approval. An approval
+// at an earlier review stage of a run that is still running, was cancelled,
+// or later had changes requested does not approve the revision. `decisions`
+// must be ordered newest first.
+function runApproval(
+  run: RunRecord,
+  decisions: readonly DecisionRecord[],
+): DecisionRecord | null {
+  if (run.status !== COMPLETED_RUN_STATUS) return null;
+  const own = decisions.filter((item) => item.workflowInstanceId === run.id);
+  if (!own.length || own.some((item) => item.decision !== 'APPROVED'))
+    return null;
+  return own[0]!;
+}
+
+// `decisions` and `runs` must be ordered newest first. Records of other
+// creatives are ignored.
 export function reviewStateFor(
   creative: { id: string; status: string; currentRevisionId: string | null },
   decisions: readonly DecisionRecord[],
-  latestRun: LatestRunRecord | undefined,
+  runs: readonly RunRecord[],
 ): CreativeReviewState {
-  const own = decisions.filter((item) => item.creativeId === creative.id);
-  const approved = own.find((item) => item.decision === 'APPROVED');
-  const currentDecision = own.find(
-    (item) => item.creativeRevisionId === creative.currentRevisionId,
+  const ownDecisions = decisions.filter(
+    (item) => item.creativeId === creative.id,
   );
+  const ownRuns = runs.filter((item) => item.creativeId === creative.id);
+  const latestRun = ownRuns[0];
   const runIsForOlderRevision =
     !!latestRun &&
     latestRun.status !== 'RUNNING' &&
     latestRun.creativeRevisionId !== creative.currentRevisionId;
+
+  let approved: DecisionRecord | null = null;
+  for (const run of ownRuns) {
+    approved = runApproval(run, ownDecisions);
+    if (approved) break;
+  }
+  // The current revision's standing is set by its latest completed run, so
+  // a re-review that is still running or was cancelled neither grants nor
+  // withdraws approval, and one that completed with changes requested
+  // withdraws it.
+  const latestCompletedForCurrent = ownRuns.find(
+    (run) =>
+      run.status === COMPLETED_RUN_STATUS &&
+      run.creativeRevisionId === creative.currentRevisionId,
+  );
   return {
     status: runIsForOlderRevision
       ? UNREVIEWED_REVISION_STATUS
@@ -61,7 +100,9 @@ export function reviewStateFor(
           reviewer: approved.reviewer,
         }
       : null,
-    currentRevisionApproved: currentDecision?.decision === 'APPROVED',
+    currentRevisionApproved:
+      !!latestCompletedForCurrent &&
+      runApproval(latestCompletedForCurrent, ownDecisions) !== null,
   };
 }
 
@@ -94,6 +135,7 @@ export async function withReviewState<
         creativeId: true,
         creativeRevisionId: true,
         revisionNumber: true,
+        workflowInstanceId: true,
         decision: true,
         createdAt: true,
         reviewer: { select: { id: true, name: true } },
@@ -102,18 +144,21 @@ export async function withReviewState<
     }),
     db.workflowInstance.findMany({
       where: { organizationId, creativeId: { in: creativeIds } },
-      select: { creativeId: true, creativeRevisionId: true, status: true },
+      select: {
+        id: true,
+        creativeId: true,
+        creativeRevisionId: true,
+        status: true,
+      },
       orderBy: [{ startedAt: 'desc' }, { id: 'desc' }],
-      distinct: ['creativeId'],
     }),
   ]);
-  const latestRuns = new Map(runs.map((run) => [run.creativeId, run]));
   return creatives.map((creative) => ({
     ...creative,
     ...reviewStateFor(
       creative,
       decisions as DecisionRecord[],
-      latestRuns.get(creative.id),
+      runs as RunRecord[],
     ),
   }));
 }

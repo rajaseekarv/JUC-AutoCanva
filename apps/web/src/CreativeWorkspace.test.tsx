@@ -1168,3 +1168,291 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
     ).toBe(false);
   });
 });
+
+// Stage 10.2: the API refuses a new revision while a run is RUNNING (409).
+// The screen locks saving in advance when it can read workflows.
+describe('CreativeWorkspace edit lock during a running workflow', () => {
+  const editor: AuthenticatedUserResponse = {
+    ...user,
+    permissions: [...user.permissions, 'workflows:read'],
+  };
+  const runningRun = {
+    id: 'instance-1',
+    status: 'RUNNING',
+    workflowId: 'workflow-1',
+    creativeRevisionId: 'revision-1',
+    currentStage: { name: 'Legal review' },
+    workflow: { name: 'Spring review' },
+  };
+
+  // `run` is read on every request, so a test can finish the run later.
+  function serveLock(
+    options: {
+      run?: Record<string, unknown> | null;
+      // Resolves the workflow request only when the test calls release().
+      holdRun?: boolean;
+      patchStatus?: number;
+    } = {},
+  ) {
+    const state = { run: options.run === undefined ? runningRun : options.run };
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/creatives/creative-1/workflow')) {
+        if (options.holdRun) await held;
+        return statusReply(200, state.run);
+      }
+      if (url.endsWith('/creatives/creative-1') && method === 'PATCH')
+        return options.patchStatus
+          ? statusReply(options.patchStatus, {
+              message:
+                'Creative revisions cannot change while a workflow is running',
+            })
+          : statusReply(200, creative);
+      if (url.endsWith('/creatives') && method === 'POST')
+        return statusReply(201, { ...creative, id: 'creative-2' });
+      if (url.includes('/creatives?')) return statusReply(200, [creative]);
+      if (url.endsWith('/templates')) return statusReply(200, [template]);
+      if (url.endsWith('/templates/template-1'))
+        return statusReply(200, detail);
+      if (url.endsWith('/creatives/creative-1/revisions'))
+        return statusReply(200, [revision]);
+      return statusReply(200, []);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const writes = () =>
+      fetchMock.mock.calls.filter(([, init]) =>
+        ['PATCH', 'POST'].includes(
+          (init as RequestInit | undefined)?.method ?? 'GET',
+        ),
+      );
+    return { fetchMock, state, release: () => release(), writes };
+  }
+
+  function renderWorkspace(
+    session: AuthenticatedUserResponse = editor,
+    dataChange?: { key: number; source: 'workflows' | '' },
+  ) {
+    const element = (change = dataChange) => (
+      <CreativeWorkspace
+        session={{ accessToken: 'token', user: session }}
+        branch={branch}
+        dataChange={change}
+        onUnauthorized={vi.fn()}
+      />
+    );
+    const view = render(element());
+    return {
+      ...view,
+      rerenderWith: (change: { key: number; source: 'workflows' | '' }) =>
+        view.rerender(element(change)),
+    };
+  }
+
+  async function openAndEdit() {
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Headline' }), {
+      target: { value: 'Edited while locked' },
+    });
+  }
+  const saveButton = () =>
+    screen.getByRole('button', { name: 'Save new revision' });
+  const lockNotice = () =>
+    screen.findByRole('region', { name: 'Editing locked' });
+
+  it('disables saving and explains the revision, stage and workflow that hold the lock', async () => {
+    serveLock();
+    renderWorkspace();
+    await openAndEdit();
+    const notice = await lockNotice();
+    expect(notice).toHaveTextContent(
+      'Revision 1 is currently under review at stage Legal review in Spring review. Editing is locked until the workflow finishes or is cancelled.',
+    );
+    expect(
+      within(notice).getByRole('link', { name: 'Open Workflows' }),
+    ).toHaveAttribute('href', '#workflows');
+    expect(saveButton()).toBeDisabled();
+    expect(saveButton()).toHaveAttribute('aria-describedby', notice.id);
+  });
+
+  it('sends no revision when the form is submitted another way, such as Enter in a field', async () => {
+    const { writes } = serveLock();
+    renderWorkspace();
+    await openAndEdit();
+    await lockNotice();
+    fireEvent.submit(saveButton().closest('form')!);
+    fireEvent.click(saveButton());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(writes()).toEqual([]);
+  });
+
+  it('restores saving through the cross-screen refresh when the run completes, keeping the edits', async () => {
+    const { state, writes } = serveLock();
+    const view = renderWorkspace(editor, { key: 0, source: '' });
+    await openAndEdit();
+    await lockNotice();
+    state.run = { ...runningRun, status: 'COMPLETED' };
+    view.rerenderWith({ key: 1, source: 'workflows' });
+    await waitFor(() => expect(saveButton()).toBeEnabled());
+    expect(
+      screen.queryByRole('region', { name: 'Editing locked' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Headline' })).toHaveValue(
+      'Edited while locked',
+    );
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(String((writes()[0]![1] as RequestInit).body)).toContain(
+      'Edited while locked',
+    );
+  });
+
+  it('also unlocks when the run was cancelled', async () => {
+    const { state } = serveLock();
+    const view = renderWorkspace(editor, { key: 0, source: '' });
+    await openAndEdit();
+    await lockNotice();
+    state.run = { ...runningRun, status: 'CANCELLED' };
+    view.rerenderWith({ key: 1, source: 'workflows' });
+    await waitFor(() => expect(saveButton()).toBeEnabled());
+  });
+
+  it('keeps saving unavailable until the workflow state is known', async () => {
+    const { release } = serveLock({
+      run: { ...runningRun, status: 'COMPLETED' },
+      holdRun: true,
+    });
+    renderWorkspace();
+    await openAndEdit();
+    expect(
+      await screen.findByText(
+        'Checking whether a workflow is running before saving…',
+      ),
+    ).toBeInTheDocument();
+    expect(saveButton()).toBeDisabled();
+    release();
+    await waitFor(() => expect(saveButton()).toBeEnabled());
+    expect(
+      screen.queryByText(
+        'Checking whether a workflow is running before saving…',
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it('allows saving when the creative has never run a workflow', async () => {
+    serveLock({ run: null });
+    renderWorkspace();
+    await openAndEdit();
+    await waitFor(() => expect(saveButton()).toBeEnabled());
+    expect(
+      screen.queryByRole('region', { name: 'Editing locked' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('without workflows:read, requests no workflow state and shows the API 409 with the edits kept', async () => {
+    const { fetchMock, writes } = serveLock({ patchStatus: 409 });
+    renderWorkspace(user);
+    await openAndEdit();
+    expect(saveButton()).toBeEnabled();
+    fireEvent.click(saveButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Creative revisions cannot change while a workflow is running Your edits are still in the form; save them once the workflow finishes or is cancelled.',
+    );
+    expect(writes()).toHaveLength(1);
+    expect(screen.getByRole('textbox', { name: 'Headline' })).toHaveValue(
+      'Edited while locked',
+    );
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).endsWith('/workflow')),
+    ).toBe(false);
+  });
+
+  it('shows the lock after a 409 when a run started elsewhere since the screen loaded', async () => {
+    const { state } = serveLock({ run: null, patchStatus: 409 });
+    renderWorkspace();
+    await openAndEdit();
+    await waitFor(() => expect(saveButton()).toBeEnabled());
+    state.run = runningRun;
+    fireEvent.click(saveButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Creative revisions cannot change while a workflow is running',
+    );
+    expect(await lockNotice()).toHaveTextContent('Legal review');
+    expect(saveButton()).toBeDisabled();
+  });
+
+  // Regression (found while adding the lock): a refresh from another screen
+  // reloaded the list and overwrote unsaved field values with the stored
+  // revision, although Stage 12 promised to keep them.
+  it('keeps unsaved edits when another screen refreshes the list, and loads a newer revision saved elsewhere', async () => {
+    const { fetchMock } = serveLock({ run: null });
+    const view = renderWorkspace(editor, { key: 0, source: '' });
+    await openAndEdit();
+    view.rerenderWith({ key: 1, source: 'workflows' });
+    const listCalls = () =>
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes('/creatives?'),
+      ).length;
+    await waitFor(() => expect(listCalls()).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.getByRole('textbox', { name: 'Headline' })).toHaveValue(
+      'Edited while locked',
+    );
+    // A newer revision saved elsewhere replaces the form, as before.
+    const revisionTwo = {
+      ...revision,
+      id: 'revision-2',
+      revisionNumber: 2,
+      values: { headline: 'Saved elsewhere' },
+    };
+    fetchMock.mockImplementation(async (url: string) =>
+      url.includes('/creatives?')
+        ? statusReply(200, [
+            {
+              ...creative,
+              currentRevisionId: 'revision-2',
+              currentRevision: revisionTwo,
+            },
+          ])
+        : url.endsWith('/templates/template-1')
+          ? statusReply(200, detail)
+          : statusReply(200, url.endsWith('/workflow') ? null : []),
+    );
+    view.rerenderWith({ key: 2, source: 'workflows' });
+    await waitFor(() =>
+      expect(screen.getByRole('textbox', { name: 'Headline' })).toHaveValue(
+        'Saved elsewhere',
+      ),
+    );
+  });
+
+  it('does not lock creating a new creative', async () => {
+    const { writes } = serveLock();
+    renderWorkspace();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+    await lockNotice();
+    fireEvent.click(screen.getByRole('button', { name: 'New creative' }));
+    expect(
+      screen.queryByRole('region', { name: 'Editing locked' }),
+    ).not.toBeInTheDocument();
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Template' }),
+      { target: { value: template.id } },
+    );
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Headline' }), {
+      target: { value: 'Fresh' },
+    });
+    fireEvent.change(screen.getByLabelText('Name'), {
+      target: { value: 'Second' },
+    });
+    const create = screen.getByRole('button', { name: 'Create creative' });
+    expect(create).toBeEnabled();
+    expect(create).not.toHaveAttribute('aria-describedby');
+    fireEvent.click(create);
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect((writes()[0]![1] as RequestInit).method).toBe('POST');
+  });
+});

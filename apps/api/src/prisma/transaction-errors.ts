@@ -28,11 +28,29 @@ function isRolledBackRawQuery(
   );
 }
 
+// Inside an interactive transaction a model query (such as updateMany) that
+// PostgreSQL aborts can reach the client as an unknown request error whose
+// message carries the SQLSTATE, for example `code: "40P01"` (found in the
+// Stage 10 PostgreSQL run: a review decision and a cancellation deadlocked).
+const rolledBackSqlStateInMessage = /\bcode: "(40P01|40001)"/;
+
+// Whether PostgreSQL rolled the whole transaction back because of a
+// deadlock or a serialization failure, so nothing was applied and the
+// client may retry.
+export function isRolledBackTransaction(error: unknown): boolean {
+  if (error instanceof Prisma.PrismaClientKnownRequestError)
+    return error.code === 'P2034' || isRolledBackRawQuery(error);
+  return (
+    error instanceof Prisma.PrismaClientUnknownRequestError &&
+    rolledBackSqlStateInMessage.test(error.message)
+  );
+}
+
 // Maps interactive-transaction failures caused by contention rather than by
 // the request. Nothing is retried automatically.
-// - P2034, or P2010 carrying 40P01/40001: PostgreSQL rolled the transaction
-//   back (deadlock or serialization failure), so nothing was applied and the
-//   client may retry.
+// - P2034, P2010 carrying 40P01/40001, or an unknown request error carrying
+//   them: PostgreSQL rolled the transaction back (deadlock or serialization
+//   failure), so nothing was applied and the client may retry.
 // - P2028: the transaction could not start in time or expired. Prisma cannot
 //   always tell whether a commit already reached the database, so the
 //   response claims neither success nor failure.
@@ -41,9 +59,9 @@ function isRolledBackRawQuery(
 export function transactionContentionException(
   error: unknown,
 ): HttpException | null {
-  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) return null;
-  if (error.code === 'P2034' || isRolledBackRawQuery(error))
+  if (isRolledBackTransaction(error))
     return new ConflictException(transactionConflictMessage);
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) return null;
   if (error.code === 'P2028')
     return new ServiceUnavailableException(transactionUnconfirmedMessage);
   return null;

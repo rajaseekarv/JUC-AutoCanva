@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { describe, expect, it } from 'vitest';
 import {
   transactionConflictMessage,
+  isRolledBackTransaction,
   transactionContentionException,
   transactionUnconfirmedMessage,
 } from './transaction-errors';
@@ -68,5 +69,53 @@ describe('transactionContentionException', () => {
     ['a non-error value', '40P01'],
   ])('returns null for %s', (_case, error) => {
     expect(transactionContentionException(error)).toBeNull();
+  });
+
+  // Regression (Stage 10 PostgreSQL run): a review decision and a
+  // cancellation deadlocked; Prisma reported the aborted updateMany as an
+  // unknown request error, which became a 500 instead of a retryable 409.
+  describe('unknown request errors from aborted model queries', () => {
+    const modelQueryFailure = (sqlState: string, message: string) =>
+      new Prisma.PrismaClientUnknownRequestError(
+        '\nInvalid `tx.workflowTask.updateMany()` invocation:\n\n' +
+          'Error occurred during query execution:\n' +
+          `ConnectorError(ConnectorError { user_facing_error: None, kind: QueryError(PostgresError { code: "${sqlState}", message: "${message}", severity: "ERROR" }), transient: false })`,
+        { clientVersion: 'test' },
+      );
+
+    it.each([
+      ['a deadlock', '40P01', 'deadlock detected'],
+      [
+        'a serialization failure',
+        '40001',
+        'could not serialize access due to concurrent update',
+      ],
+    ])('maps %s to 409 without database details', (_case, state, text) => {
+      const error = modelQueryFailure(state, text);
+      expect(isRolledBackTransaction(error)).toBe(true);
+      const mapped = transactionContentionException(error);
+      expect(mapped).toBeInstanceOf(ConflictException);
+      expect(mapped?.message).toBe(transactionConflictMessage);
+      expect(JSON.stringify(mapped?.getResponse())).not.toContain(state);
+    });
+
+    it('leaves other unknown request errors unmapped', () => {
+      const error = modelQueryFailure('23505', 'duplicate key value');
+      expect(isRolledBackTransaction(error)).toBe(false);
+      expect(transactionContentionException(error)).toBeNull();
+      expect(
+        isRolledBackTransaction(
+          new Prisma.PrismaClientUnknownRequestError('connection reset', {
+            clientVersion: 'test',
+          }),
+        ),
+      ).toBe(false);
+    });
+
+    it('does not trust the SQLSTATE text in a plain Error', () => {
+      expect(
+        isRolledBackTransaction(new Error('code: "40P01" deadlock detected')),
+      ).toBe(false);
+    });
   });
 });

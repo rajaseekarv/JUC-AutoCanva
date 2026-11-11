@@ -16,6 +16,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WorkflowsService } from '../workflows/workflows.service';
 import { AuditService } from '../audit/audit.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { isRolledBackTransaction } from '../prisma/transaction-errors';
 
 type DecisionInput = {
   decision: ReviewDecisionType;
@@ -45,9 +46,13 @@ export class ApprovalsService {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
       });
     } catch (error) {
+      // A unique-key race, or PostgreSQL rolling the transaction back
+      // (deadlock or serialization failure, however Prisma reports it):
+      // nothing was applied.
       if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        (error.code === 'P2002' || error.code === 'P2034')
+        (error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002') ||
+        isRolledBackTransaction(error)
       )
         throw new ConflictException(
           'Review changed concurrently; reload and retry',
@@ -448,22 +453,11 @@ export class ApprovalsService {
           revisionNumber: revision.revisionNumber,
         },
       });
-      // Changes requested are announced by the change request above.
-      if (input.decision === ReviewDecisionType.APPROVED)
-        await this.notifications.create(tx, {
-          recipientUserId: task.instance.startedById,
-          organizationId: user.organizationId,
-          eventKey: `approval-decision:${decision.id}`,
-          type: 'CREATIVE_APPROVED',
-          title: 'Creative approved',
-          message: `A review decision was recorded for ${task.instance.creative.name}.`,
-          entityType: 'approval_decision',
-          entityId: decision.id,
-          branchId: task.instance.branchId,
-          creativeId: task.instance.creativeId,
-          creativeRevisionId: revision.id,
-          workflowInstanceId: task.instanceId,
-        });
+      // Changes requested are announced by the change request above. An
+      // approval is announced by the transition that completes the run
+      // (WorkflowsService.notifyRunApproved), so an approval at an earlier
+      // review stage of a longer workflow never claims the creative is
+      // approved.
       return decision;
     });
   }

@@ -157,7 +157,11 @@ const workflow = {
 function serveApi() {
   let revisionNumber = 1;
   let status = 'DRAFT';
-  let run: { stage: keyof typeof stages; revisionNumber: number } | null = null;
+  let run: {
+    stage: keyof typeof stages;
+    revisionNumber: number;
+    cancelReason?: string;
+  } | null = null;
   let approvedRevision: number | null = null;
   const revisionOf = (number: number) => ({
     id: 'revision-' + number,
@@ -194,7 +198,15 @@ function serveApi() {
   const instance = () =>
     run && {
       id: 'instance-1',
-      status: run.stage === 'approved' ? 'COMPLETED' : 'RUNNING',
+      status:
+        run.cancelReason !== undefined
+          ? 'CANCELLED'
+          : run.stage === 'approved'
+            ? 'COMPLETED'
+            : 'RUNNING',
+      startedById: 'user-1',
+      workflow: { id: 'workflow-1', name: 'Review flow' },
+      _count: { approvalDecisions: run.stage === 'approved' ? 1 : 0 },
       workflowId: 'workflow-1',
       creativeRevisionId: 'revision-' + run.revisionNumber,
       currentStage: stages[run.stage],
@@ -210,7 +222,19 @@ function serveApi() {
               },
             ]
           : [],
-      history: [],
+      history:
+        run.cancelReason !== undefined
+          ? [
+              {
+                id: 'history-cancel',
+                actionKey: 'CANCEL',
+                reason: run.cancelReason,
+                createdAt: '2026-01-03T00:00:00Z',
+                fromStage: stages[run.stage],
+                toStage: stages[run.stage],
+              },
+            ]
+          : [],
     };
   const reply = (body: unknown, code = 200) => {
     const text = body === null ? '' : JSON.stringify(body);
@@ -237,6 +261,13 @@ function serveApi() {
       run!.stage = 'review';
       status = 'review';
       return reply(instance());
+    }
+    if (method === 'POST' && path === '/workflow-instances/instance-1/cancel') {
+      run!.cancelReason = (
+        JSON.parse(String(init!.body)) as { reason: string }
+      ).reason;
+      status = 'DRAFT';
+      return reply(instance(), 201);
     }
     if (method === 'POST' && path === '/approvals/tasks/task-1/decision') {
       run!.stage = 'approved';
@@ -438,6 +469,80 @@ describe('cross-screen refresh', () => {
       'Revision 1 approved · current revision 2 not yet approved',
     );
     expect(creativeRow()).not.toHaveTextContent('Approved Revision');
+  });
+
+  // Stage 10.3: cancelling a run on Workflows releases the edit lock on
+  // Creatives without a reload, keeping the edits typed while it was locked.
+  it('unlocks the Creatives form when Workflows cancels the run, keeping unsaved edits', async () => {
+    serveApi();
+    render(<Screens />);
+    await waitFor(() => expect(picker()).toHaveTextContent('Launch · Draft'));
+    fireEvent.change(picker(), { target: { value: 'creative-1' } });
+    fireEvent.change(
+      await within(workflowsScreen()).findByRole('combobox', {
+        name: 'Workflow to start',
+      }),
+      { target: { value: 'workflow-1' } },
+    );
+    fireEvent.click(
+      within(workflowsScreen()).getByRole('button', { name: 'Start workflow' }),
+    );
+    fireEvent.click(
+      await within(workflowsScreen()).findByRole('button', {
+        name: 'Submit for review',
+      }),
+    );
+    await waitFor(() => expect(creativeRow()).toHaveTextContent('Review'));
+
+    fireEvent.click(
+      within(creativesScreen()).getByRole('button', { name: 'Open' }),
+    );
+    expect(
+      await within(creativesScreen()).findByRole('region', {
+        name: 'Editing locked',
+      }),
+    ).toHaveTextContent('at stage Review in Review flow');
+    const headline = await within(creativesScreen()).findByRole('textbox', {
+      name: 'Headline',
+    });
+    fireEvent.change(headline, { target: { value: 'Typed while locked' } });
+    const save = within(creativesScreen()).getByRole('button', {
+      name: 'Save new revision',
+    });
+    expect(save).toBeDisabled();
+
+    // The run's starter cancels it from Workflows (no decision yet).
+    fireEvent.click(
+      await within(workflowsScreen()).findByRole('button', {
+        name: 'Cancel run',
+      }),
+    );
+    fireEvent.change(
+      within(workflowsScreen()).getByRole('textbox', {
+        name: 'Reason for cancelling (required)',
+      }),
+      { target: { value: 'Wrong revision submitted' } },
+    );
+    fireEvent.click(
+      within(workflowsScreen()).getByRole('button', {
+        name: 'Confirm cancellation',
+      }),
+    );
+    expect(
+      await within(workflowsScreen()).findByText(
+        /Cancelled at Review · .* · Reason: Wrong revision submitted/,
+      ),
+    ).toBeInTheDocument();
+
+    await waitFor(() => expect(save).toBeEnabled());
+    expect(
+      within(creativesScreen()).queryByRole('region', {
+        name: 'Editing locked',
+      }),
+    ).not.toBeInTheDocument();
+    expect(headline).toHaveValue('Typed while locked');
+    await waitFor(() => expect(creativeRow()).toHaveTextContent('Draft'));
+    await waitFor(() => expect(picker()).toHaveTextContent('Launch · Draft'));
   });
 });
 

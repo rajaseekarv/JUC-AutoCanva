@@ -26,6 +26,8 @@ export type WorkflowDefinitionInput = {
   transitions: TransitionDefinition[];
 };
 
+const REVIEW_DECISIONS = ['APPROVED', 'CHANGES_REQUESTED'] as const;
+
 export function validateWorkflowDefinition(
   input: WorkflowDefinitionInput,
 ): string[] {
@@ -79,9 +81,20 @@ export function validateWorkflowDefinition(
       const reviewTransitions = stageTransitions.filter(
         (transition) => transition.reviewDecision,
       );
-      if (!reviewTransitions.length)
+      // A reviewer must always be able to approve and to request changes;
+      // without either, the review can only end one way.
+      for (const decision of REVIEW_DECISIONS)
+        if (
+          !reviewTransitions.some(
+            (transition) => transition.reviewDecision === decision,
+          )
+        )
+          errors.push(
+            `Review stage ${stage.key} requires one ${decision} transition.`,
+          );
+      if (stageTransitions.some((transition) => transition.to === stage.key))
         errors.push(
-          `Review stage ${stage.key} requires a decision transition.`,
+          `Review stage ${stage.key} cannot transition to itself; a decision must move the run to another stage.`,
         );
       if (reviewTransitions.length !== stageTransitions.length)
         errors.push(
@@ -122,7 +135,74 @@ export function validateWorkflowDefinition(
           'Creatives cannot be revised while a run is active, so this would leave the creative locked; route it to a terminal stage or to stages that lead to one.',
       );
   }
+  errors.push(...reachabilityErrors(input, keys));
   return errors;
+}
+
+// Every stage must be reachable from the entry, and every reachable stage
+// must be able to reach a terminal stage; otherwise a run can stop in a stage
+// it can never leave and its creative stays locked. Transitions to unknown
+// stages are reported elsewhere and ignored here. Stages already reported as
+// dead ends (no outgoing transition) are not reported again.
+function reachabilityErrors(
+  input: WorkflowDefinitionInput,
+  keys: ReadonlySet<string>,
+): string[] {
+  const entries = input.stages.filter((stage) => stage.isEntry);
+  if (entries.length !== 1) return [];
+  const entry = entries[0]!;
+  const forward = new Map<string, string[]>();
+  const backward = new Map<string, string[]>();
+  for (const transition of input.transitions) {
+    if (!keys.has(transition.from) || !keys.has(transition.to)) continue;
+    forward.set(transition.from, [
+      ...(forward.get(transition.from) ?? []),
+      transition.to,
+    ]);
+    backward.set(transition.to, [
+      ...(backward.get(transition.to) ?? []),
+      transition.from,
+    ]);
+  }
+  const fromEntry = reachable([entry.key], forward);
+  const toTerminal = reachable(
+    input.stages.filter((stage) => stage.isTerminal).map((stage) => stage.key),
+    backward,
+  );
+  const errors: string[] = [];
+  const reported = new Set<string>();
+  for (const stage of input.stages) {
+    if (reported.has(stage.key)) continue;
+    reported.add(stage.key);
+    if (!fromEntry.has(stage.key))
+      errors.push(
+        `Stage ${stage.key} is unreachable from the entry stage ${entry.key}.`,
+      );
+    else if (
+      !stage.isTerminal &&
+      forward.has(stage.key) &&
+      !toTerminal.has(stage.key)
+    )
+      errors.push(
+        `Stage ${stage.key} cannot reach a terminal stage, so a run there could never finish.`,
+      );
+  }
+  return errors;
+}
+
+function reachable(
+  starts: readonly string[],
+  edges: ReadonlyMap<string, readonly string[]>,
+): Set<string> {
+  const seen = new Set<string>();
+  const pending = [...starts];
+  while (pending.length) {
+    const key = pending.pop()!;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pending.push(...(edges.get(key) ?? []));
+  }
+  return seen;
 }
 
 // Whether a terminal stage is reachable from `start` without entering a
