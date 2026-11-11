@@ -129,13 +129,28 @@ export interface CreativeRevisionResponse {
   createdAt: string;
   templateVersion: TemplateVersionResponse;
 }
+// The latest approval decision of a creative, tied to the exact revision
+// that was reviewed.
+export interface ApprovedRevisionSummary {
+  revisionId: string;
+  revisionNumber: number;
+  approvedAt: string;
+  reviewer: { id: string; name: string };
+}
+
 export interface CreativeResponse {
   id: string;
   organizationId: string;
   branchId: string;
   campaignId: string | null;
   name: string;
+  // Status of the current revision: the stage of a run for that revision, or
+  // DRAFT when the latest run reviewed an older revision.
   status: string;
+  // Latest approved revision, which may be older than the current one.
+  approvedRevision?: ApprovedRevisionSummary | null;
+  // Whether the current revision's latest decision is an approval.
+  currentRevisionApproved?: boolean;
   currentRevisionId: string | null;
   createdAt: string;
   updatedAt: string;

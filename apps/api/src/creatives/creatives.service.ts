@@ -13,6 +13,10 @@ import { TemplatesService } from '../templates/templates.service';
 import { AuditService } from '../audit/audit.service';
 import { lockActiveAssetsForReference } from '../assets/asset-locks';
 import { transactionContentionException } from '../prisma/transaction-errors';
+import {
+  UNREVIEWED_REVISION_STATUS,
+  withReviewState,
+} from './creative-review-state';
 
 type CreativeInput = {
   name: string;
@@ -120,7 +124,7 @@ export class CreativesService {
     );
     if (branchId && !ids.includes(branchId))
       throw new NotFoundException('Branch not found');
-    return this.prisma.creative.findMany({
+    const creatives = await this.prisma.creative.findMany({
       where: { organizationId: user.organizationId, branchId: { in: ids } },
       include: {
         ...detailInclude,
@@ -129,6 +133,7 @@ export class CreativesService {
       },
       orderBy: { updatedAt: 'desc' },
     });
+    return withReviewState(this.prisma, user.organizationId, creatives);
   }
 
   // Revision writes run SERIALIZABLE. A transaction PostgreSQL rolls back
@@ -173,7 +178,12 @@ export class CreativesService {
     });
     if (!creative) throw new NotFoundException('Creative not found');
     await this.assertBranch(user, creative.branchId);
-    return creative;
+    const [withState] = await withReviewState(
+      this.prisma,
+      user.organizationId,
+      [creative],
+    );
+    return withState;
   }
 
   async create(user: AuthenticatedPrincipal, input: CreativeInput) {
@@ -275,11 +285,17 @@ export class CreativesService {
           templateVersionId: version.id,
         },
       });
-      return tx.creative.update({
+      const created = await tx.creative.update({
         where: { id: creative.id },
         data: { currentRevisionId: revision.id },
         include: detailInclude,
       });
+      // A new creative has no runs or decisions yet.
+      return {
+        ...created,
+        approvedRevision: null,
+        currentRevisionApproved: false,
+      };
     });
   }
 
@@ -386,6 +402,9 @@ export class CreativesService {
           ...(input.name ? { name: input.name } : {}),
           updatedById: user.id,
           currentRevisionId: revision.id,
+          // The status described the revision the last run reviewed; the
+          // new revision has not entered a workflow. Decisions are kept.
+          status: UNREVIEWED_REVISION_STATUS,
         },
       });
       await this.audit.write(tx, {
@@ -400,12 +419,18 @@ export class CreativesService {
         metadata: {
           revisionNumber: revision.revisionNumber,
           templateVersionId: version.id,
+          previousStatus: creative.status,
+          status: UNREVIEWED_REVISION_STATUS,
         },
       });
-      return tx.creative.findUniqueOrThrow({
+      const revised = await tx.creative.findUniqueOrThrow({
         where: { id },
         include: detailInclude,
       });
+      const [withState] = await withReviewState(tx, user.organizationId, [
+        revised,
+      ]);
+      return withState;
     });
   }
 
