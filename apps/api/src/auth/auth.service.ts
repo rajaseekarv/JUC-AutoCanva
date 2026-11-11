@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
 import type { LoginResponse } from '@adflow/shared-types';
@@ -9,8 +9,15 @@ import { AuditService } from '../audit/audit.service';
 const INVALID_CREDENTIALS = 'Invalid email or password';
 const accessTokenTtlSeconds = Number(process.env.JWT_ACCESS_TTL_SECONDS ?? 900);
 
+// Why a login for an existing account was refused (audit metadata only;
+// the API response never says).
+export type LoginFailureReason =
+  'INVALID_PASSWORD' | 'INACTIVE' | 'PASSWORD_NOT_SET';
+
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
@@ -42,6 +49,14 @@ export class AuthService {
       }
     }
     if (!user || user.status !== 'ACTIVE' || !passwordIsValid) {
+      // An unknown email has no organization to audit in, so only attempts
+      // against an existing account are recorded. The response is the same
+      // in every case.
+      if (user)
+        await this.recordFailedLogin(user, {
+          active: user.status === 'ACTIVE',
+          hasPassword: Boolean(user.passwordHash),
+        });
       throw new UnauthorizedException(INVALID_CREDENTIALS);
     }
 
@@ -96,6 +111,36 @@ export class AuthService {
           })),
       },
     };
+  }
+
+  // Records a refused login for an existing account. Only a reason code is
+  // stored: never the password, the submitted email, a hash or a token. The
+  // actor is unknown (the request is unauthenticated), so actorUserId is
+  // null and the account is the entity. A failure to write the record never
+  // changes the 401 the caller receives.
+  private async recordFailedLogin(
+    user: { id: string; organizationId: string },
+    state: { active: boolean; hasPassword: boolean },
+  ): Promise<void> {
+    const reason: LoginFailureReason = !state.active
+      ? 'INACTIVE'
+      : state.hasPassword
+        ? 'INVALID_PASSWORD'
+        : 'PASSWORD_NOT_SET';
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await this.audit.write(tx, {
+          organizationId: user.organizationId,
+          actorUserId: null,
+          action: 'auth.login_failed',
+          entityType: 'user',
+          entityId: user.id,
+          metadata: { reason },
+        });
+      });
+    } catch {
+      this.logger.warn('A failed login could not be recorded in the audit log');
+    }
   }
 
   async logout(
