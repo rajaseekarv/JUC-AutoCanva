@@ -1,15 +1,32 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import type {
+  AssetInUseConflictResponse,
+  AssetInUseReason,
+  AssetUsageResponse,
+} from '@adflow/shared-types';
+import type { Prisma } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import type { AuthenticatedPrincipal } from '../auth/auth.types';
 import { PERMISSIONS } from '../auth/permissions';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import {
+  transactionConflictMessage,
+  transactionContentionException,
+} from '../prisma/transaction-errors';
+import { lockActiveAssetForChange } from './asset-locks';
+import {
+  branchLogoWhere,
+  findCreativeRevisionReferences,
+  organizationLogoWhere,
+} from './asset-references';
 import { ASSET_STORAGE, type AssetStorage } from './asset-storage';
 
 const maxBytes = 5 * 1024 * 1024;
@@ -63,8 +80,19 @@ function dimensions(
   type: string,
   data: Buffer,
 ): { width: number | null; height: number | null } {
-  if (type === 'image/png' && data.length >= 24)
-    return { width: data.readUInt32BE(16), height: data.readUInt32BE(20) };
+  // Only a real IHDR chunk carries the size; other bytes after the signature
+  // would otherwise be reported as nonsense dimensions. PNG limits each
+  // dimension to 1..2^31-1.
+  if (
+    type === 'image/png' &&
+    data.length >= 24 &&
+    data.toString('ascii', 12, 16) === 'IHDR'
+  ) {
+    const width = data.readUInt32BE(16);
+    const height = data.readUInt32BE(20);
+    if (width > 0 && height > 0 && width <= 0x7fffffff && height <= 0x7fffffff)
+      return { width, height };
+  }
   if (type === 'image/jpeg' && data[0] === 0xff && data[1] === 0xd8) {
     let offset = 2;
     while (offset + 9 < data.length) {
@@ -122,6 +150,21 @@ function dimensions(
   }
   return { width: null, height: null };
 }
+// The 409 body names why deletion was refused so clients can explain it
+// without parsing the message.
+function assetInUse(
+  reason: AssetInUseReason,
+  message: string,
+): ConflictException {
+  const body: AssetInUseConflictResponse = {
+    statusCode: 409,
+    error: 'Conflict',
+    message,
+    reason,
+  };
+  return new ConflictException(body);
+}
+
 function cleanName(name: string): string {
   const basename = name.replaceAll('\\', '/').split('/').at(-1) ?? 'asset';
   return (
@@ -226,6 +269,118 @@ export class AssetsService {
     return assets;
   }
 
+  // Branches whose details the caller may see, by the same rule as
+  // assertBranch; null means every branch of the organization.
+  private async accessibleBranchIds(
+    user: AuthenticatedPrincipal,
+  ): Promise<Set<string> | null> {
+    if (this.has(user, PERMISSIONS.BRANCH_MANAGE)) return null;
+    const grants = await this.prisma.userBranchAccess.findMany({
+      where: {
+        userId: user.id,
+        branch: { organizationId: user.organizationId, status: 'ACTIVE' },
+      },
+      select: { branchId: true },
+    });
+    return new Set(grants.map((grant) => grant.branchId));
+  }
+
+  // Read-only: where the asset is used in the caller's organization, from the
+  // same reference definitions that block deletion and branch moves. Takes
+  // no locks and writes nothing. Deleted, unknown, and other organizations'
+  // assets are not found, as for GET /assets/:assetId.
+  async usage(
+    user: AuthenticatedPrincipal,
+    assetId: string,
+  ): Promise<AssetUsageResponse> {
+    if (!this.has(user, PERMISSIONS.ASSET_READ))
+      throw new ForbiddenException('Permission denied');
+    const asset = await this.authorizedAsset(user, assetId);
+    const [revisions, organizationProfile, branchProfiles, visibleBranches] =
+      await Promise.all([
+        findCreativeRevisionReferences(
+          this.prisma,
+          user.organizationId,
+          asset.id,
+        ),
+        this.prisma.brandProfile.findFirst({
+          where: organizationLogoWhere(user.organizationId, asset.id),
+          select: { id: true, displayName: true },
+        }),
+        this.prisma.branchBrandOverride.findMany({
+          where: branchLogoWhere(user.organizationId, asset.id),
+          select: {
+            branchId: true,
+            branch: { select: { name: true, code: true } },
+          },
+          orderBy: { branch: { name: 'asc' } },
+        }),
+        this.accessibleBranchIds(user),
+      ]);
+    const visible = (branchId: string) =>
+      visibleBranches === null || visibleBranches.has(branchId);
+    const shownRevisions = revisions.filter((revision) =>
+      visible(revision.branchId),
+    );
+    const shownBranchProfiles = branchProfiles.filter((profile) =>
+      visible(profile.branchId),
+    );
+    const fields = shownRevisions.some((revision) => revision.fieldKeys.length)
+      ? await this.prisma.templateField.findMany({
+          where: {
+            OR: shownRevisions.map((revision) => ({
+              versionId: revision.templateVersionId,
+              key: { in: revision.fieldKeys },
+            })),
+          },
+          select: { versionId: true, key: true, label: true, type: true },
+        })
+      : [];
+    const fieldOf = (versionId: string, key: string) =>
+      fields.find(
+        (field) => field.versionId === versionId && field.key === key,
+      );
+    return {
+      assetId: asset.id,
+      inUse:
+        revisions.length > 0 ||
+        organizationProfile !== null ||
+        branchProfiles.length > 0,
+      creativeRevisions: shownRevisions.map((revision) => ({
+        creativeId: revision.creativeId,
+        creativeName: revision.creativeName,
+        branchId: revision.branchId,
+        branchName: revision.branchName,
+        revisionId: revision.revisionId,
+        revisionNumber: revision.revisionNumber,
+        isCurrentRevision: revision.isCurrentRevision,
+        fields: revision.fieldKeys.map((key) => {
+          const field = fieldOf(revision.templateVersionId, key);
+          return {
+            key,
+            label: field?.label ?? null,
+            type: field?.type ?? null,
+          };
+        }),
+      })),
+      organizationBrandProfile: organizationProfile
+        ? {
+            profileId: organizationProfile.id,
+            displayName: organizationProfile.displayName,
+          }
+        : null,
+      branchBrandProfiles: shownBranchProfiles.map((profile) => ({
+        branchId: profile.branchId,
+        branchName: profile.branch.name,
+        branchCode: profile.branch.code,
+      })),
+      hiddenReferenceCount:
+        revisions.length -
+        shownRevisions.length +
+        (branchProfiles.length - shownBranchProfiles.length),
+    };
+  }
+
   async get(user: AuthenticatedPrincipal, assetId: string) {
     if (!this.has(user, PERMISSIONS.ASSET_READ))
       throw new ForbiddenException('Permission denied');
@@ -249,7 +404,14 @@ export class AssetsService {
     if (!this.has(user, PERMISSIONS.ASSET_READ))
       throw new ForbiddenException('Permission denied');
     const asset = await this.authorizedAsset(user, assetId);
-    return { asset, stream: await this.storage.get(asset.storageKey) };
+    try {
+      return { asset, stream: await this.storage.get(asset.storageKey) };
+    } catch (error: unknown) {
+      // The record is active but its file is gone; never expose the path.
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT')
+        throw new NotFoundException('Asset content not found');
+      throw error;
+    }
   }
 
   async upload(
@@ -310,6 +472,67 @@ export class AssetsService {
     }
   }
 
+  // Locks the asset row before a deletion or branch move. Reference writers
+  // then wait (or fail) until this transaction ends, so no reference can
+  // appear between the checks below and the write. Authorization ran on the
+  // branch read before the transaction; if a concurrent move changed it, the
+  // request is refused rather than applied under a stale scope.
+  private async lockForChange(
+    tx: Prisma.TransactionClient,
+    user: AuthenticatedPrincipal,
+    asset: { id: string; branchId: string | null },
+  ): Promise<void> {
+    const locked = await lockActiveAssetForChange(
+      tx,
+      user.organizationId,
+      asset.id,
+    );
+    if (!locked) throw new NotFoundException('Asset not found');
+    if (locked.branchId !== asset.branchId)
+      throw new ConflictException(transactionConflictMessage);
+  }
+
+  // Refuses with 409 while anything in the caller's organization still uses
+  // the asset: a retained creative revision (image and logo asset IDs are
+  // top-level string values of its JSON field map), the organization brand
+  // logo, or a branch brand logo. Runs under lockForChange, before any write
+  // and before the stored file is touched.
+  private async assertUnreferenced(
+    tx: Prisma.TransactionClient,
+    user: AuthenticatedPrincipal,
+    assetId: string,
+    refusal: string,
+  ): Promise<void> {
+    const references = await findCreativeRevisionReferences(
+      tx,
+      user.organizationId,
+      assetId,
+    );
+    if (references.length > 0)
+      throw assetInUse(
+        'CREATIVE_REVISION',
+        'Asset is used by a creative revision and ' + refusal,
+      );
+    const organizationLogo = await tx.brandProfile.findFirst({
+      where: organizationLogoWhere(user.organizationId, assetId),
+      select: { id: true },
+    });
+    if (organizationLogo)
+      throw assetInUse(
+        'ORGANIZATION_BRAND_LOGO',
+        'Asset is used as the organization brand logo and ' + refusal,
+      );
+    const branchLogo = await tx.branchBrandOverride.findFirst({
+      where: branchLogoWhere(user.organizationId, assetId),
+      select: { id: true },
+    });
+    if (branchLogo)
+      throw assetInUse(
+        'BRANCH_BRAND_LOGO',
+        'Asset is used as a branch brand logo and ' + refusal,
+      );
+  }
+
   async update(
     user: AuthenticatedPrincipal,
     assetId: string,
@@ -320,39 +543,57 @@ export class AssetsService {
     const asset = await this.authorizedAsset(user, assetId);
     if (asset.branchId === null && !this.canManageOrganization(user))
       throw new ForbiddenException('Organization asset access denied');
+    const moving =
+      input.branchId !== undefined && input.branchId !== asset.branchId;
     if (
-      input.branchId !== undefined &&
-      input.branchId !== asset.branchId &&
+      moving &&
       (input.branchId === null || asset.branchId === null
         ? !this.canManageOrganization(user)
         : !this.has(user, PERMISSIONS.BRANCH_MANAGE))
     )
       throw new ForbiddenException('Asset scope cannot be changed');
-    if (input.branchId) await this.assertBranch(user, input.branchId);
-    return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.asset.update({
-        where: { id: asset.id },
-        data: {
-          ...(input.originalName
-            ? { originalName: cleanName(input.originalName) }
-            : {}),
-          ...(input.branchId !== undefined ? { branchId: input.branchId } : {}),
-        },
-        select,
+    if (moving && input.branchId) await this.assertBranch(user, input.branchId);
+    return this.prisma
+      .$transaction(async (tx) => {
+        // A move would strand every reference that relies on the current
+        // scope, so it is refused while any exists. Renames take no lock.
+        if (moving) {
+          await this.lockForChange(tx, user, asset);
+          await this.assertUnreferenced(
+            tx,
+            user,
+            asset.id,
+            'cannot be moved to another branch',
+          );
+        }
+        const updated = await tx.asset.update({
+          where: { id: asset.id },
+          data: {
+            ...(input.originalName
+              ? { originalName: cleanName(input.originalName) }
+              : {}),
+            // Only a real move writes the branch: echoing the branch read
+            // before the transaction could undo a concurrent move.
+            ...(moving ? { branchId: input.branchId } : {}),
+          },
+          select,
+        });
+        await this.audit.write(tx, {
+          organizationId: user.organizationId,
+          actorUserId: user.id,
+          action: 'asset.updated',
+          entityType: 'asset',
+          entityId: asset.id,
+          branchId: input.branchId ?? asset.branchId,
+          metadata: {
+            fields: Object.keys(input).filter((key) => key !== 'originalName'),
+          },
+        });
+        return updated;
+      })
+      .catch((error: unknown) => {
+        throw transactionContentionException(error) ?? error;
       });
-      await this.audit.write(tx, {
-        organizationId: user.organizationId,
-        actorUserId: user.id,
-        action: 'asset.updated',
-        entityType: 'asset',
-        entityId: asset.id,
-        branchId: input.branchId ?? asset.branchId,
-        metadata: {
-          fields: Object.keys(input).filter((key) => key !== 'originalName'),
-        },
-      });
-      return updated;
-    });
   }
 
   async remove(user: AuthenticatedPrincipal, assetId: string) {
@@ -361,29 +602,27 @@ export class AssetsService {
     const asset = await this.authorizedAsset(user, assetId);
     if (asset.branchId === null && !this.canManageOrganization(user))
       throw new ForbiddenException('Organization asset access denied');
-    await this.prisma.$transaction(async (tx) => {
-      await tx.brandProfile.updateMany({
-        where: { logoAssetId: asset.id },
-        data: { logoAssetId: null },
+    await this.prisma
+      .$transaction(async (tx) => {
+        await this.lockForChange(tx, user, asset);
+        await this.assertUnreferenced(tx, user, asset.id, 'cannot be deleted');
+        await tx.asset.update({
+          where: { id: asset.id },
+          data: { status: 'DELETED', deletedAt: new Date() },
+        });
+        await this.audit.write(tx, {
+          organizationId: user.organizationId,
+          actorUserId: user.id,
+          action: 'asset.deleted',
+          entityType: 'asset',
+          entityId: asset.id,
+          branchId: asset.branchId,
+          metadata: { mimeType: asset.mimeType, sizeBytes: asset.sizeBytes },
+        });
+      })
+      .catch((error: unknown) => {
+        throw transactionContentionException(error) ?? error;
       });
-      await tx.branchBrandOverride.updateMany({
-        where: { logoAssetId: asset.id },
-        data: { logoAssetId: null },
-      });
-      await tx.asset.update({
-        where: { id: asset.id },
-        data: { status: 'DELETED', deletedAt: new Date() },
-      });
-      await this.audit.write(tx, {
-        organizationId: user.organizationId,
-        actorUserId: user.id,
-        action: 'asset.deleted',
-        entityType: 'asset',
-        entityId: asset.id,
-        branchId: asset.branchId,
-        metadata: { mimeType: asset.mimeType, sizeBytes: asset.sizeBytes },
-      });
-    });
     await this.storage.remove(asset.storageKey).catch(() => undefined);
     return { id: asset.id, status: 'DELETED' as const };
   }

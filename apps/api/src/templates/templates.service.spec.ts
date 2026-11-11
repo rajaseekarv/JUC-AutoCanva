@@ -582,6 +582,7 @@ describe('TemplatesService', () => {
     ).resolves.toEqual({
       versionId: 'version-1',
       values: { headline: 'Live' },
+      assetIds: [],
     });
     await expect(
       service.validateCreativeValues(principal, 'branch-1', 'version-2', {}),

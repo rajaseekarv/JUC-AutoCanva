@@ -254,3 +254,72 @@ export interface CanvaJobResponse {
   createdAt: string;
   updatedAt: string;
 }
+
+// DELETE /assets/:assetId, and PATCH /assets/:assetId when it changes the
+// asset's branch, answer 409 with this body while the asset is still
+// referenced in the organization; the asset record (including its branch)
+// and its file are left unchanged.
+// GET /assets/:assetId and each GET /assets entry. Never includes the storage
+// key or any filesystem path; the bytes are only served by the authenticated
+// /assets/:assetId/content (inline) and /assets/:assetId/download routes.
+export interface AssetResponse {
+  id: string;
+  organizationId: string;
+  branchId: string | null;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number;
+  width: number | null;
+  height: number | null;
+  status: 'ACTIVE' | 'DELETED';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type AssetInUseReason =
+  'CREATIVE_REVISION' | 'ORGANIZATION_BRAND_LOGO' | 'BRANCH_BRAND_LOGO';
+
+export interface AssetInUseConflictResponse {
+  statusCode: 409;
+  error: 'Conflict';
+  message: string;
+  reason: AssetInUseReason;
+}
+
+// GET /assets/:assetId/usage: where an active asset is used in the caller's
+// organization. Read-only. Details cover only branches the caller can access;
+// other references are counted in hiddenReferenceCount. inUse covers every
+// reference, matching what blocks deletion and branch moves.
+export interface AssetUsageField {
+  key: string;
+  // From the revision's template version; null when the field is not found.
+  label: string | null;
+  type: string | null;
+}
+
+export interface AssetUsageCreativeRevision {
+  creativeId: string;
+  creativeName: string;
+  branchId: string;
+  branchName: string;
+  revisionId: string;
+  revisionNumber: number;
+  isCurrentRevision: boolean;
+  fields: AssetUsageField[];
+}
+
+export interface AssetUsageResponse {
+  assetId: string;
+  inUse: boolean;
+  creativeRevisions: AssetUsageCreativeRevision[];
+  organizationBrandProfile: {
+    profileId: string;
+    displayName: string | null;
+  } | null;
+  branchBrandProfiles: Array<{
+    branchId: string;
+    branchName: string;
+    branchCode: string;
+  }>;
+  hiddenReferenceCount: number;
+}

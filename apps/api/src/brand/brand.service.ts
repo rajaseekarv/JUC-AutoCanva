@@ -3,7 +3,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
+import { lockActiveAssetsForReference } from '../assets/asset-locks';
 import { PrismaService } from '../prisma/prisma.service';
+import { transactionContentionException } from '../prisma/transaction-errors';
 import type { AuthenticatedPrincipal } from '../auth/auth.types';
 import { PERMISSIONS } from '../auth/permissions';
 import { AuditService } from '../audit/audit.service';
@@ -17,6 +20,11 @@ const fields = [
   'websiteUrl',
   'logoAssetId',
 ] as const;
+// A transaction PostgreSQL rolled back for contention answers 409, not 500.
+function rethrowContention(error: unknown): never {
+  throw transactionContentionException(error) ?? error;
+}
+
 export type BrandInput = Partial<
   Record<(typeof fields)[number], string | null>
 >;
@@ -57,25 +65,27 @@ export class BrandService {
       !this.can(user, PERMISSIONS.ORGANIZATION_UPDATE)
     )
       throw new ForbiddenException('Permission denied');
-    if (input.logoAssetId) await this.assertLogo(user, input.logoAssetId, null);
-    return this.prisma.$transaction(async (tx) => {
-      const profile = await tx.brandProfile.upsert({
-        where: { organizationId: user.organizationId },
-        create: { organizationId: user.organizationId, ...input },
-        update: input,
-      });
-      await this.audit.write(tx, {
-        organizationId: user.organizationId,
-        actorUserId: user.id,
-        action: 'brand_profile.updated',
-        entityType: 'brand_profile',
-        entityId: profile.id,
-        metadata: {
-          fields: Object.keys(input).filter((key) => key !== 'logoAssetId'),
-        },
-      });
-      return profile;
-    });
+    return this.prisma
+      .$transaction(async (tx) => {
+        await this.lockLogo(tx, user, input.logoAssetId, null);
+        const profile = await tx.brandProfile.upsert({
+          where: { organizationId: user.organizationId },
+          create: { organizationId: user.organizationId, ...input },
+          update: input,
+        });
+        await this.audit.write(tx, {
+          organizationId: user.organizationId,
+          actorUserId: user.id,
+          action: 'brand_profile.updated',
+          entityType: 'brand_profile',
+          entityId: profile.id,
+          metadata: {
+            fields: Object.keys(input).filter((key) => key !== 'logoAssetId'),
+          },
+        });
+        return profile;
+      })
+      .catch(rethrowContention);
   }
 
   private async branch(user: AuthenticatedPrincipal, branchId: string) {
@@ -98,20 +108,25 @@ export class BrandService {
     return branch;
   }
 
-  private async assertLogo(
+  // Runs inside the write transaction, before the profile changes: the shared
+  // row lock keeps the logo from being deleted until the new reference
+  // commits (see lockActiveAssetsForReference). An organization profile may
+  // only use organization-wide assets; a branch override may also use assets
+  // attached to its own branch.
+  private async lockLogo(
+    tx: Prisma.TransactionClient,
     user: AuthenticatedPrincipal,
-    assetId: string,
+    assetId: string | null | undefined,
     branchId: string | null,
   ) {
-    const asset = await this.prisma.asset.findFirst({
-      where: {
-        id: assetId,
-        organizationId: user.organizationId,
-        status: 'ACTIVE',
-      },
-    });
-    if (!asset || (asset.branchId !== null && asset.branchId !== branchId))
-      throw new NotFoundException('Asset not found');
+    if (!assetId) return;
+    const locked = await lockActiveAssetsForReference(
+      tx,
+      user.organizationId,
+      branchId,
+      [assetId],
+    );
+    if (!locked.has(assetId)) throw new NotFoundException('Asset not found');
   }
 
   async branchProfile(user: AuthenticatedPrincipal, branchId: string) {
@@ -143,27 +158,28 @@ export class BrandService {
     if (!this.can(user, PERMISSIONS.BRAND_MANAGE))
       throw new ForbiddenException('Permission denied');
     await this.branch(user, branchId);
-    if (input.logoAssetId)
-      await this.assertLogo(user, input.logoAssetId, branchId);
-    return this.prisma.$transaction(async (tx) => {
-      const override = await tx.branchBrandOverride.upsert({
-        where: { branchId },
-        create: { branchId, ...input },
-        update: input,
-      });
-      await this.audit.write(tx, {
-        organizationId: user.organizationId,
-        actorUserId: user.id,
-        action: 'branch_brand_override.updated',
-        entityType: 'branch_brand_override',
-        entityId: override.id,
-        branchId,
-        metadata: {
-          fields: Object.keys(input).filter((key) => key !== 'logoAssetId'),
-        },
-      });
-      return override;
-    });
+    return this.prisma
+      .$transaction(async (tx) => {
+        await this.lockLogo(tx, user, input.logoAssetId, branchId);
+        const override = await tx.branchBrandOverride.upsert({
+          where: { branchId },
+          create: { branchId, ...input },
+          update: input,
+        });
+        await this.audit.write(tx, {
+          organizationId: user.organizationId,
+          actorUserId: user.id,
+          action: 'branch_brand_override.updated',
+          entityType: 'branch_brand_override',
+          entityId: override.id,
+          branchId,
+          metadata: {
+            fields: Object.keys(input).filter((key) => key !== 'logoAssetId'),
+          },
+        });
+        return override;
+      })
+      .catch(rethrowContention);
   }
 
   async effective(user: AuthenticatedPrincipal, branchId: string) {

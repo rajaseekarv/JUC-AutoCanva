@@ -26,6 +26,10 @@ import {
   AssetsService,
   type UploadedFile as UploadedFileData,
 } from './assets.service';
+import {
+  attachmentContentDisposition,
+  inlineContentDisposition,
+} from './content-disposition';
 
 const updateSchema = z
   .object({
@@ -48,21 +52,68 @@ export class AssetsController {
   }
   @Get(':assetId/content')
   @RequirePermissions(PERMISSIONS.ASSET_READ)
-  async content(
+  content(
     @CurrentUser() user: AuthenticatedPrincipal,
     @Param('assetId') id: string,
     @Res() response: Response,
+  ) {
+    return this.send(user, id, response, inlineContentDisposition);
+  }
+  // The same authorized bytes as /content, marked as a file to save.
+  @Get(':assetId/download')
+  @RequirePermissions(PERMISSIONS.ASSET_READ)
+  download(
+    @CurrentUser() user: AuthenticatedPrincipal,
+    @Param('assetId') id: string,
+    @Res() response: Response,
+  ) {
+    return this.send(user, id, response, attachmentContentDisposition);
+  }
+  private async send(
+    user: AuthenticatedPrincipal,
+    id: string,
+    response: Response,
+    disposition: (originalName: string) => string,
   ) {
     const result = await this.assets.content(user, id);
     response.setHeader('Content-Type', result.asset.mimeType);
     response.setHeader(
       'Content-Disposition',
-      'inline; filename="' +
-        result.asset.originalName.replace(/["\\r\\n]/g, '') +
-        '"',
+      disposition(result.asset.originalName),
     );
     response.setHeader('X-Content-Type-Options', 'nosniff');
+    // Access can be revoked or the asset deleted at any time, so no browser
+    // or proxy may keep a copy, and the bytes can never run as a document.
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.setHeader(
+      'Content-Security-Policy',
+      "default-src 'none'; sandbox",
+    );
+    // A read error must not escape as an unhandled 'error' event, which would
+    // stop the process. Before any bytes are sent a generic 500 replaces the
+    // image response; afterwards the only safe option is to end the
+    // connection. Closing the response early also releases the file.
+    result.stream.once('error', () => {
+      if (response.headersSent) {
+        response.destroy();
+        return;
+      }
+      response.removeHeader('Content-Type');
+      response.removeHeader('Content-Disposition');
+      response
+        .status(500)
+        .json({ statusCode: 500, message: 'Internal server error' });
+    });
+    response.once('close', () => result.stream.destroy());
     result.stream.pipe(response);
+  }
+  @Get(':assetId/usage')
+  @RequirePermissions(PERMISSIONS.ASSET_READ)
+  usage(
+    @CurrentUser() user: AuthenticatedPrincipal,
+    @Param('assetId') id: string,
+  ) {
+    return this.assets.usage(user, id);
   }
   @Get(':assetId')
   @RequirePermissions(PERMISSIONS.ASSET_READ)

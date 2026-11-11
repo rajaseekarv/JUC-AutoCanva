@@ -2,6 +2,7 @@ import type { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { Prisma, PrismaClient } from '@prisma/client';
+import { Readable } from 'node:stream';
 import request from 'supertest';
 import {
   afterAll,
@@ -13,6 +14,7 @@ import {
   vi,
 } from 'vitest';
 import { AppModule } from '../app.module';
+import { ASSET_STORAGE } from '../assets/asset-storage';
 import { PERMISSIONS } from '../auth/permissions';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -888,6 +890,1016 @@ describe('HTTP API with mocked Prisma', () => {
         mode: 'CANVA',
         status: 'DISCONNECTED',
         isRealConnection: false,
+      });
+    });
+  });
+
+  describe('asset content streaming', () => {
+    // Storage is faked so these tests never read or write asset files.
+    const storage = { put: vi.fn(), get: vi.fn(), remove: vi.fn() };
+    let assetApp: INestApplication;
+    let assetToken: string;
+    const assetServer = () => assetApp.getHttpServer();
+    const assetAuth = () => ({ Authorization: `Bearer ${assetToken}` });
+    const storedAsset = (
+      branchId: string | null = null,
+      originalName = 'creative-final.png',
+    ) => ({
+      id: 'asset-1',
+      organizationId: 'org-1',
+      branchId,
+      uploadedById: 'user-1',
+      originalName,
+      storageKey: 'generated.png',
+      mimeType: 'image/png',
+      sizeBytes: 4,
+      width: 1,
+      height: 1,
+      checksumSha256: 'hash',
+      status: 'ACTIVE',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      deletedAt: null,
+    });
+    const expectServerAlive = () =>
+      request(assetServer()).get('/api/v1/health').expect(200);
+
+    beforeAll(async () => {
+      const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+        .overrideProvider(PrismaService)
+        .useValue(prismaMock)
+        .overrideProvider(ASSET_STORAGE)
+        .useValue(storage)
+        .compile();
+      assetApp = moduleRef.createNestApplication();
+      assetApp.setGlobalPrefix('api/v1');
+      await assetApp.init();
+      assetToken = await assetApp
+        .get(JwtService)
+        .signAsync({ sub: 'user-1', sid: 'session-1' });
+    });
+
+    afterAll(async () => {
+      await assetApp?.close();
+    });
+
+    beforeEach(() => {
+      grantedPermissions = [PERMISSIONS.ASSET_READ];
+      storage.get.mockReset();
+      model('asset').findFirst = vi.fn(async () => storedAsset());
+    });
+
+    it('streams stored content with its type and security headers', async () => {
+      const bytes = Buffer.from([137, 80, 78, 71]);
+      storage.get.mockResolvedValue(Readable.from([bytes]));
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .buffer(true)
+        .parse((res, done) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => done(null, Buffer.concat(chunks)));
+        })
+        .expect(200);
+      expect(response.headers['content-type']).toBe('image/png');
+      expect(response.headers['x-content-type-options']).toBe('nosniff');
+      expect(response.headers['content-disposition']).toBe(
+        'inline; filename="creative-final.png"',
+      );
+      expect(response.body).toEqual(bytes);
+      expect(storage.get).toHaveBeenCalledWith('generated.png');
+    });
+
+    it('keeps CR and LF in a stored name from injecting a response header', async () => {
+      model('asset').findFirst = vi.fn(async () =>
+        storedAsset(null, 'banner\r\nSet-Cookie: session=stolen.png'),
+      );
+      storage.get.mockResolvedValue(Readable.from([Buffer.from([1])]));
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(200);
+      expect(response.headers['content-disposition']).toBe(
+        'inline; filename="bannerSet-Cookie: session=stolen.png"',
+      );
+      expect(response.headers['set-cookie']).toBeUndefined();
+    });
+
+    it('serves a non-ASCII name with an ASCII fallback instead of failing', async () => {
+      model('asset').findFirst = vi.fn(async () =>
+        storedAsset(null, 'ロゴ.png'),
+      );
+      storage.get.mockResolvedValue(Readable.from([Buffer.from([1])]));
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(200);
+      expect(response.headers['content-disposition']).toBe(
+        'inline; filename="__.png"; filename*=UTF-8\'\'%E3%83%AD%E3%82%B4.png',
+      );
+    });
+
+    it('answers 404 when the stored file is missing and keeps serving', async () => {
+      storage.get.mockRejectedValue(
+        Object.assign(new Error("ENOENT: no such file, open 'C:\\x.png'"), {
+          code: 'ENOENT',
+        }),
+      );
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(404);
+      expect(response.body.message).toBe('Asset content not found');
+      expect(JSON.stringify(response.body)).not.toContain('x.png');
+      await expectServerAlive();
+    });
+
+    it('answers 500 without detail when the stream fails before any data', async () => {
+      storage.get.mockResolvedValue(
+        new Readable({
+          read() {
+            this.destroy(new Error('EIO: i/o error, read'));
+          },
+        }),
+      );
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(500);
+      expect(response.headers['content-type']).toMatch(/^application\/json/);
+      expect(response.body).toEqual({
+        statusCode: 500,
+        message: 'Internal server error',
+      });
+      expect(response.headers['content-disposition']).toBeUndefined();
+      await expectServerAlive();
+    });
+
+    it('ends the response when the stream fails after data was sent', async () => {
+      let sent = false;
+      storage.get.mockResolvedValue(
+        new Readable({
+          read() {
+            if (sent) {
+              this.destroy(new Error('EIO: i/o error, read'));
+              return;
+            }
+            sent = true;
+            this.push(Buffer.alloc(16));
+          },
+        }),
+      );
+      // The status line is already sent, so the only safe outcome is a
+      // truncated response or an aborted connection, never a second reply.
+      await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .then(
+          (response) => expect(response.status).toBe(200),
+          (error: Error) => expect(error).toBeInstanceOf(Error),
+        );
+      await expectServerAlive();
+    });
+
+    it('keeps reporting a deleted asset as not found without opening storage', async () => {
+      model('asset').findFirst = vi.fn(async () => null);
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(404);
+      expect(response.body.message).toBe('Asset not found');
+      expect(storage.get).not.toHaveBeenCalled();
+    });
+
+    it('still requires the read permission and branch access before opening storage', async () => {
+      grantedPermissions = [];
+      await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(403);
+      grantedPermissions = [PERMISSIONS.ASSET_READ];
+      model('asset').findFirst = vi.fn(async () => storedAsset('branch-2'));
+      model('userBranchAccess').findFirst = vi.fn(async () => null);
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(403);
+      expect(response.body.message).toBe('Branch access denied');
+      expect(storage.get).not.toHaveBeenCalled();
+    });
+
+    it('keeps image bytes out of browser and proxy caches and unable to run as a page', async () => {
+      storage.get.mockResolvedValue(Readable.from([Buffer.from([1])]));
+      const response = await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(200);
+      expect(response.headers['cache-control']).toBe('private, no-store');
+      expect(response.headers['content-security-policy']).toBe(
+        "default-src 'none'; sandbox",
+      );
+    });
+
+    it('serves a branch asset to a caller granted that branch', async () => {
+      model('asset').findFirst = vi.fn(async () => storedAsset('branch-1'));
+      model('userBranchAccess').findFirst = vi.fn(async () => ({
+        branchId: 'branch-1',
+      }));
+      storage.get.mockResolvedValue(Readable.from([Buffer.from([1])]));
+      await request(assetServer())
+        .get('/api/v1/assets/asset-1/content')
+        .set(assetAuth())
+        .expect(200);
+      expect(model('userBranchAccess').findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            userId: 'user-1',
+            branchId: 'branch-1',
+          }),
+        }),
+      );
+    });
+
+    it('only looks up active assets in the caller organization', async () => {
+      model('asset').findFirst = vi.fn(async () => null);
+      await request(assetServer())
+        .get('/api/v1/assets/other-org-asset/content')
+        .set(assetAuth())
+        .expect(404);
+      expect(model('asset').findFirst).toHaveBeenCalledWith({
+        where: {
+          id: 'other-org-asset',
+          organizationId: 'org-1',
+          status: 'ACTIVE',
+        },
+      });
+      expect(storage.get).not.toHaveBeenCalled();
+    });
+
+    describe('download (GET /assets/:assetId/download)', () => {
+      it('sends the stored bytes as an attachment with the same protections', async () => {
+        const bytes = Buffer.from([137, 80, 78, 71]);
+        storage.get.mockResolvedValue(Readable.from([bytes]));
+        const response = await request(assetServer())
+          .get('/api/v1/assets/asset-1/download')
+          .set(assetAuth())
+          .buffer(true)
+          .parse((res, done) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: Buffer) => chunks.push(chunk));
+            res.on('end', () => done(null, Buffer.concat(chunks)));
+          })
+          .expect(200);
+        expect(response.headers['content-type']).toBe('image/png');
+        expect(response.headers['content-disposition']).toBe(
+          'attachment; filename="creative-final.png"',
+        );
+        expect(response.headers['x-content-type-options']).toBe('nosniff');
+        expect(response.headers['cache-control']).toBe('private, no-store');
+        expect(response.body).toEqual(bytes);
+        expect(storage.get).toHaveBeenCalledWith('generated.png');
+      });
+
+      it('never reveals the storage key or a filesystem path', async () => {
+        storage.get.mockRejectedValue(
+          Object.assign(
+            new Error("ENOENT: no such file, open 'C:\\store\\generated.png'"),
+            { code: 'ENOENT' },
+          ),
+        );
+        const response = await request(assetServer())
+          .get('/api/v1/assets/asset-1/download')
+          .set(assetAuth())
+          .expect(404);
+        expect(response.body.message).toBe('Asset content not found');
+        expect(JSON.stringify(response.body)).not.toMatch(/generated|store/);
+        expect(JSON.stringify(response.headers)).not.toContain('generated');
+      });
+
+      it('requires authentication', async () => {
+        await request(assetServer())
+          .get('/api/v1/assets/asset-1/download')
+          .expect(401);
+        expect(storage.get).not.toHaveBeenCalled();
+      });
+
+      it('requires the read permission before any lookup', async () => {
+        grantedPermissions = [PERMISSIONS.ASSET_MANAGE];
+        await request(assetServer())
+          .get('/api/v1/assets/asset-1/download')
+          .set(assetAuth())
+          .expect(403);
+        expect(storage.get).not.toHaveBeenCalled();
+      });
+
+      it('denies a branch asset outside the caller branch grants', async () => {
+        model('asset').findFirst = vi.fn(async () => storedAsset('branch-2'));
+        model('userBranchAccess').findFirst = vi.fn(async () => null);
+        const response = await request(assetServer())
+          .get('/api/v1/assets/asset-1/download')
+          .set(assetAuth())
+          .expect(403);
+        expect(response.body.message).toBe('Branch access denied');
+        expect(storage.get).not.toHaveBeenCalled();
+      });
+
+      it('reports a deleted or unknown asset as not found', async () => {
+        model('asset').findFirst = vi.fn(async () => null);
+        const response = await request(assetServer())
+          .get('/api/v1/assets/asset-1/download')
+          .set(assetAuth())
+          .expect(404);
+        expect(response.body.message).toBe('Asset not found');
+        expect(storage.get).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('usage (GET /assets/:assetId/usage)', () => {
+      // Only reads are mocked on the strict client: a transaction, row lock,
+      // write, or audit insert would hit an unmocked member and fail with 500.
+      type StoredRevision = {
+        organizationId: string;
+        branchId: string;
+        revisionId: string;
+        values: Record<string, unknown>;
+      };
+      let revisions: StoredRevision[];
+      const usage = (assetId = 'asset-1') =>
+        request(assetServer())
+          .get(`/api/v1/assets/${assetId}/usage`)
+          .set(assetAuth());
+
+      beforeEach(() => {
+        grantedPermissions = [
+          PERMISSIONS.ASSET_READ,
+          PERMISSIONS.BRANCH_MANAGE,
+        ];
+        storage.get.mockReset();
+        storage.put.mockReset();
+        storage.remove.mockReset();
+        revisions = [];
+        prismaRoot.$queryRaw = vi.fn(
+          async (_sql: TemplateStringsArray, ...parameters: unknown[]) => {
+            const [organizationId, assetId] = parameters;
+            return revisions
+              .filter(
+                (item) =>
+                  item.organizationId === organizationId &&
+                  Object.values(item.values).includes(assetId),
+              )
+              .map((item) => ({
+                revisionId: item.revisionId,
+                revisionNumber: Number(item.revisionId.split('-')[1]),
+                templateVersionId: 'version-1',
+                creativeId: 'creative-1',
+                creativeName: 'Spring Sale',
+                branchId: item.branchId,
+                branchName: item.branchId === 'branch-1' ? 'North' : 'South',
+                isCurrentRevision: item.revisionId === 'revision-2',
+                fieldKeys: Object.keys(item.values).filter(
+                  (key) => item.values[key] === assetId,
+                ),
+              }));
+          },
+        );
+        model('brandProfile').findFirst = vi.fn(async () => null);
+        model('branchBrandOverride').findMany = vi.fn(async () => []);
+        model('templateField').findMany = vi.fn(async () => [
+          { versionId: 'version-1', key: 'logo', label: 'Logo', type: 'LOGO' },
+        ]);
+      });
+
+      it('returns grouped references for an asset in use', async () => {
+        revisions = [
+          {
+            organizationId: 'org-1',
+            branchId: 'branch-1',
+            revisionId: 'revision-2',
+            values: { logo: 'asset-1' },
+          },
+          {
+            organizationId: 'org-1',
+            branchId: 'branch-1',
+            revisionId: 'revision-1',
+            values: { logo: 'asset-1' },
+          },
+          {
+            organizationId: 'org-2',
+            branchId: 'branch-x',
+            revisionId: 'revision-9',
+            values: { logo: 'asset-1' },
+          },
+        ];
+        model('brandProfile').findFirst = vi.fn(async () => ({
+          id: 'profile-1',
+          displayName: 'AdFlow',
+        }));
+        model('branchBrandOverride').findMany = vi.fn(async () => [
+          { branchId: 'branch-1', branch: { name: 'North', code: 'NORTH' } },
+        ]);
+        const response = await usage().expect(200);
+        expect(response.body).toEqual({
+          assetId: 'asset-1',
+          inUse: true,
+          creativeRevisions: [
+            {
+              creativeId: 'creative-1',
+              creativeName: 'Spring Sale',
+              branchId: 'branch-1',
+              branchName: 'North',
+              revisionId: 'revision-2',
+              revisionNumber: 2,
+              isCurrentRevision: true,
+              fields: [{ key: 'logo', label: 'Logo', type: 'LOGO' }],
+            },
+            {
+              creativeId: 'creative-1',
+              creativeName: 'Spring Sale',
+              branchId: 'branch-1',
+              branchName: 'North',
+              revisionId: 'revision-1',
+              revisionNumber: 1,
+              isCurrentRevision: false,
+              fields: [{ key: 'logo', label: 'Logo', type: 'LOGO' }],
+            },
+          ],
+          organizationBrandProfile: {
+            profileId: 'profile-1',
+            displayName: 'AdFlow',
+          },
+          branchBrandProfiles: [
+            { branchId: 'branch-1', branchName: 'North', branchCode: 'NORTH' },
+          ],
+          hiddenReferenceCount: 0,
+        });
+        // The other organization's revision is filtered by the query itself.
+        expect(JSON.stringify(response.body)).not.toContain('revision-9');
+        expect(
+          (prismaRoot.$queryRaw as MockFn).mock.calls[0]?.slice(1),
+        ).toEqual(['org-1', 'asset-1']);
+        expect(model('brandProfile').findFirst).toHaveBeenCalledWith({
+          where: { logoAssetId: 'asset-1', organizationId: 'org-1' },
+          select: { id: true, displayName: true },
+        });
+        expect(model('branchBrandOverride').findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              logoAssetId: 'asset-1',
+              branch: { organizationId: 'org-1' },
+            },
+          }),
+        );
+      });
+
+      it('reports an unused asset', async () => {
+        const response = await usage().expect(200);
+        expect(response.body).toEqual({
+          assetId: 'asset-1',
+          inUse: false,
+          creativeRevisions: [],
+          organizationBrandProfile: null,
+          branchBrandProfiles: [],
+          hiddenReferenceCount: 0,
+        });
+      });
+
+      it('hides details from branches the caller has no grant to, but still reports use', async () => {
+        grantedPermissions = [PERMISSIONS.ASSET_READ];
+        model('userBranchAccess').findMany = vi.fn(async () => [
+          { branchId: 'branch-1' },
+        ]);
+        revisions = [
+          {
+            organizationId: 'org-1',
+            branchId: 'branch-2',
+            revisionId: 'revision-1',
+            values: { logo: 'asset-1' },
+          },
+        ];
+        const response = await usage().expect(200);
+        expect(response.body).toMatchObject({
+          inUse: true,
+          creativeRevisions: [],
+          hiddenReferenceCount: 1,
+        });
+        expect(JSON.stringify(response.body)).not.toMatch(/South|branch-2/);
+      });
+
+      it('returns 404 for an unknown or deleted asset', async () => {
+        model('asset').findFirst = vi.fn(async () => null);
+        const response = await usage('asset-missing').expect(404);
+        expect(response.body.message).toBe('Asset not found');
+        expect(prismaRoot.$queryRaw).not.toHaveBeenCalled();
+      });
+
+      it('denies callers without read permission or branch access', async () => {
+        grantedPermissions = [];
+        await usage().expect(403);
+        grantedPermissions = [PERMISSIONS.ASSET_READ];
+        model('asset').findFirst = vi.fn(async () => storedAsset('branch-2'));
+        model('userBranchAccess').findFirst = vi.fn(async () => null);
+        const response = await usage().expect(403);
+        expect(response.body.message).toBe('Branch access denied');
+        expect(prismaRoot.$queryRaw).not.toHaveBeenCalled();
+      });
+
+      it('requires authentication', async () => {
+        await request(assetServer())
+          .get('/api/v1/assets/asset-1/usage')
+          .expect(401);
+      });
+
+      it('writes nothing: no transaction, audit event, or storage access', async () => {
+        revisions = [
+          {
+            organizationId: 'org-1',
+            branchId: 'branch-1',
+            revisionId: 'revision-2',
+            values: { logo: 'asset-1' },
+          },
+        ];
+        await usage().expect(200);
+        // None of these are mocked on the strict client; any access would
+        // have failed the request.
+        expect('$transaction' in prismaRoot).toBe(false);
+        expect(models.has('auditLog')).toBe(false);
+        expect(storage.get).not.toHaveBeenCalled();
+        expect(storage.put).not.toHaveBeenCalled();
+        expect(storage.remove).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('deletion and branch moves', () => {
+      // References as stored, each tagged with the organization it belongs
+      // to. The fakes apply the real queries' filters: the caller's
+      // organization, and the asset ID as a top-level revision value or as a
+      // brand-profile or branch-override logo. Only the row lock, the
+      // reference checks and the deletion writes are mocked, so any other
+      // database access fails the request.
+      type References = {
+        revisions?: Array<{
+          id: string;
+          organizationId: string;
+          values: Record<string, unknown>;
+        }>;
+        organizationLogos?: Array<{
+          organizationId: string;
+          logoAssetId: string;
+        }>;
+        branchLogos?: Array<{ organizationId: string; logoAssetId: string }>;
+        // The branch the row lock finds (the stored asset's by default);
+        // differs when a concurrent move committed after authorization.
+        lockedBranchId?: string | null;
+      };
+      let transaction: Record<string, unknown> & {
+        $queryRaw: MockFn;
+        brandProfile: { findFirst: MockFn };
+        branchBrandOverride: { findFirst: MockFn };
+        asset: { update: MockFn };
+        auditLog: { create: MockFn };
+      };
+
+      function withReferences(references: References = {}) {
+        const logoFinder =
+          (
+            logos: References['organizationLogos'],
+            organizationOf: (where: Record<string, unknown>) => unknown,
+          ) =>
+          async ({ where }: { where: Record<string, unknown> }) =>
+            (logos ?? []).some(
+              (logo) =>
+                logo.logoAssetId === where.logoAssetId &&
+                logo.organizationId === organizationOf(where),
+            )
+              ? { id: 'profile' }
+              : null;
+        transaction = {
+          $queryRaw: vi.fn(
+            async (sql: TemplateStringsArray, ...parameters: unknown[]) => {
+              if (sql.join('?').includes('FOR UPDATE'))
+                return [{ branchId: references.lockedBranchId ?? null }];
+              const [organizationId, assetId] = parameters;
+              return (references.revisions ?? [])
+                .filter(
+                  (revision) =>
+                    revision.organizationId === organizationId &&
+                    Object.values(revision.values).includes(assetId),
+                )
+                .slice(0, 1)
+                .map((revision) => ({ id: revision.id }));
+            },
+          ),
+          brandProfile: {
+            findFirst: vi.fn(
+              logoFinder(
+                references.organizationLogos,
+                (where) => where.organizationId,
+              ),
+            ),
+          },
+          branchBrandOverride: {
+            findFirst: vi.fn(
+              logoFinder(
+                references.branchLogos,
+                (where) =>
+                  (where.branch as { organizationId: string }).organizationId,
+              ),
+            ),
+          },
+          asset: {
+            update: vi.fn(
+              async ({ data }: { data: Record<string, unknown> }) => ({
+                id: 'asset-1',
+                ...data,
+              }),
+            ),
+          },
+          auditLog: { create: vi.fn(async () => ({})) },
+        };
+        const client = strict('tx', transaction);
+        prismaRoot.$transaction = vi.fn(
+          async (work: (tx: typeof client) => Promise<unknown>) => work(client),
+        );
+      }
+
+      const deleteAsset = () =>
+        request(assetServer())
+          .delete('/api/v1/assets/asset-1')
+          .set(assetAuth());
+      const expectNothingWritten = () => {
+        expect(transaction.asset.update).not.toHaveBeenCalled();
+        expect(transaction.auditLog.create).not.toHaveBeenCalled();
+        expect(storage.remove).not.toHaveBeenCalled();
+      };
+
+      beforeEach(() => {
+        grantedPermissions = [
+          PERMISSIONS.ASSET_READ,
+          PERMISSIONS.ASSET_MANAGE,
+          PERMISSIONS.ORGANIZATION_UPDATE,
+        ];
+        storage.remove.mockReset();
+        storage.remove.mockResolvedValue(undefined);
+      });
+
+      it('returns 409 without writes or file removal for a referenced asset', async () => {
+        withReferences({
+          revisions: [
+            {
+              id: 'revision-1',
+              organizationId: 'org-1',
+              values: { headline: 'Sale', logo: 'asset-1' },
+            },
+          ],
+        });
+        const response = await deleteAsset().expect(409);
+        expect(response.body.message).toBe(
+          'Asset is used by a creative revision and cannot be deleted',
+        );
+        expect(response.body).toMatchObject({
+          statusCode: 409,
+          error: 'Conflict',
+          reason: 'CREATIVE_REVISION',
+        });
+        expect(JSON.stringify(response.body)).not.toContain('revision-1');
+        expectNothingWritten();
+      });
+
+      it('returns 409 for the organization brand logo', async () => {
+        withReferences({
+          organizationLogos: [
+            { organizationId: 'org-1', logoAssetId: 'asset-1' },
+          ],
+        });
+        const response = await deleteAsset().expect(409);
+        expect(response.body.message).toBe(
+          'Asset is used as the organization brand logo and cannot be deleted',
+        );
+        expect(response.body.reason).toBe('ORGANIZATION_BRAND_LOGO');
+        expectNothingWritten();
+      });
+
+      it('returns 409 for a branch brand logo', async () => {
+        withReferences({
+          branchLogos: [{ organizationId: 'org-1', logoAssetId: 'asset-1' }],
+        });
+        const response = await deleteAsset().expect(409);
+        expect(response.body.message).toBe(
+          'Asset is used as a branch brand logo and cannot be deleted',
+        );
+        expect(response.body.reason).toBe('BRANCH_BRAND_LOGO');
+        expectNothingWritten();
+      });
+
+      it('deletes an unreferenced asset and its stored file', async () => {
+        withReferences({
+          revisions: [
+            {
+              id: 'revision-1',
+              organizationId: 'org-1',
+              values: { logo: 'asset-2' },
+            },
+          ],
+          organizationLogos: [
+            { organizationId: 'org-1', logoAssetId: 'asset-2' },
+          ],
+        });
+        const response = await deleteAsset().expect(200);
+        expect(response.body).toEqual({ id: 'asset-1', status: 'DELETED' });
+        expect(transaction.asset.update).toHaveBeenCalledWith({
+          where: { id: 'asset-1' },
+          data: { status: 'DELETED', deletedAt: expect.any(Date) },
+        });
+        expect(transaction.auditLog.create).toHaveBeenCalledTimes(1);
+        expect(storage.remove).toHaveBeenCalledWith('generated.png');
+      });
+
+      it('ignores references and logos from another organization', async () => {
+        withReferences({
+          revisions: [
+            {
+              id: 'revision-x',
+              organizationId: 'org-2',
+              values: { logo: 'asset-1' },
+            },
+          ],
+          organizationLogos: [
+            { organizationId: 'org-2', logoAssetId: 'asset-1' },
+          ],
+          branchLogos: [{ organizationId: 'org-2', logoAssetId: 'asset-1' }],
+        });
+        await deleteAsset().expect(200);
+        expect(transaction.$queryRaw.mock.calls[0]?.slice(1)).toEqual([
+          'asset-1',
+          'org-1',
+        ]);
+        expect(transaction.$queryRaw.mock.calls[1]?.slice(1)).toEqual([
+          'org-1',
+          'asset-1',
+        ]);
+        expect(storage.remove).toHaveBeenCalledWith('generated.png');
+      });
+
+      it('returns 404 without writes when a concurrent deletion won the row lock', async () => {
+        withReferences();
+        transaction.$queryRaw.mockImplementationOnce(async () => []);
+        const response = await deleteAsset().expect(404);
+        expect(response.body.message).toBe('Asset not found');
+        expectNothingWritten();
+      });
+
+      describe('branch move (PATCH branchId)', () => {
+        // branch-1 and branch-2 belong to org-1; anything else does not.
+        const organizationBranches = new Set(['branch-1', 'branch-2']);
+        const moveAsset = (branchId: string | null) =>
+          request(assetServer())
+            .patch('/api/v1/assets/asset-1')
+            .set(assetAuth())
+            .send({ branchId });
+        const expectUnchanged = () => {
+          expect(transaction.asset.update).not.toHaveBeenCalled();
+          expect(transaction.auditLog.create).not.toHaveBeenCalled();
+          expect(storage.put).not.toHaveBeenCalled();
+          expect(storage.remove).not.toHaveBeenCalled();
+        };
+
+        beforeEach(() => {
+          grantedPermissions = [
+            PERMISSIONS.ASSET_READ,
+            PERMISSIONS.ASSET_MANAGE,
+            PERMISSIONS.BRANCH_MANAGE,
+            PERMISSIONS.ORGANIZATION_UPDATE,
+          ];
+          storage.put.mockReset();
+          model('asset').findFirst = vi.fn(async () => storedAsset('branch-1'));
+          model('branch').findFirst = vi.fn(
+            async ({
+              where,
+            }: {
+              where: { id: string; organizationId: string };
+            }) =>
+              where.organizationId === 'org-1' &&
+              organizationBranches.has(where.id)
+                ? { id: where.id }
+                : null,
+          );
+        });
+
+        it('returns 409 CREATIVE_REVISION and keeps the branch for a referenced asset', async () => {
+          withReferences({
+            lockedBranchId: 'branch-1',
+            revisions: [
+              {
+                id: 'revision-1',
+                organizationId: 'org-1',
+                values: { logo: 'asset-1' },
+              },
+            ],
+          });
+          const response = await moveAsset('branch-2').expect(409);
+          expect(response.body).toEqual({
+            statusCode: 409,
+            error: 'Conflict',
+            reason: 'CREATIVE_REVISION',
+            message:
+              'Asset is used by a creative revision and cannot be moved to another branch',
+          });
+          expectUnchanged();
+        });
+
+        it('returns 409 ORGANIZATION_BRAND_LOGO for the organization logo', async () => {
+          model('asset').findFirst = vi.fn(async () => storedAsset(null));
+          withReferences({
+            lockedBranchId: null,
+            organizationLogos: [
+              { organizationId: 'org-1', logoAssetId: 'asset-1' },
+            ],
+          });
+          const response = await moveAsset('branch-2').expect(409);
+          expect(response.body.reason).toBe('ORGANIZATION_BRAND_LOGO');
+          expect(response.body.message).toBe(
+            'Asset is used as the organization brand logo and cannot be moved to another branch',
+          );
+          expectUnchanged();
+        });
+
+        it('returns 409 BRANCH_BRAND_LOGO for a branch logo', async () => {
+          withReferences({
+            lockedBranchId: 'branch-1',
+            branchLogos: [{ organizationId: 'org-1', logoAssetId: 'asset-1' }],
+          });
+          const response = await moveAsset('branch-2').expect(409);
+          expect(response.body.reason).toBe('BRANCH_BRAND_LOGO');
+          expectUnchanged();
+        });
+
+        it('moves an unreferenced asset', async () => {
+          withReferences({
+            lockedBranchId: 'branch-1',
+            revisions: [
+              {
+                id: 'revision-1',
+                organizationId: 'org-1',
+                values: { logo: 'asset-2' },
+              },
+            ],
+          });
+          const response = await moveAsset('branch-2').expect(200);
+          expect(response.body).toMatchObject({
+            id: 'asset-1',
+            branchId: 'branch-2',
+          });
+          expect(transaction.asset.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              where: { id: 'asset-1' },
+              data: { branchId: 'branch-2' },
+            }),
+          );
+          expect(transaction.auditLog.create).toHaveBeenCalledTimes(1);
+          expect(storage.put).not.toHaveBeenCalled();
+          expect(storage.remove).not.toHaveBeenCalled();
+        });
+
+        it('ignores references and logos from another organization', async () => {
+          withReferences({
+            lockedBranchId: 'branch-1',
+            revisions: [
+              {
+                id: 'revision-x',
+                organizationId: 'org-2',
+                values: { logo: 'asset-1' },
+              },
+            ],
+            organizationLogos: [
+              { organizationId: 'org-2', logoAssetId: 'asset-1' },
+            ],
+            branchLogos: [{ organizationId: 'org-2', logoAssetId: 'asset-1' }],
+          });
+          await moveAsset('branch-2').expect(200);
+          expect(transaction.$queryRaw.mock.calls[0]?.slice(1)).toEqual([
+            'asset-1',
+            'org-1',
+          ]);
+          expect(transaction.$queryRaw.mock.calls[1]?.slice(1)).toEqual([
+            'org-1',
+            'asset-1',
+          ]);
+        });
+
+        it('returns a retryable 409 when a concurrent move changed the branch first', async () => {
+          withReferences({ lockedBranchId: 'branch-2' });
+          const response = await moveAsset(null).expect(409);
+          expect(response.body.message).toBe(transactionConflictMessage);
+          expectUnchanged();
+        });
+
+        it('returns 404 when the asset was deleted before the lock', async () => {
+          withReferences();
+          transaction.$queryRaw.mockImplementationOnce(async () => []);
+          const response = await moveAsset('branch-2').expect(404);
+          expect(response.body.message).toBe('Asset not found');
+          expectUnchanged();
+        });
+
+        it('keeps permission and branch isolation checks ahead of any lock', async () => {
+          withReferences({ lockedBranchId: 'branch-1' });
+          // No asset-management permission: refused by the guard.
+          grantedPermissions = [PERMISSIONS.ASSET_READ];
+          await moveAsset('branch-2').expect(403);
+          // Branch to branch without branch management.
+          grantedPermissions = [
+            PERMISSIONS.ASSET_READ,
+            PERMISSIONS.ASSET_MANAGE,
+            PERMISSIONS.ORGANIZATION_UPDATE,
+          ];
+          model('userBranchAccess').findFirst = vi.fn(async () => ({
+            branchId: 'branch-1',
+          }));
+          const scope = await moveAsset('branch-2').expect(403);
+          expect(scope.body.message).toBe('Asset scope cannot be changed');
+          // A target branch outside the organization.
+          grantedPermissions = [
+            PERMISSIONS.ASSET_READ,
+            PERMISSIONS.ASSET_MANAGE,
+            PERMISSIONS.BRANCH_MANAGE,
+          ];
+          const foreign = await moveAsset('branch-foreign').expect(403);
+          expect(foreign.body.message).toBe('Branch access denied');
+          // An asset in a branch the caller has no grant to.
+          grantedPermissions = [
+            PERMISSIONS.ASSET_READ,
+            PERMISSIONS.ASSET_MANAGE,
+          ];
+          model('asset').findFirst = vi.fn(async () => storedAsset('branch-2'));
+          model('userBranchAccess').findFirst = vi.fn(async () => null);
+          const hidden = await moveAsset('branch-1').expect(403);
+          expect(hidden.body.message).toBe('Branch access denied');
+          expect(prismaRoot.$transaction).not.toHaveBeenCalled();
+          expect(transaction.$queryRaw).not.toHaveBeenCalled();
+        });
+
+        it('rejects an invalid branch value before any database work', async () => {
+          withReferences();
+          await request(assetServer())
+            .patch('/api/v1/assets/asset-1')
+            .set(assetAuth())
+            .send({ branchId: '' })
+            .expect(400);
+          expect(transaction.$queryRaw).not.toHaveBeenCalled();
+        });
+      });
+    });
+
+    describe('brand logo updates', () => {
+      let transaction: Record<string, unknown> & {
+        $queryRaw: MockFn;
+        brandProfile: { upsert: MockFn };
+        auditLog: { create: MockFn };
+      };
+
+      beforeEach(() => {
+        grantedPermissions = [
+          PERMISSIONS.BRAND_MANAGE,
+          PERMISSIONS.ORGANIZATION_UPDATE,
+        ];
+        transaction = {
+          $queryRaw: vi.fn(async () => [{ id: 'asset-1' }]),
+          brandProfile: { upsert: vi.fn(async () => ({ id: 'profile-1' })) },
+          auditLog: { create: vi.fn(async () => ({})) },
+        };
+        const client = strict('tx', transaction);
+        prismaRoot.$transaction = vi.fn(
+          async (work: (tx: typeof client) => Promise<unknown>) => work(client),
+        );
+      });
+
+      it('locks the logo in the profile transaction before saving it', async () => {
+        await request(assetServer())
+          .patch('/api/v1/organization/brand')
+          .set(assetAuth())
+          .send({ logoAssetId: 'asset-1' })
+          .expect(200);
+        const [sql, ...parameters] = transaction.$queryRaw.mock.calls[0] ?? [];
+        expect((sql as TemplateStringsArray).join('?')).toMatch(
+          /FOR SHARE\s*$/,
+        );
+        expect(parameters).toEqual(
+          expect.arrayContaining([expect.anything(), 'org-1']),
+        );
+        expect(transaction.brandProfile.upsert).toHaveBeenCalled();
+      });
+
+      it('returns 404 without saving when the logo was deleted concurrently', async () => {
+        transaction.$queryRaw.mockImplementationOnce(async () => []);
+        const response = await request(assetServer())
+          .patch('/api/v1/organization/brand')
+          .set(assetAuth())
+          .send({ logoAssetId: 'asset-1' })
+          .expect(404);
+        expect(response.body.message).toBe('Asset not found');
+        expect(transaction.brandProfile.upsert).not.toHaveBeenCalled();
+        expect(transaction.auditLog.create).not.toHaveBeenCalled();
       });
     });
   });
