@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type {
   AuthenticatedUserResponse,
   CreativeResponse,
@@ -15,6 +15,8 @@ import { approvalSummaryText } from './approvalText';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
+// Mirrors the API's limit for POST /workflow-instances/:id/cancel.
+const CANCEL_REASON_MAX_LENGTH = 1000;
 type Session = { accessToken: string; user: AuthenticatedUserResponse };
 type Stage = {
   id: string;
@@ -67,6 +69,10 @@ type Instance = {
   status: string;
   currentStage: Stage;
   creativeRevisionId: string;
+  startedById?: string;
+  // Review decisions recorded in this run; the starter may cancel only
+  // while there are none.
+  _count?: { approvalDecisions: number };
   version: Version;
   tasks: {
     id: string;
@@ -145,6 +151,21 @@ export default function WorkflowWorkspace({
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  // Cancellation of the selected run: the reason form, and a guard against a
+  // second submission before the first one's busy state has rendered.
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+  const [cancelError, setCancelError] = useState('');
+  const cancelInFlight = useRef(false);
+  const cancelReasonId = useId();
+  const startBlockedId = useId();
+  const instanceId = instance?.id;
+  useEffect(() => {
+    // A different run (or none) is shown: drop any half-entered reason.
+    setCancelOpen(false);
+    setCancelReason('');
+    setCancelError('');
+  }, [instanceId]);
   const selected = workflows.find((item) => item.id === workflowId) ?? null;
 
   async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -254,6 +275,48 @@ export default function WorkflowWorkspace({
       ),
     );
   }, [selected, workflowId, workflows]);
+  // Revision numbers with an OPEN or IN_PROGRESS change request for the
+  // selected creative. The API refuses a run for such a revision (409); this
+  // only explains it before Start is pressed, so it is loaded only for users
+  // who may read change requests.
+  const [unresolvedRevisions, setUnresolvedRevisions] = useState<number[]>([]);
+  const [requestsKey, setRequestsKey] = useState(0);
+  const canReadRequests = session.user.permissions.includes(
+    'change_requests:read',
+  );
+  useEffect(() => {
+    setUnresolvedRevisions([]);
+    if (!creativeId || !canReadRequests) return;
+    let cancelled = false;
+    void request<{ status: string; revisionNumber: number }[] | null>(
+      `/creatives/${encodeURIComponent(creativeId)}/change-requests`,
+    )
+      .then((requests) => {
+        if (cancelled) return;
+        setUnresolvedRevisions(
+          (requests ?? [])
+            .filter(
+              (item) => item.status === 'OPEN' || item.status === 'IN_PROGRESS',
+            )
+            .map((item) => item.revisionNumber),
+        );
+      })
+      .catch(() => {
+        // Without them Start stays available and the API still decides.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creativeId, session.accessToken, instanceKey, requestsKey]);
+  const selectedCreative =
+    creatives.find((item) => item.id === creativeId) ?? null;
+  const currentRevisionNumber =
+    selectedCreative?.currentRevision?.revisionNumber;
+  const startBlockedByRequests =
+    currentRevisionNumber !== undefined &&
+    unresolvedRevisions.includes(currentRevisionNumber);
+
   useEffect(() => {
     if (!creativeId) {
       setInstance(null);
@@ -385,10 +448,66 @@ export default function WorkflowWorkspace({
       await reload();
       onDataChanged?.('workflows');
     } catch (cause) {
+      // The chosen workflow stays selected. A refusal may come from change
+      // requests added since they were loaded, so reload them.
       setError(
         cause instanceof Error ? cause.message : 'Unable to start workflow.',
       );
+      setRequestsKey((key) => key + 1);
     } finally {
+      setBusy(false);
+    }
+  }
+
+  // A workflow manager may cancel any running run; whoever started it only
+  // while no review decision is recorded. The API enforces both rules.
+  const canCancel =
+    instance?.status === 'RUNNING' &&
+    (canManage ||
+      (canStart &&
+        instance.startedById === session.user.id &&
+        instance._count?.approvalDecisions === 0));
+
+  async function cancelRun(): Promise<void> {
+    if (!instance || cancelInFlight.current) return;
+    const reason = cancelReason.trim();
+    if (!reason) {
+      setCancelError('Enter a reason for cancelling this run.');
+      return;
+    }
+    if (reason.length > CANCEL_REASON_MAX_LENGTH) {
+      setCancelError(
+        `The reason must be at most ${CANCEL_REASON_MAX_LENGTH} characters.`,
+      );
+      return;
+    }
+    cancelInFlight.current = true;
+    setBusy(true);
+    setCancelError('');
+    setError('');
+    setMessage('');
+    try {
+      const cancelled = await request<Instance>(
+        `/workflow-instances/${encodeURIComponent(instance.id)}/cancel`,
+        { method: 'POST', body: JSON.stringify({ reason }) },
+      );
+      setInstance(cancelled);
+      setCancelOpen(false);
+      setCancelReason('');
+      setMessage(
+        'Run cancelled. The creative can be revised and submitted again.',
+      );
+      await reload();
+      onDataChanged?.('workflows');
+    } catch (cause) {
+      // Kept next to the reason so it can be corrected or retried; the run
+      // is reloaded in case it changed meanwhile.
+      setCancelError(
+        cause instanceof Error ? cause.message : 'Unable to cancel the run.',
+      );
+      setInstanceKey((key) => key + 1);
+    } finally {
+      cancelInFlight.current = false;
       setBusy(false);
     }
   }
@@ -589,8 +708,23 @@ export default function WorkflowWorkspace({
                     ))}
                 </select>
               </label>
+              {startBlockedByRequests && (
+                <p className="empty-state" id={startBlockedId}>
+                  Revision {currentRevisionNumber} has unresolved change
+                  requests. Save a new revision with the requested changes in
+                  Creatives before resubmitting it for review.
+                </p>
+              )}
               <button
-                disabled={busy || !selected || selected.status !== 'ENABLED'}
+                disabled={
+                  busy ||
+                  !selected ||
+                  selected.status !== 'ENABLED' ||
+                  startBlockedByRequests
+                }
+                aria-describedby={
+                  startBlockedByRequests ? startBlockedId : undefined
+                }
                 onClick={() => void startWorkflow()}
               >
                 Start workflow
@@ -635,15 +769,91 @@ export default function WorkflowWorkspace({
                     {item.label}
                   </button>
                 ))}
+              {canCancel &&
+                (cancelOpen ? (
+                  <div
+                    className="template-preview"
+                    role="group"
+                    aria-label="Cancel run"
+                  >
+                    <label htmlFor={cancelReasonId}>
+                      Reason for cancelling (required)
+                    </label>
+                    <textarea
+                      id={cancelReasonId}
+                      value={cancelReason}
+                      maxLength={CANCEL_REASON_MAX_LENGTH}
+                      aria-invalid={cancelError ? true : undefined}
+                      onChange={(event) => {
+                        setCancelReason(event.target.value);
+                        setCancelError('');
+                      }}
+                    />
+                    <p className="empty-state">
+                      Cancelling ends this run at the{' '}
+                      {instance.currentStage.name} stage. Its decisions, change
+                      requests and history are kept, open tasks close, and the
+                      creative can be revised again.
+                    </p>
+                    {cancelError && (
+                      <p role="alert" className="form-message">
+                        {cancelError}
+                      </p>
+                    )}
+                    <div className="template-actions">
+                      <button
+                        type="button"
+                        className="warning-button"
+                        disabled={busy}
+                        onClick={() => void cancelRun()}
+                      >
+                        {busy ? 'Cancelling…' : 'Confirm cancellation'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          setCancelOpen(false);
+                          setCancelReason('');
+                          setCancelError('');
+                        }}
+                      >
+                        Keep running
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="warning-button"
+                    disabled={busy}
+                    onClick={() => {
+                      setCancelOpen(true);
+                      setCancelError('');
+                    }}
+                  >
+                    Cancel run
+                  </button>
+                ))}
               <h4>Transition history</h4>
               {instance.history.length ? (
                 <ol>
                   {instance.history.map((item) => (
                     <li key={item.id}>
-                      {item.fromStage?.name ?? 'Start'} → {item.toStage.name} ·{' '}
-                      {item.actionKey} ·{' '}
-                      {new Date(item.createdAt).toLocaleString()}
-                      {item.reason ? ` · ${item.reason}` : ''}
+                      {item.actionKey === 'CANCEL' ? (
+                        <>
+                          Cancelled at {item.toStage.name} ·{' '}
+                          {new Date(item.createdAt).toLocaleString()}
+                          {item.reason ? ` · Reason: ${item.reason}` : ''}
+                        </>
+                      ) : (
+                        <>
+                          {item.fromStage?.name ?? 'Start'} →{' '}
+                          {item.toStage.name} · {item.actionKey} ·{' '}
+                          {new Date(item.createdAt).toLocaleString()}
+                          {item.reason ? ` · ${item.reason}` : ''}
+                        </>
+                      )}
                     </li>
                   ))}
                 </ol>

@@ -15,7 +15,10 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PermissionGuard } from '../auth/permission.guard';
 import { RequirePermissions } from '../auth/require-permissions.decorator';
 import { PERMISSIONS } from '../auth/permissions';
-import { WorkflowsService } from './workflows.service';
+import {
+  CANCEL_REASON_MAX_LENGTH,
+  WorkflowsService,
+} from './workflows.service';
 
 const stage = z
   .object({
@@ -180,6 +183,31 @@ export class WorkflowsController {
     @Param('instanceId') id: string,
   ) {
     return this.workflows.history(user, id);
+  }
+
+  // No route permission: a workflow manager may cancel any run in their
+  // branches, and the run's starter (workflows:start) only while it has no
+  // decision. The service enforces both, after hiding out-of-scope runs.
+  @Post('workflow-instances/:instanceId/cancel')
+  cancel(
+    @CurrentUser() user: AuthenticatedPrincipal,
+    @Param('instanceId') id: string,
+    @Body() body: unknown,
+  ) {
+    const result = z
+      .object({
+        reason: z.string().trim().min(1).max(CANCEL_REASON_MAX_LENGTH),
+      })
+      .strict()
+      .safeParse(body);
+    // An invalid body becomes an empty reason, which the service rejects
+    // with 400 after its permission check, so a caller without permission
+    // always gets 403.
+    return this.workflows.cancel(
+      user,
+      id,
+      result.success ? result.data.reason : '',
+    );
   }
 
   @Get('workflow-instances/:instanceId/transitions')

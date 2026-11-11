@@ -147,9 +147,10 @@ export interface CreativeResponse {
   // Status of the current revision: the stage of a run for that revision, or
   // DRAFT when the latest run reviewed an older revision.
   status: string;
-  // Latest approved revision, which may be older than the current one.
+  // Latest revision approved by a completed run whose decisions were all
+  // approvals; it may be older than the current one.
   approvedRevision?: ApprovedRevisionSummary | null;
-  // Whether the current revision's latest decision is an approval.
+  // Whether the current revision's latest completed run approved it.
   currentRevisionApproved?: boolean;
   currentRevisionId: string | null;
   createdAt: string;

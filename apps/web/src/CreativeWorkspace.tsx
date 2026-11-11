@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react';
 import type {
   AuthenticatedUserResponse,
   BranchResponse,
@@ -27,7 +34,18 @@ type LatestRun = {
   status: string;
   workflowId: string;
   creativeRevisionId: string;
+  currentStage?: { name: string } | null;
+  workflow?: { name: string } | null;
 };
+// A failed API request, keeping the HTTP status for callers that need it.
+class RequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
 type AssetOption = {
   id: string;
   originalName: string;
@@ -84,6 +102,14 @@ export default function CreativeWorkspace({
   // and review feedback for the selected creative reload.
   const [reviewKey, setReviewKey] = useState(0);
   const [latestRun, setLatestRun] = useState<LatestRun | null>(null);
+  // True while the selected creative's workflow state is being fetched.
+  const [runLoading, setRunLoading] = useState(false);
+  // The creative the loaded run belongs to, so a refresh of the same
+  // creative keeps showing its run instead of flickering.
+  const runCreativeId = useRef('');
+  const lockNoticeId = useId();
+  // What the form values were last loaded from (see the effect below).
+  const appliedFormSource = useRef('');
   const [openRequests, setOpenRequests] = useState<FeedbackChangeRequest[]>([]);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -110,10 +136,18 @@ export default function CreativeWorkspace({
         (typeof value === 'string' && value.trim().length === 0)
       );
     }) ?? false;
+  // The API refuses a new revision while a run is RUNNING (409). With
+  // workflows:read the screen knows this in advance and locks saving; until
+  // the run state is known it does not offer a save that may be refused.
+  // Without workflows:read the API's 409 remains the protection.
+  const editLocked = !!selected && latestRun?.status === 'RUNNING';
+  const awaitingRunState = !!selected && canReadWorkflows && runLoading;
   const canSubmit =
     !!selectedVersion?.immutableAt &&
     name.trim().length > 0 &&
-    !missingRequiredValue;
+    !missingRequiredValue &&
+    !editLocked &&
+    !awaitingRunState;
 
   async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(apiBase + path, {
@@ -132,10 +166,11 @@ export default function CreativeWorkspace({
       const payload = (await response.json().catch(() => null)) as {
         message?: string;
       } | null;
-      throw new Error(
+      throw new RequestError(
         response.status === 403
           ? 'You do not have permission to complete this action.'
           : (payload?.message ?? 'Unable to complete the creative request.'),
+        response.status,
       );
     }
     return response.json() as Promise<T>;
@@ -261,9 +296,21 @@ export default function CreativeWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTemplateId, session.accessToken]);
   useEffect(() => {
-    if (!templateDetail) return;
+    if (!templateDetail) {
+      // Choosing a template again starts from its stored values or defaults.
+      appliedFormSource.current = '';
+      return;
+    }
     const selectedCreative = creatives.find((item) => item.id === selectedId);
     const revision = selectedCreative?.currentRevision;
+    // A list refresh (for example from another screen) returns new objects
+    // for the same creative and revision; the form keeps its unsaved values
+    // unless the creative, its current revision, or the template changed.
+    const formSource = [templateDetail.id, selectedId, revision?.id ?? ''].join(
+      ':',
+    );
+    if (formSource === appliedFormSource.current) return;
+    appliedFormSource.current = formSource;
     const active = templateDetail.versions?.find(
       (version) => version.versionNumber === templateDetail.activeVersionNumber,
     );
@@ -308,9 +355,16 @@ export default function CreativeWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, session.accessToken, reviewKey]);
   useEffect(() => {
-    setLatestRun(null);
-    if (!selected || !canReadWorkflows) return;
+    if (runCreativeId.current !== selectedId) {
+      runCreativeId.current = selectedId;
+      setLatestRun(null);
+    }
+    if (!selected || !canReadWorkflows) {
+      setRunLoading(false);
+      return;
+    }
     let cancelled = false;
+    setRunLoading(true);
     void request<LatestRun | null>(
       '/creatives/' + encodeURIComponent(selected.id) + '/workflow',
     )
@@ -318,7 +372,12 @@ export default function CreativeWorkspace({
         if (!cancelled) setLatestRun(run);
       })
       .catch(() => {
-        // Without the workflow state, resubmission is simply not offered.
+        // Without the workflow state, resubmission is not offered and saving
+        // falls back to the API's own check.
+        if (!cancelled) setLatestRun(null);
+      })
+      .finally(() => {
+        if (!cancelled) setRunLoading(false);
       });
     return () => {
       cancelled = true;
@@ -359,6 +418,9 @@ export default function CreativeWorkspace({
       setError('Select a creative from the current branch.');
       return;
     }
+    // The disabled button already blocks this; Enter in a field or any other
+    // submit path must not send a revision the API would refuse.
+    if (selected && (editLocked || awaitingRunState)) return;
     setBusy(true);
     setError('');
     setMessage('');
@@ -398,9 +460,19 @@ export default function CreativeWorkspace({
       if (selected) setReviewKey((key) => key + 1);
       onDataChanged?.('creatives');
     } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : 'Unable to save creative.',
-      );
+      if (selected && cause instanceof RequestError && cause.status === 409) {
+        // For example a run started elsewhere, or the user cannot read
+        // workflows: keep the API's reason and the unsaved edits.
+        setError(
+          cause.message +
+            ' Your edits are still in the form; save them once the workflow finishes or is cancelled.',
+        );
+        // Reload the run so the lock explains which workflow holds it.
+        if (canReadWorkflows) setReviewKey((key) => key + 1);
+      } else
+        setError(
+          cause instanceof Error ? cause.message : 'Unable to save creative.',
+        );
     } finally {
       setBusy(false);
     }
@@ -778,7 +850,34 @@ export default function CreativeWorkspace({
                   onChange={(event) => setSummary(event.target.value)}
                 />
               </label>
-              <button type="submit" disabled={busy || !canSubmit}>
+              {selected && editLocked && latestRun && (
+                <EditLockNotice
+                  id={lockNoticeId}
+                  run={latestRun}
+                  revisionNumber={
+                    history.find(
+                      (item) => item.id === latestRun.creativeRevisionId,
+                    )?.revisionNumber ??
+                    (selected.currentRevisionId === latestRun.creativeRevisionId
+                      ? selected.currentRevision?.revisionNumber
+                      : undefined)
+                  }
+                />
+              )}
+              {selected && !editLocked && awaitingRunState && (
+                <p id={lockNoticeId} className="empty-state" aria-live="polite">
+                  Checking whether a workflow is running before saving…
+                </p>
+              )}
+              <button
+                type="submit"
+                disabled={busy || !canSubmit}
+                aria-describedby={
+                  selected && (editLocked || awaitingRunState)
+                    ? lockNoticeId
+                    : undefined
+                }
+              >
                 {busy
                   ? 'Saving…'
                   : selected
@@ -870,6 +969,41 @@ export default function CreativeWorkspace({
           )}
         </div>
       )}
+    </section>
+  );
+}
+
+// Why a new revision cannot be saved while the creative's run is RUNNING,
+// and where to follow the run.
+function EditLockNotice({
+  id,
+  run,
+  revisionNumber,
+}: {
+  id: string;
+  run: LatestRun;
+  revisionNumber: number | undefined;
+}) {
+  const stage = run.currentStage?.name;
+  const workflow = run.workflow?.name;
+  return (
+    <section
+      id={id}
+      className="change-request-banner edit-lock-notice"
+      aria-label="Editing locked"
+    >
+      <p>
+        {revisionNumber !== undefined
+          ? 'Revision ' + revisionNumber
+          : 'This creative'}{' '}
+        is currently under review
+        {stage ? ' at stage ' + stage : ''}
+        {workflow ? ' in ' + workflow : ''}. Editing is locked until the
+        workflow finishes or is cancelled.
+      </p>
+      <p>
+        <a href="#workflows">Open Workflows</a> to follow or move the run.
+      </p>
     </section>
   );
 }

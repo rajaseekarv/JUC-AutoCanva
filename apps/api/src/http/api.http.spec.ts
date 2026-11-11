@@ -956,6 +956,377 @@ describe('HTTP API with mocked Prisma', () => {
       },
     );
 
+    describe('workflow start (POST /creatives/:creativeId/workflows)', () => {
+      const stage = (id: string, key: string, extra: object = {}) => ({
+        id,
+        key,
+        name: key,
+        displayOrder: id.length,
+        isEntry: false,
+        isTerminal: false,
+        requiresReview: false,
+        requiredPermission: null,
+        assignedUserId: null,
+        assignedPermission: null,
+        ...extra,
+      });
+      const mockStart = (currentRevisionId: string | null) => {
+        grantedPermissions = [PERMISSIONS.WORKFLOW_START];
+        mockSession();
+        useTransactionMock();
+        grantBranch();
+        model('creative').findFirst = vi.fn(async () => ({
+          id: 'creative-1',
+          organizationId: 'org-1',
+          branchId: 'branch-1',
+          name: 'Spring post',
+          currentRevisionId,
+        }));
+        model('workflowInstance').findFirst = vi.fn(async () => null);
+        model('workflowInstance').create = vi.fn();
+        model('changeRequest').count = vi.fn(async () => 0);
+        model('workflow').findFirst = vi.fn(async () => ({
+          id: 'workflow-1',
+          name: 'Spring review',
+          description: null,
+          enabledVersionNumber: 1,
+        }));
+        model('workflowVersion').findUnique = vi.fn(async () => ({
+          id: 'version-1',
+          immutableAt: new Date(),
+          stages: [
+            stage('stage-review', 'review', {
+              isEntry: true,
+              requiresReview: true,
+              assignedPermission: PERMISSIONS.APPROVAL_DECIDE,
+            }),
+            stage('stage-approved', 'approved', { isTerminal: true }),
+            stage('stage-changes', 'changes', { isTerminal: true }),
+          ],
+          transitions: [
+            {
+              key: 'approve',
+              label: 'Approve',
+              sourceStageId: 'stage-review',
+              destinationStageId: 'stage-approved',
+              requiredPermission: null,
+              reviewDecision: 'APPROVED',
+            },
+            {
+              key: 'request',
+              label: 'Request changes',
+              sourceStageId: 'stage-review',
+              destinationStageId: 'stage-changes',
+              requiredPermission: null,
+              reviewDecision: 'CHANGES_REQUESTED',
+            },
+          ],
+        }));
+        model('creativeRevision').findFirst = vi.fn(
+          async ({ where }: { where: { id: string } }) =>
+            ({
+              'revision-1': { id: 'revision-1', revisionNumber: 1 },
+              'revision-2': { id: 'revision-2', revisionNumber: 2 },
+            })[where.id] ?? null,
+        );
+      };
+
+      it('refuses an older revision with 409 and creates no run', async () => {
+        mockStart('revision-2');
+        const response = await request(server())
+          .post('/api/v1/creatives/creative-1/workflows')
+          .set(auth())
+          .send({ workflowId: 'workflow-1', creativeRevisionId: 'revision-1' })
+          .expect(409);
+        expect(response.body.message).toBe(
+          'Only the current revision (2) can be submitted for review; revision 1 is an older revision',
+        );
+        expect(model('workflowInstance').create).not.toHaveBeenCalled();
+      });
+
+      it('refuses a creative without a current revision with 409', async () => {
+        mockStart(null);
+        const response = await request(server())
+          .post('/api/v1/creatives/creative-1/workflows')
+          .set(auth())
+          .send({ workflowId: 'workflow-1' })
+          .expect(409);
+        expect(response.body.message).toBe(
+          'Creative has no current revision to submit; save a revision first',
+        );
+        expect(model('workflowInstance').create).not.toHaveBeenCalled();
+      });
+
+      it('checks branch access before revealing anything about revisions', async () => {
+        mockStart('revision-2');
+        model('userBranchAccess').findFirst = vi.fn(async () => null);
+        await request(server())
+          .post('/api/v1/creatives/creative-1/workflows')
+          .set(auth())
+          .send({ workflowId: 'workflow-1', creativeRevisionId: 'revision-1' })
+          .expect(404);
+        expect(model('creativeRevision').findFirst).not.toHaveBeenCalled();
+        expect(model('workflowInstance').create).not.toHaveBeenCalled();
+      });
+
+      it.each(['OPEN', 'IN_PROGRESS'])(
+        'refuses the current revision with 409 while it has an %s change request',
+        async (status) => {
+          mockStart('revision-2');
+          model('changeRequest').count = vi.fn(
+            async ({ where }: { where: { status: { in: string[] } } }) =>
+              where.status.in.includes(status) ? 1 : 0,
+          );
+          const response = await request(server())
+            .post('/api/v1/creatives/creative-1/workflows')
+            .set(auth())
+            .send({ workflowId: 'workflow-1' })
+            .expect(409);
+          expect(response.body.message).toBe(
+            'Save a new revision with the requested changes before resubmitting.',
+          );
+          expect(model('changeRequest').count).toHaveBeenCalledWith({
+            where: {
+              organizationId: 'org-1',
+              creativeRevisionId: 'revision-2',
+              status: { in: ['OPEN', 'IN_PROGRESS'] },
+            },
+          });
+          expect(model('workflowInstance').create).not.toHaveBeenCalled();
+        },
+      );
+    });
+
+    describe('transition into a review stage (POST /workflow-instances/:id/transitions)', () => {
+      const mockTransition = (unresolved: number) => {
+        grantedPermissions = [PERMISSIONS.WORKFLOW_TRANSITION];
+        mockSession();
+        useTransactionMock();
+        grantBranch();
+        model('workflowInstance').findFirst = vi.fn(async () => ({
+          id: 'instance-1',
+          organizationId: 'org-1',
+          branchId: 'branch-1',
+          creativeId: 'creative-1',
+          creativeRevisionId: 'revision-1',
+          status: 'RUNNING',
+          startedById: 'user-1',
+          currentStageId: 'stage-draft',
+          currentStage: {
+            id: 'stage-draft',
+            key: 'draft',
+            requiresReview: false,
+            requiredPermission: null,
+            assignedUserId: null,
+            assignedPermission: null,
+          },
+          workflowVersionId: 'version-1',
+        }));
+        model('workflowTransition').findFirst = vi.fn(async () => ({
+          key: 'submit',
+          destinationStageId: 'stage-review',
+          requiredPermission: null,
+          destination: {
+            id: 'stage-review',
+            key: 'review',
+            name: 'Review',
+            requiresReview: true,
+            isTerminal: false,
+            requiredPermission: null,
+            assignedUserId: null,
+            assignedPermission: PERMISSIONS.APPROVAL_DECIDE,
+          },
+        }));
+        model('changeRequest').count = vi.fn(async () => unresolved);
+        model('workflowInstance').updateMany = vi.fn();
+        model('auditLog').create = vi.fn();
+      };
+
+      it('returns 409 and moves nothing while the run revision has an unresolved change request', async () => {
+        mockTransition(1);
+        const response = await request(server())
+          .post('/api/v1/workflow-instances/instance-1/transitions')
+          .set(auth())
+          .send({ transitionKey: 'submit' })
+          .expect(409);
+        expect(response.body.message).toBe(
+          'Revision cannot enter review stage Review while it has unresolved change requests. Save a new revision with the requested changes before resubmitting.',
+        );
+        expect(model('workflowInstance').updateMany).not.toHaveBeenCalled();
+        expect(model('auditLog').create).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('workflow cancellation (POST /workflow-instances/:id/cancel)', () => {
+      const runningRun = (overrides: Record<string, unknown> = {}) => ({
+        id: 'instance-1',
+        organizationId: 'org-1',
+        branchId: 'branch-1',
+        creativeId: 'creative-1',
+        creativeRevisionId: 'revision-1',
+        workflowId: 'workflow-1',
+        workflowVersionId: 'version-1',
+        currentStageId: 'stage-review',
+        status: 'RUNNING',
+        startedById: 'user-2',
+        currentStage: { id: 'stage-review', key: 'review', name: 'Review' },
+        workflow: { id: 'workflow-1', name: 'Spring review' },
+        creative: { id: 'creative-1', name: 'Spring post' },
+        ...overrides,
+      });
+      // Every write the cancellation makes is mocked; anything else fails
+      // the request with a 500.
+      const mockCancel = (
+        permissions: string[],
+        options: {
+          run?: Record<string, unknown> | null;
+          updated?: number;
+          decisions?: number;
+        } = {},
+      ) => {
+        grantedPermissions = permissions;
+        mockSession();
+        useTransactionMock();
+        grantBranch();
+        model('workflowInstance').findFirst = vi.fn(async () =>
+          options.run === undefined ? runningRun() : options.run,
+        );
+        model('approvalDecision').count = vi.fn(
+          async () => options.decisions ?? 0,
+        );
+        model('workflowInstance').updateMany = vi.fn(async () => ({
+          count: options.updated ?? 1,
+        }));
+        model('workflowTask').findMany = vi.fn(async () => [
+          { assignedUserId: 'reviewer-1' },
+        ]);
+        model('workflowTask').updateMany = vi.fn(async () => ({ count: 1 }));
+        model('workflowTransitionHistory').create = vi.fn(async () => ({}));
+        model('creative').update = vi.fn(async () => ({}));
+        model('auditLog').create = vi.fn(async () => ({}));
+        model('inAppNotification').upsert = vi.fn(async () => ({}));
+        model('workflowInstance').findUniqueOrThrow = vi.fn(async () =>
+          runningRun({ status: 'CANCELLED' }),
+        );
+      };
+      const cancel = (body: unknown) =>
+        request(server())
+          .post('/api/v1/workflow-instances/instance-1/cancel')
+          .set(auth())
+          .send(body as object);
+
+      it('cancels a running run for a workflow manager and returns it', async () => {
+        mockCancel([PERMISSIONS.WORKFLOW_MANAGE]);
+        const response = await cancel({ reason: ' Stuck at review ' }).expect(
+          201,
+        );
+        expect(response.body.status).toBe('CANCELLED');
+        expect(model('workflowTransitionHistory').create).toHaveBeenCalledWith({
+          data: expect.objectContaining({
+            actionKey: 'CANCEL',
+            reason: 'Stuck at review',
+          }),
+        });
+        expect(model('creative').update).toHaveBeenCalledWith({
+          where: { id: 'creative-1' },
+          data: { status: 'DRAFT' },
+        });
+        // Starter and assignee are notified; the manager is not.
+        expect(model('inAppNotification').upsert).toHaveBeenCalledTimes(2);
+      });
+
+      it.each([
+        ['a missing reason', {}],
+        ['a blank reason', { reason: '   ' }],
+        ['a reason over 1000 characters', { reason: 'x'.repeat(1001) }],
+        ['a non-string reason', { reason: 42 }],
+        ['an unknown field', { reason: 'Stuck', force: true }],
+      ])('returns 400 for %s and writes nothing', async (_label, body) => {
+        mockCancel([PERMISSIONS.WORKFLOW_MANAGE]);
+        const response = await cancel(body).expect(400);
+        expect(response.body.message).toBe(
+          'A cancellation reason of 1 to 1000 characters is required',
+        );
+        expect(model('workflowInstance').updateMany).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 without workflows:manage or workflows:start, even for an invalid body', async () => {
+        mockCancel([
+          PERMISSIONS.WORKFLOW_READ,
+          PERMISSIONS.WORKFLOW_TRANSITION,
+        ]);
+        await cancel({}).expect(403);
+        expect(model('workflowInstance').findFirst).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 to a user who can start workflows but did not start this run', async () => {
+        mockCancel([PERMISSIONS.WORKFLOW_START]);
+        const response = await cancel({ reason: 'Stuck' }).expect(403);
+        expect(response.body.message).toBe(
+          'Only a workflow manager or the person who started this run can cancel it',
+        );
+        expect(model('workflowInstance').updateMany).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 to the starter once a decision is recorded', async () => {
+        mockCancel([PERMISSIONS.WORKFLOW_START], {
+          run: runningRun({ startedById: 'user-1' }),
+          decisions: 1,
+        });
+        await cancel({ reason: 'Stuck' }).expect(403);
+        expect(model('workflowInstance').updateMany).not.toHaveBeenCalled();
+      });
+
+      it('lets the starter cancel before any decision', async () => {
+        mockCancel([PERMISSIONS.WORKFLOW_START], {
+          run: runningRun({ startedById: 'user-1' }),
+        });
+        await cancel({ reason: 'Submitted by mistake' }).expect(201);
+        // Only the open task's assignee is notified, not the starter.
+        expect(model('inAppNotification').upsert).toHaveBeenCalledTimes(1);
+      });
+
+      it('returns 404 for a run outside the caller branches', async () => {
+        mockCancel([PERMISSIONS.WORKFLOW_MANAGE]);
+        model('userBranchAccess').findFirst = vi.fn(async () => null);
+        await cancel({ reason: 'Stuck' }).expect(404);
+        expect(model('workflowInstance').updateMany).not.toHaveBeenCalled();
+      });
+
+      it('returns 404 for a run of another organization', async () => {
+        mockCancel([PERMISSIONS.WORKFLOW_MANAGE], { run: null });
+        const response = await cancel({ reason: 'Stuck' }).expect(404);
+        expect(response.body.message).toBe('Workflow instance not found');
+        expect(model('workflowInstance').findFirst).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: 'instance-1', organizationId: 'org-1' },
+          }),
+        );
+      });
+
+      it.each(['COMPLETED', 'CANCELLED'])(
+        'returns 409 for a %s run',
+        async (status) => {
+          mockCancel([PERMISSIONS.WORKFLOW_MANAGE], {
+            run: runningRun({ status }),
+          });
+          const response = await cancel({ reason: 'Again' }).expect(409);
+          expect(response.body.message).toBe('Workflow is not running');
+          expect(model('workflowInstance').updateMany).not.toHaveBeenCalled();
+        },
+      );
+
+      it('returns 409 when a concurrent decision or transition changed the run first', async () => {
+        mockCancel([PERMISSIONS.WORKFLOW_MANAGE], { updated: 0 });
+        const response = await cancel({ reason: 'Stuck' }).expect(409);
+        expect(response.body.message).toBe(
+          'Workflow changed concurrently; reload and retry',
+        );
+        expect(model('workflowTask').updateMany).not.toHaveBeenCalled();
+        expect(model('auditLog').create).not.toHaveBeenCalled();
+      });
+    });
+
     it('still requires the decide permission before looking at the task', async () => {
       grantedPermissions = [PERMISSIONS.APPROVAL_READ];
       mockSession();
@@ -1087,6 +1458,155 @@ describe('HTTP API with mocked Prisma', () => {
         .get('/api/v1/creatives/creative-1/change-requests')
         .set(auth())
         .expect(200);
+    });
+
+    // Stage 10.5: review feedback stays inside the caller's branches. The
+    // creative lookup applies the same branch filter the service builds, so
+    // a creative in branch-2 (no grant for user-1) is simply not found.
+    describe('cross-branch review feedback', () => {
+      const creatives = [
+        { id: 'creative-1', branchId: 'branch-1', name: 'Spring post' },
+        { id: 'creative-2', branchId: 'branch-2', name: 'South post' },
+      ];
+      const grants: Record<string, string[]> = { 'branch-1': ['user-1'] };
+      type CreativeWhere = {
+        id: string;
+        organizationId: string;
+        branch: { status: string; users?: { some: { userId: string } } };
+      };
+      const mockFeedback = (permissions: string[]) => {
+        grantedPermissions = permissions;
+        mockSession();
+        useTransactionMock();
+        model('creative').findFirst = vi.fn(
+          async ({ where }: { where: CreativeWhere }) => {
+            const found = creatives.find((item) => item.id === where.id);
+            const userId = where.branch.users?.some.userId;
+            if (
+              !found ||
+              where.organizationId !== 'org-1' ||
+              where.branch.status !== 'ACTIVE' ||
+              (userId !== undefined &&
+                !(grants[found.branchId] ?? []).includes(userId))
+            )
+              return null;
+            return found;
+          },
+        );
+        // Spies for every write a comment could make; refused requests must
+        // reach none of them.
+        model('creativeComment').create = vi.fn();
+        model('auditLog').create = vi.fn();
+        model('inAppNotification').upsert = vi.fn();
+        model('approvalDecision').findMany = vi.fn(async () => []);
+        model('changeRequest').findMany = vi.fn(async () => []);
+      };
+      const expectNoWrites = () => {
+        expect(model('creativeComment').create).not.toHaveBeenCalled();
+        expect(model('auditLog').create).not.toHaveBeenCalled();
+        expect(model('inAppNotification').upsert).not.toHaveBeenCalled();
+      };
+
+      it('returns 404 for a comment on a creative in another branch and stores nothing', async () => {
+        mockFeedback([PERMISSIONS.COMMENT_CREATE]);
+        model('creativeRevision').findUnique = vi.fn();
+        const response = await request(server())
+          .post('/api/v1/creatives/creative-2/revisions/1/comments')
+          .set(auth())
+          .send({ text: 'Looks good' })
+          .expect(404);
+        expect(response.body.message).toBe('Creative not found');
+        // Nothing about the creative's revisions is revealed or touched.
+        expect(model('creativeRevision').findUnique).not.toHaveBeenCalled();
+        expectNoWrites();
+      });
+
+      it('returns 404 for the decisions of a creative in another branch', async () => {
+        mockFeedback([PERMISSIONS.APPROVAL_READ]);
+        const response = await request(server())
+          .get('/api/v1/creatives/creative-2/decisions')
+          .set(auth())
+          .expect(404);
+        expect(response.body.message).toBe('Creative not found');
+        expect(model('approvalDecision').findMany).not.toHaveBeenCalled();
+        expectNoWrites();
+      });
+
+      it('returns 404 for the change requests of a creative in another branch', async () => {
+        mockFeedback([PERMISSIONS.CHANGE_REQUEST_READ]);
+        const response = await request(server())
+          .get('/api/v1/creatives/creative-2/change-requests')
+          .set(auth())
+          .expect(404);
+        expect(response.body.message).toBe('Creative not found');
+        expect(model('changeRequest').findMany).not.toHaveBeenCalled();
+        expectNoWrites();
+      });
+
+      it('still serves the same routes for the creative in the caller branch', async () => {
+        mockFeedback([
+          PERMISSIONS.APPROVAL_READ,
+          PERMISSIONS.CHANGE_REQUEST_READ,
+        ]);
+        await request(server())
+          .get('/api/v1/creatives/creative-1/decisions')
+          .set(auth())
+          .expect(200);
+        await request(server())
+          .get('/api/v1/creatives/creative-1/change-requests')
+          .set(auth())
+          .expect(200);
+      });
+
+      it('returns 404 for a reply whose parent belongs to another creative and stores nothing', async () => {
+        mockFeedback([PERMISSIONS.COMMENT_CREATE]);
+        model('creativeRevision').findUnique = vi.fn(async () => ({
+          id: 'revision-1',
+        }));
+        const stored = [
+          {
+            id: 'comment-on-creative-2',
+            creativeId: 'creative-2',
+            creativeRevisionId: 'revision-9',
+            organizationId: 'org-1',
+            parentId: null,
+          },
+        ];
+        model('creativeComment').findFirst = vi.fn(
+          async ({
+            where,
+          }: {
+            where: {
+              id: string;
+              creativeId: string;
+              creativeRevisionId: string;
+              organizationId: string;
+            };
+          }) =>
+            stored.find(
+              (comment) =>
+                comment.id === where.id &&
+                comment.creativeId === where.creativeId &&
+                comment.creativeRevisionId === where.creativeRevisionId &&
+                comment.organizationId === where.organizationId,
+            ) ?? null,
+        );
+        const response = await request(server())
+          .post('/api/v1/creatives/creative-1/revisions/1/comments')
+          .set(auth())
+          .send({ text: 'Agreed', parentId: 'comment-on-creative-2' })
+          .expect(404);
+        expect(response.body.message).toBe('Comment thread not found');
+        expect(model('creativeComment').findFirst).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              id: 'comment-on-creative-2',
+              creativeId: 'creative-1',
+            }),
+          }),
+        );
+        expectNoWrites();
+      });
     });
   });
 

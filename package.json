@@ -10,7 +10,7 @@
     "dev": "pnpm --parallel --filter @adflow/web --filter @adflow/api dev",
     "build": "pnpm -r build",
     "lint": "eslint . --max-warnings=0",
-    "format:check": "prettier --check README.md \"apps/**/*.{md,json,ts,tsx,js,css,html}\" \"packages/shared-types/**/*.{json,ts}\" package.json pnpm-workspace.yaml eslint.config.js .prettierrc.json",
+    "format:check": "prettier --check README.md \"apps/**/*.{md,json,ts,tsx,js,mjs,css,html}\" \"packages/shared-types/**/*.{json,ts}\" package.json pnpm-workspace.yaml eslint.config.js .prettierrc.json",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
     "typecheck:api-tests": "pnpm --filter @adflow/api typecheck:test",

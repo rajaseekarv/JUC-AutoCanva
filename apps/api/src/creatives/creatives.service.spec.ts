@@ -132,6 +132,7 @@ describe('CreativesService revision-specific approval', () => {
     creativeId: 'creative-1',
     creativeRevisionId: 'revision-1',
     revisionNumber: 1,
+    workflowInstanceId: 'run-1',
     decision: 'APPROVED',
     createdAt: new Date('2026-11-10T10:00:00Z'),
     reviewer: { id: 'reviewer-1', name: 'Rita Reviewer' },
@@ -173,6 +174,7 @@ describe('CreativesService revision-specific approval', () => {
     tx.approvalDecision.findMany.mockResolvedValueOnce([approvalOfRevision1]);
     tx.workflowInstance.findMany.mockResolvedValueOnce([
       {
+        id: 'run-1',
         creativeId: 'creative-1',
         creativeRevisionId: 'revision-1',
         status: 'COMPLETED',
@@ -204,6 +206,7 @@ describe('CreativesService revision-specific approval', () => {
     ]);
     prisma.workflowInstance.findMany.mockResolvedValueOnce([
       {
+        id: 'run-1',
         creativeId: 'creative-1',
         creativeRevisionId: 'revision-1',
         status: 'COMPLETED',
@@ -223,6 +226,7 @@ describe('CreativesService revision-specific approval', () => {
     ]);
     prisma.workflowInstance.findMany.mockResolvedValueOnce([
       {
+        id: 'run-1',
         creativeId: 'creative-1',
         creativeRevisionId: 'revision-1',
         status: 'COMPLETED',
@@ -233,6 +237,46 @@ describe('CreativesService revision-specific approval', () => {
       currentRevisionApproved: true,
       approvedRevision: { revisionNumber: 1 },
     });
+  });
+
+  it('does not report approval from an earlier review stage while the run is still running', async () => {
+    const { service, prisma } = setup();
+    prisma.creative.findFirst.mockResolvedValueOnce({
+      ...creative,
+      status: 'legal-review',
+    });
+    prisma.approvalDecision.findMany.mockResolvedValueOnce([
+      approvalOfRevision1,
+    ]);
+    prisma.workflowInstance.findMany.mockResolvedValueOnce([
+      {
+        id: 'run-1',
+        creativeId: 'creative-1',
+        creativeRevisionId: 'revision-1',
+        status: 'RUNNING',
+      },
+    ]);
+    await expect(service.get(principal, 'creative-1')).resolves.toMatchObject({
+      status: 'legal-review',
+      currentRevisionApproved: false,
+      approvedRevision: null,
+    });
+  });
+
+  it('loads every run, not only the latest, so an older completed approval is still found', async () => {
+    const { service, prisma } = setup();
+    await service.get(principal, 'creative-1');
+    const query = prisma.workflowInstance.findMany.mock.calls[0]![0] as {
+      distinct?: unknown;
+      select: Record<string, boolean>;
+    };
+    expect(query.distinct).toBeUndefined();
+    expect(query.select).toMatchObject({ id: true, status: true });
+    expect(prisma.approvalDecision.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ workflowInstanceId: true }),
+      }),
+    );
   });
 
   it('adds review state to a whole list with two organization-scoped queries', async () => {

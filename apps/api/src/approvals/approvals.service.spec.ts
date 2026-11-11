@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
-import { ReviewDecisionType } from '@prisma/client';
+import { Prisma, ReviewDecisionType } from '@prisma/client';
 import type { AuthenticatedPrincipal } from '../auth/auth.types';
 import { PERMISSIONS } from '../auth/permissions';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -206,6 +206,26 @@ describe('ApprovalsService', () => {
     expect(workflows.transitionInTransaction).toHaveBeenCalledTimes(1);
   });
 
+  // Regression (Stage 10 PostgreSQL run): PostgreSQL may abort the decision
+  // instead (deadlock with a concurrent cancellation); Prisma can report that
+  // as an unknown request error, which must be a retryable 409, not a 500.
+  it('maps a deadlock reported as an unknown request error to 409', async () => {
+    const { service, prisma } = setup();
+    prisma.$transaction.mockImplementationOnce(async () => {
+      throw new Prisma.PrismaClientUnknownRequestError(
+        'ConnectorError(ConnectorError { user_facing_error: None, kind: QueryError(PostgresError { code: "40P01", message: "deadlock detected", severity: "ERROR" }) })',
+        { clientVersion: 'test' },
+      );
+    });
+    const attempt = service.decide(user, 'task-1', {
+      decision: ReviewDecisionType.APPROVED,
+    });
+    await expect(attempt).rejects.toBeInstanceOf(ConflictException);
+    await expect(attempt).rejects.toThrow(
+      'Review changed concurrently; reload and retry',
+    );
+  });
+
   it('requires a reason for changes and creates a revision-linked change request', async () => {
     const missingReason = setup();
     await expect(
@@ -359,18 +379,23 @@ describe('ApprovalsService self-approval', () => {
     expect(tx.approvalDecision.create).not.toHaveBeenCalled();
   });
 
-  it('notifies the submitter of an approval', async () => {
-    const { service, notifications, tx } = setup();
+  // Stage 10.6: an approval may only move a longer workflow to its next
+  // review, so the decision itself announces nothing. The transition that
+  // completes an all-approved run sends "Creative approved" (covered in
+  // workflows.service.spec.ts).
+  it('leaves the approval notice to the transition, which runs in the same transaction', async () => {
+    const { service, notifications, tx, workflows } = setup();
     await service.decide(user, 'task-1', {
       decision: ReviewDecisionType.APPROVED,
     });
-    expect(notifications.create).toHaveBeenCalledWith(
+    expect(notifications.create).not.toHaveBeenCalled();
+    expect(workflows.transitionInTransaction).toHaveBeenCalledWith(
       tx,
-      expect.objectContaining({
-        recipientUserId: 'submitter-1',
-        type: 'CREATIVE_APPROVED',
-        title: 'Creative approved',
-      }),
+      user,
+      'instance-1',
+      'approve',
+      undefined,
+      PERMISSIONS.APPROVAL_DECIDE,
     );
   });
 

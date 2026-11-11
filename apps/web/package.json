@@ -9,7 +9,8 @@
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src --max-warnings=0",
     "test": "vitest run",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "e2e:approval-images": "node e2e/approval-images.e2e.mjs"
   },
   "dependencies": {
     "@adflow/shared-types": "workspace:*",
