@@ -17,6 +17,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+// A successful API reply. Like the API, null is sent as an empty body, which
+// a real Response's json() rejects.
+const okReply = (body: unknown) => {
+  const text = body === null ? '' : JSON.stringify(body);
+  return {
+    ok: true,
+    status: 200,
+    json: async () => JSON.parse(text) as unknown,
+    text: async () => text,
+  };
+};
+
 const user: AuthenticatedUserResponse = {
   id: 'user-1',
   organizationId: 'org-1',
@@ -130,6 +142,46 @@ const completed = {
 };
 
 describe('WorkflowWorkspace', () => {
+  // Regression (Stage 11 E2E): the API answers 200 with an empty body for a
+  // creative that never had a run, and the screen showed the JSON parse
+  // error "Unexpected end of JSON input" instead of offering a first run.
+  it('offers a first run for a creative that has never had one, without an error', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockImplementation(async (url: string) =>
+          okReply(
+            url.endsWith('/workflows')
+              ? [workflow]
+              : url.includes('/creatives?branchId=')
+                ? [creative]
+                : url.endsWith('/creatives/creative-1/workflow')
+                  ? null
+                  : [],
+          ),
+        ),
+    );
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: creative.id } },
+    );
+    expect(
+      await screen.findByRole('combobox', { name: 'Workflow to start' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Start workflow' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('shows the authorized next transition and append-only history after it succeeds', async () => {
     const fetchMock = vi
       .fn()
@@ -140,7 +192,7 @@ describe('WorkflowWorkspace', () => {
         else if (url.endsWith('/creatives/creative-1/workflow')) body = running;
         else if (url.endsWith('/workflow-instances/instance-1/transitions'))
           body = completed;
-        return { ok: true, status: 200, json: async () => body, init };
+        return { ...okReply(body), init };
       });
     vi.stubGlobal('fetch', fetchMock);
     render(
@@ -173,16 +225,17 @@ describe('WorkflowWorkspace', () => {
   });
 
   it('loads a workflow version into the definition editor and validates it through the API', async () => {
-    const fetchMock = vi.fn().mockImplementation(async (url: string) => ({
-      ok: true,
-      status: 200,
-      json: async () =>
-        url.endsWith('/validate')
-          ? { valid: true, errors: [] }
-          : url.endsWith('/workflows')
-            ? [workflow]
-            : { ...workflow, versions: workflow.versions },
-    }));
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async (url: string) =>
+        okReply(
+          url.endsWith('/validate')
+            ? { valid: true, errors: [] }
+            : url.endsWith('/workflows')
+              ? [workflow]
+              : { ...workflow, versions: workflow.versions },
+        ),
+      );
     vi.stubGlobal('fetch', fetchMock);
     render(
       <WorkflowWorkspace
@@ -221,5 +274,140 @@ describe('WorkflowWorkspace', () => {
         expect.objectContaining({ method: 'POST' }),
       ),
     );
+  });
+});
+
+// Regression (Stage 8 E2E): after a run completed (for example with changes
+// requested), the UI never offered "Start workflow" again although the API
+// allows one running instance at a time, so a revised creative could not be
+// resubmitted from the browser.
+// Regression (Stage 11 E2E): the creative picker labelled a creative whose
+// newer revision was never reviewed as "Approved".
+describe('WorkflowWorkspace revision-specific approval', () => {
+  it('labels a creative with the current revision status and the approved revision', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async (url: string) =>
+        okReply(
+          url.endsWith('/workflows')
+            ? [workflow]
+            : url.includes('/creatives?branchId=')
+              ? [
+                  {
+                    ...creative,
+                    status: 'DRAFT',
+                    currentRevision: { revisionNumber: 2 },
+                    approvedRevision: {
+                      revisionId: 'revision-1',
+                      revisionNumber: 1,
+                      approvedAt: '2026-11-05T10:00:00.000Z',
+                      reviewer: { id: 'reviewer-1', name: 'Rita Reviewer' },
+                    },
+                    currentRevisionApproved: false,
+                  },
+                ]
+              : null,
+        ),
+      ),
+    );
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    const picker = await screen.findByRole('combobox', {
+      name: 'Branch creative',
+    });
+    await waitFor(() =>
+      expect(picker).toHaveTextContent(
+        creative.name +
+          ' · Draft · Revision 1 approved · current revision 2 not yet approved',
+      ),
+    );
+    expect(picker).not.toHaveTextContent('Approved ·');
+  });
+});
+
+describe('WorkflowWorkspace starting another run', () => {
+  function serve(latest: unknown) {
+    let current = latest;
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async (url: string, init?: RequestInit) => {
+        let body: unknown = [];
+        // Most specific first: the start URL also ends with "/workflows".
+        if (
+          url.endsWith('/creatives/creative-1/workflows') &&
+          init?.method === 'POST'
+        ) {
+          current = { ...running, id: 'instance-2' };
+          body = current;
+        } else if (url.endsWith('/workflows')) body = [workflow];
+        else if (url.endsWith('/workflows/workflow-1')) body = workflow;
+        else if (url.includes('/creatives?branchId=')) body = [creative];
+        else if (url.endsWith('/creatives/creative-1/workflow')) body = current;
+        return okReply(body);
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    return fetchMock;
+  }
+  const chooseCreative = async () =>
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: creative.id } },
+    );
+
+  it('offers a new run after the latest one completed, and starts it', async () => {
+    const fetchMock = serve(completed);
+    await chooseCreative();
+    expect(
+      await screen.findByRole('heading', { name: 'Ready · Completed' }),
+    ).toBeInTheDocument();
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Workflow to start' }),
+      { target: { value: workflow.id } },
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Start workflow' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Draft · In progress' }),
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/creatives/creative-1/workflows'),
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ workflowId: workflow.id }),
+      }),
+    );
+  });
+
+  it('does not offer a second run while one is running', async () => {
+    serve(running);
+    await chooseCreative();
+    expect(
+      await screen.findByRole('heading', { name: 'Draft · In progress' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Start workflow' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('combobox', { name: 'Workflow to start' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('still offers the first run when the creative has none', async () => {
+    serve(null);
+    await chooseCreative();
+    expect(
+      await screen.findByRole('button', { name: 'Start workflow' }),
+    ).toBeInTheDocument();
   });
 });

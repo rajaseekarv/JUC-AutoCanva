@@ -1,6 +1,14 @@
 import { useEffect, useState } from 'react';
 import type { AuthenticatedUserResponse } from '@adflow/shared-types';
+import type { AssetSource } from './assetFiles';
+import { AssetReference } from './AssetImage';
+import ReviewFeedback from './ReviewFeedback';
 import { statusLabel } from './statusDisplay';
+import {
+  useOtherScreenChanges,
+  type DataChange,
+  type DataChangeSource,
+} from './dataChanges';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -29,12 +37,7 @@ type Review = {
     templateVersion: { fields: { key: string; label: string; type: string }[] };
   };
   current: boolean;
-};
-type Comment = {
-  id: string;
-  text: string;
-  createdAt: string;
-  author: { name: string };
+  submittedByViewer?: boolean;
 };
 type ChangeRequest = {
   id: string;
@@ -54,23 +57,31 @@ type Decision = {
 
 export default function ApprovalsWorkspace({
   session,
+  dataChange,
+  onDataChanged,
   onUnauthorized,
 }: {
   session: Session;
+  dataChange?: DataChange;
+  onDataChanged?: (source: DataChangeSource) => void;
   onUnauthorized: () => void;
 }) {
   const permissions = session.user.permissions;
   const canRead = permissions.includes('approvals:read');
   const canDecide = permissions.includes('approvals:decide');
   const canReadComments = permissions.includes('comments:read');
-  const canComment = permissions.includes('comments:create');
+  const assetSource: AssetSource = {
+    apiBase,
+    accessToken: session.accessToken,
+    onUnauthorized,
+  };
   const [tasks, setTasks] = useState<Task[]>([]);
   const [taskId, setTaskId] = useState('');
   const [review, setReview] = useState<Review | null>(null);
-  const [comments, setComments] = useState<Comment[]>([]);
+  // Bumped after each detail load so the feedback panel reloads too.
+  const [feedbackKey, setFeedbackKey] = useState(0);
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [requests, setRequests] = useState<ChangeRequest[]>([]);
-  const [commentText, setCommentText] = useState('');
   const [reason, setReason] = useState('');
   const [explanation, setExplanation] = useState('');
   const [error, setError] = useState('');
@@ -105,20 +116,37 @@ export default function ApprovalsWorkspace({
     return response.json() as Promise<T>;
   }
 
-  async function loadTasks(): Promise<void> {
-    if (!canRead) return;
+  async function loadTasks(): Promise<Task[] | null> {
+    if (!canRead) return null;
     setLoadingTasks(true);
     try {
-      setTasks(await request<Task[]>('/approvals/tasks'));
+      const loaded = await request<Task[]>('/approvals/tasks');
+      setTasks(loaded);
       setError('');
+      return loaded;
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : 'Unable to load reviews.',
       );
+      return null;
     } finally {
       setLoadingTasks(false);
     }
   }
+
+  // Another screen changed review data (for example a run reached review or
+  // a creative was resubmitted): refresh the assignments, and the open review
+  // while it is still pending. The selection is kept.
+  async function refreshFromOtherScreen(): Promise<void> {
+    const loaded = await loadTasks();
+    if (taskId && loaded?.some((task) => task.id === taskId))
+      await loadDetail(taskId);
+  }
+  useOtherScreenChanges(
+    dataChange,
+    'approvals',
+    () => void refreshFromOtherScreen(),
+  );
 
   async function loadDetail(id: string): Promise<void> {
     if (!id) return;
@@ -130,12 +158,6 @@ export default function ApprovalsWorkspace({
       setReview(detail);
       const creativeId = encodeURIComponent(detail.creative.id);
       const jobs: Promise<void>[] = [];
-      if (canReadComments)
-        jobs.push(
-          request<Comment[]>(
-            `/creatives/${creativeId}/revisions/${detail.revision.revisionNumber}/comments`,
-          ).then(setComments),
-        );
       if (permissions.includes('approvals:read'))
         jobs.push(
           request<Decision[]>(`/creatives/${creativeId}/decisions`).then(
@@ -149,6 +171,7 @@ export default function ApprovalsWorkspace({
           ).then(setRequests),
         );
       await Promise.all(jobs);
+      setFeedbackKey((key) => key + 1);
       setError('');
     } catch (cause) {
       setError(
@@ -195,31 +218,12 @@ export default function ApprovalsWorkspace({
       );
       setReason('');
       setExplanation('');
+      onDataChanged?.('approvals');
       await loadTasks();
       await loadDetail(review.task.id);
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : 'Unable to record decision.',
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function addComment(): Promise<void> {
-    if (!review || !commentText.trim()) return;
-    setBusy(true);
-    setError('');
-    try {
-      await request(
-        `/creatives/${encodeURIComponent(review.creative.id)}/revisions/${review.revision.revisionNumber}/comments`,
-        { method: 'POST', body: JSON.stringify({ text: commentText.trim() }) },
-      );
-      setCommentText('');
-      await loadDetail(review.task.id);
-    } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : 'Unable to add comment.',
       );
     } finally {
       setBusy(false);
@@ -233,6 +237,7 @@ export default function ApprovalsWorkspace({
       await request(`/change-requests/${encodeURIComponent(id)}/resolve`, {
         method: 'POST',
       });
+      onDataChanged?.('approvals');
       await loadDetail(review!.task.id);
       setMessage('Change request resolved.');
     } catch (cause) {
@@ -257,6 +262,7 @@ export default function ApprovalsWorkspace({
       await request(`/change-requests/${encodeURIComponent(id)}/${action}`, {
         method: 'POST',
       });
+      onDataChanged?.('approvals');
       await loadDetail(review.task.id);
       setMessage(
         action === 'start'
@@ -349,79 +355,77 @@ export default function ApprovalsWorkspace({
               {fields.map((field) => (
                 <div key={field.key}>
                   <dt>{field.label}</dt>
-                  <dd>{formatValue(review.revision.values[field.key])}</dd>
+                  <dd>
+                    {field.type === 'IMAGE' || field.type === 'LOGO' ? (
+                      <AssetReference
+                        assetId={review.revision.values[field.key]}
+                        label={field.label}
+                        source={assetSource}
+                        canReadAssets={permissions.includes('assets:read')}
+                      />
+                    ) : (
+                      formatValue(review.revision.values[field.key])
+                    )}
+                  </dd>
                 </div>
               ))}
             </dl>
-            {canDecide && review.current && review.task.status === 'OPEN' && (
-              <div className="template-preview">
-                <label htmlFor="review-reason">
-                  Decision reason or requested changes
-                </label>
-                <textarea
-                  id="review-reason"
-                  value={reason}
-                  onChange={(event) => setReason(event.target.value)}
-                  maxLength={5000}
-                />
-                <label htmlFor="review-explanation">Optional explanation</label>
-                <textarea
-                  id="review-explanation"
-                  value={explanation}
-                  onChange={(event) => setExplanation(event.target.value)}
-                  maxLength={5000}
-                />
-                <div className="template-actions">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void decide('APPROVED')}
-                  >
-                    Approve
-                  </button>
-                  <button
-                    type="button"
-                    className="warning-button"
-                    disabled={busy || !reason.trim()}
-                    onClick={() => void decide('CHANGES_REQUESTED')}
-                  >
-                    Request changes
-                  </button>
-                </div>
-              </div>
+            {review.submittedByViewer && (
+              <p className="form-message">
+                You submitted this creative, so another reviewer must decide.
+              </p>
             )}
-            {canReadComments && (
-              <div className="creative-inspection">
-                <h4>Comments on revision {review.revision.revisionNumber}</h4>
-                {comments.length ? (
-                  comments.map((comment) => (
-                    <p key={comment.id}>
-                      <strong>{comment.author.name}</strong>: {comment.text}
-                    </p>
-                  ))
-                ) : (
-                  <p className="empty-state">No comments on this revision.</p>
-                )}
-                {canComment && (
-                  <div className="template-preview">
-                    <label htmlFor="review-comment">Add a comment</label>
-                    <textarea
-                      id="review-comment"
-                      value={commentText}
-                      onChange={(event) => setCommentText(event.target.value)}
-                      maxLength={5000}
-                    />
+            {canDecide &&
+              review.current &&
+              !review.submittedByViewer &&
+              review.task.status === 'OPEN' && (
+                <div className="template-preview">
+                  <label htmlFor="review-reason">
+                    Decision reason or requested changes
+                  </label>
+                  <textarea
+                    id="review-reason"
+                    value={reason}
+                    onChange={(event) => setReason(event.target.value)}
+                    maxLength={5000}
+                  />
+                  <label htmlFor="review-explanation">
+                    Optional explanation
+                  </label>
+                  <textarea
+                    id="review-explanation"
+                    value={explanation}
+                    onChange={(event) => setExplanation(event.target.value)}
+                    maxLength={5000}
+                  />
+                  <div className="template-actions">
                     <button
                       type="button"
-                      disabled={busy || !commentText.trim()}
-                      onClick={() => void addComment()}
+                      disabled={busy}
+                      onClick={() => void decide('APPROVED')}
                     >
-                      Add comment
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      className="warning-button"
+                      disabled={busy || !reason.trim()}
+                      onClick={() => void decide('CHANGES_REQUESTED')}
+                    >
+                      Request changes
                     </button>
                   </div>
-                )}
-              </div>
-            )}
+                </div>
+              )}
+            <ReviewFeedback
+              session={session}
+              creativeId={review.creative.id}
+              latestRevisionNumber={review.revision.revisionNumber}
+              onUnauthorized={onUnauthorized}
+              showHistory={false}
+              refreshKey={feedbackKey}
+              title="Comments"
+            />
             {decisions.length > 0 && (
               <div className="creative-inspection">
                 <h4>Review history</h4>

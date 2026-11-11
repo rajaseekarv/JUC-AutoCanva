@@ -15,6 +15,7 @@ import { AuditWorkspace, NotificationsWorkspace } from './ActivityWorkspaces';
 import CanvaIntegration from './CanvaIntegration';
 import StatusBadge from './StatusBadge';
 import WorkspaceShell, { type WorkspaceModule } from './WorkspaceShell';
+import { useDataChanges } from './dataChanges';
 import type {
   AuthenticatedUserResponse,
   BranchResponse,
@@ -45,6 +46,9 @@ export default function App() {
   const [sessionExpired, setSessionExpired] = useState(false);
   const [selectedBranchId, setSelectedBranchId] = useState('');
   const [templateRefreshKey, setTemplateRefreshKey] = useState(0);
+  // Creatives, Workflows and Approvals report review-data changes here so
+  // the other two refresh their lists.
+  const [dataChange, onDataChanged] = useDataChanges();
   const [branch, setBranch] = useState<BranchResponse | null>(null);
   const [branchError, setBranchError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -335,6 +339,8 @@ export default function App() {
             session={session}
             branch={branch}
             templateRefreshKey={templateRefreshKey}
+            dataChange={dataChange}
+            onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
           />
         ),
@@ -365,6 +371,8 @@ export default function App() {
           <WorkflowWorkspace
             session={session}
             branch={branch}
+            dataChange={dataChange}
+            onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
           />
         ),
@@ -379,6 +387,8 @@ export default function App() {
         content: (
           <ApprovalsWorkspace
             session={session}
+            dataChange={dataChange}
+            onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
           />
         ),
