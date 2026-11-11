@@ -107,5 +107,41 @@ export function validateWorkflowDefinition(
         `Transition ${transition.key} has a review decision on a non-review stage.`,
       );
   }
+  // A creative cannot be revised while its run is running, and a later
+  // review would only see the same revision again. After changes are
+  // requested the run must therefore be able to finish without passing
+  // through another review stage, or the creative stays locked.
+  for (const transition of input.transitions) {
+    if (
+      transition.reviewDecision === 'CHANGES_REQUESTED' &&
+      keys.has(transition.to) &&
+      !finishesWithoutReview(input, transition.to)
+    )
+      errors.push(
+        `Changes-requested transition ${transition.key} leads to stage ${transition.to}, which cannot reach a terminal stage without another review. ` +
+          'Creatives cannot be revised while a run is active, so this would leave the creative locked; route it to a terminal stage or to stages that lead to one.',
+      );
+  }
   return errors;
+}
+
+// Whether a terminal stage is reachable from `start` without entering a
+// review stage.
+function finishesWithoutReview(
+  input: WorkflowDefinitionInput,
+  start: string,
+): boolean {
+  const visited = new Set<string>();
+  const pending = [start];
+  while (pending.length) {
+    const key = pending.pop()!;
+    if (visited.has(key)) continue;
+    visited.add(key);
+    const stage = input.stages.find((item) => item.key === key);
+    if (!stage || stage.requiresReview) continue;
+    if (stage.isTerminal) return true;
+    for (const transition of input.transitions)
+      if (transition.from === key) pending.push(transition.to);
+  }
+  return false;
 }

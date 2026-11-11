@@ -89,10 +89,38 @@ export class ApprovalsService {
             : { users: { some: { userId: user.id } } }),
         },
       },
-      select: { id: true, branchId: true },
+      select: { id: true, branchId: true, name: true },
     });
     if (!creative) throw new NotFoundException('Creative not found');
     return creative;
+  }
+
+  // Replies are one level deep: a reply to a reply joins the original
+  // top-level comment's thread. The parent must be on the same revision of
+  // the same creative in the caller's organization; older data with deeper
+  // chains is followed up to its top-level comment.
+  private async threadRoot(
+    user: AuthenticatedPrincipal,
+    creativeId: string,
+    creativeRevisionId: string,
+    parentId: string,
+  ): Promise<string> {
+    let commentId = parentId;
+    for (let depth = 0; depth < 50; depth += 1) {
+      const comment = await this.prisma.creativeComment.findFirst({
+        where: {
+          id: commentId,
+          creativeId,
+          creativeRevisionId,
+          organizationId: user.organizationId,
+        },
+        select: { id: true, parentId: true },
+      });
+      if (!comment) throw new NotFoundException('Comment thread not found');
+      if (!comment.parentId) return comment.id;
+      commentId = comment.parentId;
+    }
+    throw new NotFoundException('Comment thread not found');
   }
 
   async pending(user: AuthenticatedPrincipal) {
@@ -103,10 +131,12 @@ export class ApprovalsService {
       where: {
         status: 'OPEN',
         stage: { requiresReview: true },
+        // Runs the caller started are never theirs to decide.
         instance: {
           organizationId: user.organizationId,
           branchId: { in: branchIds },
           status: 'RUNNING',
+          startedById: { not: user.id },
         },
         OR: [
           { assignedUserId: user.id },
@@ -212,6 +242,18 @@ export class ApprovalsService {
     throw new ForbiddenException('Review task is assigned to another reviewer');
   }
 
+  // Separation of duties: whoever started a run cannot decide its review,
+  // whatever their role, permissions, or task assignment.
+  private assertNotSubmitter(
+    user: AuthenticatedPrincipal,
+    instance: { startedById: string },
+  ) {
+    if (instance.startedById === user.id)
+      throw new ForbiddenException(
+        'You cannot decide a review for a creative you submitted',
+      );
+  }
+
   async context(user: AuthenticatedPrincipal, taskId: string) {
     this.require(user, PERMISSIONS.APPROVAL_READ);
     const task = await this.taskContext(user, taskId);
@@ -245,6 +287,8 @@ export class ApprovalsService {
         currentRevisionId: task.instance.creative.currentRevisionId,
       },
       revision,
+      // Lets the client hide decision controls; decide() enforces it.
+      submittedByViewer: task.instance.startedById === user.id,
       current:
         task.instance.status === 'RUNNING' &&
         task.instance.currentStageId === task.stageId &&
@@ -270,6 +314,7 @@ export class ApprovalsService {
     return this.transaction(async (tx) => {
       const task = await this.taskContext(user, taskId, tx);
       this.assertReviewer(user, task);
+      this.assertNotSubmitter(user, task.instance);
       if (
         !task.stage.requiresReview ||
         task.status !== 'OPEN' ||
@@ -403,22 +448,14 @@ export class ApprovalsService {
           revisionNumber: revision.revisionNumber,
         },
       });
-      if (
-        input.decision === ReviewDecisionType.APPROVED &&
-        task.instance.startedById !== user.id
-      )
+      // Changes requested are announced by the change request above.
+      if (input.decision === ReviewDecisionType.APPROVED)
         await this.notifications.create(tx, {
           recipientUserId: task.instance.startedById,
           organizationId: user.organizationId,
           eventKey: `approval-decision:${decision.id}`,
-          type:
-            input.decision === ReviewDecisionType.APPROVED
-              ? 'CREATIVE_APPROVED'
-              : 'CREATIVE_CHANGES_REQUESTED',
-          title:
-            input.decision === ReviewDecisionType.APPROVED
-              ? 'Creative approved'
-              : 'Changes requested',
+          type: 'CREATIVE_APPROVED',
+          title: 'Creative approved',
           message: `A review decision was recorded for ${task.instance.creative.name}.`,
           entityType: 'approval_decision',
           entityId: decision.id,
@@ -624,18 +661,9 @@ export class ApprovalsService {
       select: { id: true },
     });
     if (!revision) throw new NotFoundException('Creative revision not found');
-    if (parentId) {
-      const parent = await this.prisma.creativeComment.findFirst({
-        where: {
-          id: parentId,
-          creativeId,
-          creativeRevisionId: revision.id,
-          organizationId: user.organizationId,
-        },
-        select: { id: true },
-      });
-      if (!parent) throw new NotFoundException('Comment thread not found');
-    }
+    const threadId = parentId
+      ? await this.threadRoot(user, creativeId, revision.id, parentId)
+      : null;
     return this.prisma.$transaction(async (tx) => {
       const comment = await tx.creativeComment.create({
         data: {
@@ -643,7 +671,7 @@ export class ApprovalsService {
           branchId: creative.branchId,
           creativeId,
           creativeRevisionId: revision.id,
-          parentId: parentId ?? null,
+          parentId: threadId,
           authorId: user.id,
           text: text.trim(),
         },
@@ -658,7 +686,13 @@ export class ApprovalsService {
         branchId: creative.branchId,
         creativeId,
         creativeRevisionId: revision.id,
-        metadata: { revisionNumber, parentId: parentId ?? null },
+        metadata: {
+          revisionNumber,
+          parentId: threadId,
+          ...(parentId && parentId !== threadId
+            ? { repliedToCommentId: parentId }
+            : {}),
+        },
       });
       const activeTask = await tx.workflowTask.findFirst({
         where: {
@@ -674,12 +708,17 @@ export class ApprovalsService {
         },
         select: { id: true, assignedUserId: true, instanceId: true },
       });
-      const workflow = activeTask
-        ? await tx.workflowInstance.findFirst({
-            where: { id: activeTask.instanceId },
-            select: { startedById: true },
-          })
-        : null;
+      // The submitter is whoever started the latest run for this revision,
+      // whether or not its review is still open.
+      const workflow = await tx.workflowInstance.findFirst({
+        where: {
+          organizationId: user.organizationId,
+          creativeId,
+          creativeRevisionId: revision.id,
+        },
+        orderBy: { startedAt: 'desc' },
+        select: { id: true, startedById: true },
+      });
       const activeRequests = await tx.changeRequest.findMany({
         where: {
           organizationId: user.organizationId,
@@ -700,14 +739,20 @@ export class ApprovalsService {
         if (request.createdById !== user.id)
           recipients.add(request.createdById);
       }
-      for (const recipientUserId of recipients)
+      const subject = `revision ${revisionNumber} of ${creative.name}`;
+      for (const recipientUserId of recipients) {
+        const submitter = recipientUserId === workflow?.startedById;
         await this.notifications.create(tx, {
           recipientUserId,
           organizationId: user.organizationId,
           eventKey: `comment:${comment.id}:${recipientUserId}`,
           type: 'REVIEW_COMMENT_ADDED',
-          title: 'New review comment',
-          message: 'A comment was added to a revision you are reviewing.',
+          title: submitter
+            ? 'New comment on your creative'
+            : 'New review comment',
+          message: submitter
+            ? `${user.name} commented on ${subject}, which you submitted for review.`
+            : `${user.name} commented on ${subject}, which you are reviewing or reviewed.`,
           entityType: 'creative_comment',
           entityId: comment.id,
           branchId: creative.branchId,
@@ -715,9 +760,11 @@ export class ApprovalsService {
           creativeRevisionId: revision.id,
           workflowInstanceId:
             activeTask?.instanceId ??
+            workflow?.id ??
             activeRequests[0]?.workflowInstanceId ??
             null,
         });
+      }
       return comment;
     });
   }

@@ -157,4 +157,218 @@ describe('validateWorkflowDefinition', () => {
       'Review stage review requires exactly one reviewer assignment.',
     );
   });
+
+  describe('changes-requested routes', () => {
+    const review = (
+      stages: WorkflowDefinitionInput['stages'],
+      transitions: WorkflowDefinitionInput['transitions'],
+    ): WorkflowDefinitionInput => ({
+      name: 'Review flow',
+      stages: [
+        {
+          key: 'review',
+          name: 'Review',
+          displayOrder: 0,
+          isEntry: true,
+          requiresReview: true,
+          assignedPermission: 'approvals:decide',
+        },
+        {
+          key: 'approved',
+          name: 'Approved',
+          displayOrder: 1,
+          isTerminal: true,
+        },
+        ...stages,
+      ],
+      transitions: [
+        {
+          key: 'approve',
+          label: 'Approve',
+          from: 'review',
+          to: 'approved',
+          reviewDecision: 'APPROVED',
+        },
+        ...transitions,
+      ],
+    });
+    const lockedMessage = (key: string, stage: string) =>
+      `Changes-requested transition ${key} leads to stage ${stage}, which cannot reach a terminal stage without another review. ` +
+      'Creatives cannot be revised while a run is active, so this would leave the creative locked; route it to a terminal stage or to stages that lead to one.';
+
+    it('accepts changes requested that end the run', () => {
+      expect(
+        validateWorkflowDefinition(
+          review(
+            [
+              {
+                key: 'changes',
+                name: 'Changes requested',
+                displayOrder: 2,
+                isTerminal: true,
+              },
+            ],
+            [
+              {
+                key: 'request',
+                label: 'Request changes',
+                from: 'review',
+                to: 'changes',
+                reviewDecision: 'CHANGES_REQUESTED',
+              },
+            ],
+          ),
+        ),
+      ).toEqual([]);
+    });
+
+    it('accepts changes requested that reach a terminal stage through non-review stages', () => {
+      expect(
+        validateWorkflowDefinition(
+          review(
+            [
+              { key: 'triage', name: 'Triage', displayOrder: 2 },
+              {
+                key: 'closed',
+                name: 'Closed',
+                displayOrder: 3,
+                isTerminal: true,
+              },
+            ],
+            [
+              {
+                key: 'request',
+                label: 'Request changes',
+                from: 'review',
+                to: 'triage',
+                reviewDecision: 'CHANGES_REQUESTED',
+              },
+              { key: 'close', label: 'Close', from: 'triage', to: 'closed' },
+            ],
+          ),
+        ),
+      ).toEqual([]);
+    });
+
+    it('rejects a rework stage whose only way out is another review', () => {
+      expect(
+        validateWorkflowDefinition({
+          ...review(
+            [{ key: 'rework', name: 'Rework', displayOrder: 2 }],
+            [
+              {
+                key: 'request',
+                label: 'Request changes',
+                from: 'review',
+                to: 'rework',
+                reviewDecision: 'CHANGES_REQUESTED',
+              },
+            ],
+          ),
+          // The review stage cannot be the entry when rework re-enters it.
+          stages: [
+            { key: 'draft', name: 'Draft', displayOrder: 3, isEntry: true },
+            {
+              key: 'review',
+              name: 'Review',
+              displayOrder: 0,
+              requiresReview: true,
+              assignedPermission: 'approvals:decide',
+            },
+            {
+              key: 'approved',
+              name: 'Approved',
+              displayOrder: 1,
+              isTerminal: true,
+            },
+            { key: 'rework', name: 'Rework', displayOrder: 2 },
+          ],
+          transitions: [
+            { key: 'submit', label: 'Submit', from: 'draft', to: 'review' },
+            {
+              key: 'approve',
+              label: 'Approve',
+              from: 'review',
+              to: 'approved',
+              reviewDecision: 'APPROVED',
+            },
+            {
+              key: 'request',
+              label: 'Request changes',
+              from: 'review',
+              to: 'rework',
+              reviewDecision: 'CHANGES_REQUESTED',
+            },
+            {
+              key: 'resubmit',
+              label: 'Resubmit',
+              from: 'rework',
+              to: 'review',
+            },
+          ],
+        }),
+      ).toEqual([lockedMessage('request', 'rework')]);
+    });
+
+    it('rejects changes requested that lead into another review stage', () => {
+      expect(
+        validateWorkflowDefinition(
+          review(
+            [
+              {
+                key: 'second',
+                name: 'Second review',
+                displayOrder: 2,
+                requiresReview: true,
+                assignedPermission: 'approvals:decide',
+              },
+            ],
+            [
+              {
+                key: 'request',
+                label: 'Request changes',
+                from: 'review',
+                to: 'second',
+                reviewDecision: 'CHANGES_REQUESTED',
+              },
+              {
+                key: 'second-approve',
+                label: 'Approve',
+                from: 'second',
+                to: 'approved',
+                reviewDecision: 'APPROVED',
+              },
+            ],
+          ),
+        ),
+      ).toContain(lockedMessage('request', 'second'));
+    });
+
+    it('ignores approval routes, which may continue to further reviews', () => {
+      const errors = validateWorkflowDefinition(
+        review(
+          [
+            {
+              key: 'changes',
+              name: 'Changes requested',
+              displayOrder: 2,
+              isTerminal: true,
+            },
+          ],
+          [
+            {
+              key: 'request',
+              label: 'Request changes',
+              from: 'review',
+              to: 'changes',
+              reviewDecision: 'CHANGES_REQUESTED',
+            },
+          ],
+        ),
+      );
+      expect(errors.some((error) => error.includes('Changes-requested'))).toBe(
+        false,
+      );
+    });
+  });
 });

@@ -37,6 +37,7 @@ function setup(
     transition?: boolean;
     updateCount?: number;
     transitionFails?: boolean;
+    startedBy?: string;
   } = {},
 ) {
   const task = {
@@ -62,6 +63,7 @@ function setup(
       workflowVersionId: 'version-1',
       currentStageId: 'stage-review',
       status: 'RUNNING',
+      startedById: options.startedBy ?? 'submitter-1',
       workflow: { name: 'Local' },
       creative: {
         id: 'creative-1',
@@ -119,6 +121,7 @@ function setup(
       callback(tx),
     ),
   };
+  const notifications = { create: vi.fn().mockResolvedValue({}) };
   const workflows = {
     transitionInTransaction: vi
       .fn()
@@ -132,9 +135,9 @@ function setup(
     prisma as unknown as PrismaService,
     workflows as unknown as WorkflowsService,
     { write: vi.fn().mockResolvedValue({}) } as never,
-    { create: vi.fn().mockResolvedValue({}) } as never,
+    notifications as never,
   );
-  return { service, prisma, tx, workflows };
+  return { service, prisma, tx, workflows, notifications };
 }
 
 describe('ApprovalsService', () => {
@@ -318,5 +321,368 @@ describe('ApprovalsService', () => {
       service.addComment(user, 'creative-1', 3, 'Reply', 'foreign-comment'),
     ).rejects.toBeInstanceOf(NotFoundException);
     expect(prisma.creativeComment.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('ApprovalsService self-approval', () => {
+  it.each([ReviewDecisionType.APPROVED, ReviewDecisionType.CHANGES_REQUESTED])(
+    'refuses a %s decision by the user who started the run, even when assigned',
+    async (decision) => {
+      const { service, tx, workflows, notifications } = setup({
+        startedBy: user.id,
+        assignment: user.id,
+      });
+      await expect(
+        service.decide(user, 'task-1', { decision, reason: 'Looks wrong' }),
+      ).rejects.toThrow(
+        new ForbiddenException(
+          'You cannot decide a review for a creative you submitted',
+        ),
+      );
+      expect(tx.approvalDecision.create).not.toHaveBeenCalled();
+      expect(tx.workflowTask.updateMany).not.toHaveBeenCalled();
+      expect(tx.changeRequest.create).not.toHaveBeenCalled();
+      expect(workflows.transitionInTransaction).not.toHaveBeenCalled();
+      expect(notifications.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses the submitter even when the task is assigned by a permission they hold', async () => {
+    const { service, tx } = setup({ startedBy: user.id, assignment: null });
+    tx.workflowTask.findFirst.mockResolvedValue({
+      ...(await tx.workflowTask.findFirst()),
+      requiredPermission: PERMISSIONS.APPROVAL_DECIDE,
+    });
+    await expect(
+      service.decide(user, 'task-1', { decision: ReviewDecisionType.APPROVED }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(tx.approvalDecision.create).not.toHaveBeenCalled();
+  });
+
+  it('notifies the submitter of an approval', async () => {
+    const { service, notifications, tx } = setup();
+    await service.decide(user, 'task-1', {
+      decision: ReviewDecisionType.APPROVED,
+    });
+    expect(notifications.create).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        recipientUserId: 'submitter-1',
+        type: 'CREATIVE_APPROVED',
+        title: 'Creative approved',
+      }),
+    );
+  });
+
+  it('announces changes requested once, through the change request', async () => {
+    const { service, notifications, tx } = setup();
+    await service.decide(user, 'task-1', {
+      decision: ReviewDecisionType.CHANGES_REQUESTED,
+      reason: 'Update the offer',
+    });
+    expect(notifications.create).toHaveBeenCalledTimes(1);
+    expect(notifications.create).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        recipientUserId: 'submitter-1',
+        type: 'CHANGE_REQUEST_CREATED',
+      }),
+    );
+  });
+
+  it('hides runs the caller started from their pending reviews', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const prisma = {
+      userBranchAccess: {
+        findMany: vi.fn().mockResolvedValue([{ branchId: 'branch-1' }]),
+      },
+      workflowTask: { findMany },
+    };
+    const service = new ApprovalsService(
+      prisma as unknown as PrismaService,
+      {} as WorkflowsService,
+      { write: vi.fn() } as never,
+      { create: vi.fn() } as never,
+    );
+    await service.pending(user);
+    expect(findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          instance: expect.objectContaining({
+            startedById: { not: user.id },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('tells the client when the viewer submitted the reviewed run', async () => {
+    for (const [startedBy, expected] of [
+      [user.id, true],
+      ['submitter-1', false],
+    ] as const) {
+      const { tx } = setup({ startedBy });
+      const prisma = {
+        ...tx,
+        creativeRevision: {
+          findFirst: vi.fn().mockResolvedValue({ id: 'revision-1' }),
+        },
+      };
+      const service = new ApprovalsService(
+        prisma as unknown as PrismaService,
+        {} as WorkflowsService,
+        { write: vi.fn() } as never,
+        { create: vi.fn() } as never,
+      );
+      await expect(service.context(user, 'task-1')).resolves.toMatchObject({
+        submittedByViewer: expected,
+      });
+    }
+  });
+});
+
+describe('ApprovalsService comment threads and notifications', () => {
+  type StoredComment = { id: string; parentId: string | null };
+
+  // A revision with stored comments, an optional open review task, the
+  // latest run's submitter, and open change requests by reviewers.
+  function commentSetup(
+    options: {
+      comments?: StoredComment[];
+      activeReviewer?: string | null;
+      submitter?: string | null;
+      requestCreators?: string[];
+    } = {},
+  ) {
+    const comments = options.comments ?? [];
+    const notifications = { create: vi.fn().mockResolvedValue({}) };
+    const audit = { write: vi.fn().mockResolvedValue({}) };
+    const latestRun =
+      options.submitter === null
+        ? null
+        : { id: 'instance-1', startedById: options.submitter ?? 'submitter-1' };
+    const tx = {
+      creativeComment: {
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({
+          id: 'comment-new',
+          ...data,
+        })),
+      },
+      workflowTask: {
+        findFirst: vi.fn().mockResolvedValue(
+          options.activeReviewer === undefined || options.activeReviewer
+            ? {
+                id: 'task-1',
+                assignedUserId: options.activeReviewer ?? 'reviewer-1',
+                instanceId: 'instance-1',
+              }
+            : null,
+        ),
+      },
+      workflowInstance: {
+        findFirst: vi.fn().mockResolvedValue(latestRun),
+      },
+      changeRequest: {
+        findMany: vi.fn().mockResolvedValue(
+          (options.requestCreators ?? []).map((createdById, index) => ({
+            id: 'request-' + index,
+            createdById,
+            workflowInstanceId: 'instance-1',
+          })),
+        ),
+      },
+    };
+    const prisma = {
+      creative: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: 'creative-1',
+          branchId: 'branch-1',
+          name: 'Spring post',
+        }),
+      },
+      creativeRevision: {
+        findUnique: vi.fn().mockResolvedValue({ id: 'revision-1' }),
+      },
+      creativeComment: {
+        findFirst: vi.fn(
+          async ({ where }: { where: { id: string } }) =>
+            comments.find((comment) => comment.id === where.id) ?? null,
+        ),
+      },
+      $transaction: vi.fn((callback: (value: typeof tx) => unknown) =>
+        callback(tx),
+      ),
+    };
+    const service = new ApprovalsService(
+      prisma as unknown as PrismaService,
+      {} as WorkflowsService,
+      audit as never,
+      notifications as never,
+    );
+    return { service, prisma, tx, audit, notifications };
+  }
+
+  it('starts a new thread for a comment without a parent', async () => {
+    const { service, tx } = commentSetup();
+    await service.addComment(user, 'creative-1', 1, '  Please fix the logo ');
+    expect(tx.creativeComment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          parentId: null,
+          text: 'Please fix the logo',
+        }),
+      }),
+    );
+  });
+
+  it('attaches a reply to a top-level comment directly', async () => {
+    const { service, tx, audit } = commentSetup({
+      comments: [{ id: 'root', parentId: null }],
+    });
+    await service.addComment(user, 'creative-1', 1, 'Done', 'root');
+    expect(tx.creativeComment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ parentId: 'root' }),
+      }),
+    );
+    expect(audit.write).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        action: 'comment.created',
+        metadata: { revisionNumber: 1, parentId: 'root' },
+      }),
+    );
+  });
+
+  it('attaches a reply to a reply to the original top-level comment', async () => {
+    const { service, tx, audit } = commentSetup({
+      comments: [
+        { id: 'root', parentId: null },
+        { id: 'reply-1', parentId: 'root' },
+      ],
+    });
+    await service.addComment(user, 'creative-1', 1, 'Agreed', 'reply-1');
+    expect(tx.creativeComment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ parentId: 'root' }),
+      }),
+    );
+    expect(audit.write).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        metadata: {
+          revisionNumber: 1,
+          parentId: 'root',
+          repliedToCommentId: 'reply-1',
+        },
+      }),
+    );
+  });
+
+  it('follows older, deeper reply chains up to their top-level comment', async () => {
+    const { service, tx } = commentSetup({
+      comments: [
+        { id: 'root', parentId: null },
+        { id: 'reply-1', parentId: 'root' },
+        { id: 'reply-2', parentId: 'reply-1' },
+      ],
+    });
+    await service.addComment(user, 'creative-1', 1, 'Agreed', 'reply-2');
+    expect(tx.creativeComment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ parentId: 'root' }),
+      }),
+    );
+  });
+
+  it('scopes every parent lookup to the same creative, revision and organization', async () => {
+    const { service, prisma } = commentSetup({
+      comments: [{ id: 'root', parentId: null }],
+    });
+    await service.addComment(user, 'creative-1', 1, 'Done', 'root');
+    expect(prisma.creativeComment.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: 'root',
+        creativeId: 'creative-1',
+        creativeRevisionId: 'revision-1',
+        organizationId: 'org-1',
+      },
+      select: { id: true, parentId: true },
+    });
+  });
+
+  it('rejects a reply whose thread cannot be found without writing anything', async () => {
+    const { service, tx, audit } = commentSetup({
+      comments: [{ id: 'reply-1', parentId: 'missing-root' }],
+    });
+    await expect(
+      service.addComment(user, 'creative-1', 1, 'Agreed', 'reply-1'),
+    ).rejects.toThrow('Comment thread not found');
+    expect(tx.creativeComment.create).not.toHaveBeenCalled();
+    expect(audit.write).not.toHaveBeenCalled();
+  });
+
+  it('words notifications for the submitter and for reviewers', async () => {
+    const author = { ...user, id: 'commenter-1', name: 'Rita Reviewer' };
+    const { service, notifications, tx } = commentSetup({
+      activeReviewer: 'reviewer-2',
+      requestCreators: ['reviewer-3'],
+    });
+    await service.addComment(author, 'creative-1', 2, 'Tighten the copy');
+    const sent = notifications.create.mock.calls.map(
+      ([, notification]) => notification as Record<string, string>,
+    );
+    expect(sent.map((item) => item.recipientUserId).sort()).toEqual([
+      'reviewer-2',
+      'reviewer-3',
+      'submitter-1',
+    ]);
+    expect(sent.find((item) => item.recipientUserId === 'submitter-1')).toEqual(
+      expect.objectContaining({
+        title: 'New comment on your creative',
+        message:
+          'Rita Reviewer commented on revision 2 of Spring post, which you submitted for review.',
+      }),
+    );
+    expect(sent.find((item) => item.recipientUserId === 'reviewer-2')).toEqual(
+      expect.objectContaining({
+        title: 'New review comment',
+        message:
+          'Rita Reviewer commented on revision 2 of Spring post, which you are reviewing or reviewed.',
+      }),
+    );
+    expect(tx.workflowInstance.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          organizationId: 'org-1',
+          creativeId: 'creative-1',
+          creativeRevisionId: 'revision-1',
+        },
+      }),
+    );
+  });
+
+  it('still notifies the submitter after the review task has closed', async () => {
+    const { service, notifications } = commentSetup({ activeReviewer: null });
+    await service.addComment(user, 'creative-1', 1, 'One more thing');
+    expect(notifications.create).toHaveBeenCalledTimes(1);
+    expect(notifications.create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        recipientUserId: 'submitter-1',
+        title: 'New comment on your creative',
+        workflowInstanceId: 'instance-1',
+      }),
+    );
+  });
+
+  it('does not notify the author of their own comment', async () => {
+    const { service, notifications } = commentSetup({
+      activeReviewer: null,
+      submitter: user.id,
+      requestCreators: [user.id],
+    });
+    await service.addComment(user, 'creative-1', 1, 'Note to self');
+    expect(notifications.create).not.toHaveBeenCalled();
   });
 });

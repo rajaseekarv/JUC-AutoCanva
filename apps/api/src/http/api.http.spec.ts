@@ -894,6 +894,202 @@ describe('HTTP API with mocked Prisma', () => {
     });
   });
 
+  describe('review safeguards', () => {
+    // Every model the request touches is mocked explicitly; anything else
+    // (such as an approval decision write) fails the request with a 500.
+    const useTransactionMock = () => {
+      prismaRoot.$transaction = vi.fn(
+        async (operation: (tx: unknown) => unknown) => operation(prismaMock),
+      );
+    };
+    const grantBranch = () => {
+      model('userBranchAccess').findFirst = vi.fn(async () => ({
+        branchId: 'branch-1',
+      }));
+    };
+    const reviewTask = (startedById: string) => ({
+      id: 'task-1',
+      instanceId: 'instance-1',
+      stageId: 'stage-review',
+      assignedUserId: 'user-1',
+      requiredPermission: null,
+      status: 'OPEN',
+      stage: { id: 'stage-review', requiresReview: true },
+      instance: {
+        id: 'instance-1',
+        branchId: 'branch-1',
+        creativeId: 'creative-1',
+        creativeRevisionId: 'revision-1',
+        currentStageId: 'stage-review',
+        status: 'RUNNING',
+        startedById,
+        creative: {
+          id: 'creative-1',
+          organizationId: 'org-1',
+          branchId: 'branch-1',
+          name: 'Spring post',
+        },
+      },
+    });
+
+    it.each(['APPROVED', 'CHANGES_REQUESTED'])(
+      'refuses a %s decision by the user who started the run with 403 and no writes',
+      async (decision) => {
+        grantedPermissions = [
+          PERMISSIONS.APPROVAL_DECIDE,
+          PERMISSIONS.CHANGE_REQUEST_CREATE,
+        ];
+        mockSession();
+        useTransactionMock();
+        grantBranch();
+        model('workflowTask').findFirst = vi.fn(async () =>
+          reviewTask('user-1'),
+        );
+        const response = await request(server())
+          .post('/api/v1/approvals/tasks/task-1/decision')
+          .set(auth())
+          .send({ decision, reason: 'Self review' })
+          .expect(403);
+        expect(response.body.message).toBe(
+          'You cannot decide a review for a creative you submitted',
+        );
+      },
+    );
+
+    it('still requires the decide permission before looking at the task', async () => {
+      grantedPermissions = [PERMISSIONS.APPROVAL_READ];
+      mockSession();
+      await request(server())
+        .post('/api/v1/approvals/tasks/task-1/decision')
+        .set(auth())
+        .send({ decision: 'APPROVED' })
+        .expect(403);
+      expect(models.get('workflowTask')).toBeUndefined();
+    });
+
+    it('stores a reply to a reply under the original top-level comment', async () => {
+      grantedPermissions = [PERMISSIONS.COMMENT_CREATE];
+      mockSession();
+      useTransactionMock();
+      model('creative').findFirst = vi.fn(async () => ({
+        id: 'creative-1',
+        branchId: 'branch-1',
+        name: 'Spring post',
+      }));
+      model('creativeRevision').findUnique = vi.fn(async () => ({
+        id: 'revision-1',
+      }));
+      const stored = [
+        { id: 'root', parentId: null },
+        { id: 'reply-1', parentId: 'root' },
+      ];
+      model('creativeComment').findFirst = vi.fn(
+        async ({ where }: { where: { id: string } }) =>
+          stored.find((comment) => comment.id === where.id) ?? null,
+      );
+      model('creativeComment').create = vi.fn(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          id: 'comment-new',
+          ...data,
+          author: { id: 'user-1', name: 'Operator' },
+        }),
+      );
+      model('auditLog').create = vi.fn(async () => ({}));
+      model('workflowTask').findFirst = vi.fn(async () => null);
+      model('workflowInstance').findFirst = vi.fn(async () => null);
+      model('changeRequest').findMany = vi.fn(async () => []);
+      const response = await request(server())
+        .post('/api/v1/creatives/creative-1/revisions/1/comments')
+        .set(auth())
+        .send({ text: 'Agreed', parentId: 'reply-1' })
+        .expect(201);
+      expect(response.body.parentId).toBe('root');
+      expect(model('creativeComment').create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ parentId: 'root' }),
+        }),
+      );
+    });
+
+    it('rejects a reply to a comment on another revision with 404', async () => {
+      grantedPermissions = [PERMISSIONS.COMMENT_CREATE];
+      mockSession();
+      model('creative').findFirst = vi.fn(async () => ({
+        id: 'creative-1',
+        branchId: 'branch-1',
+        name: 'Spring post',
+      }));
+      model('creativeRevision').findUnique = vi.fn(async () => ({
+        id: 'revision-2',
+      }));
+      model('creativeComment').findFirst = vi.fn(async () => null);
+      const response = await request(server())
+        .post('/api/v1/creatives/creative-1/revisions/2/comments')
+        .set(auth())
+        .send({ text: 'Agreed', parentId: 'comment-on-revision-1' })
+        .expect(404);
+      expect(response.body.message).toBe('Comment thread not found');
+    });
+
+    it('requires comments:read, and hides creatives outside the caller branches', async () => {
+      grantedPermissions = [PERMISSIONS.APPROVAL_READ];
+      mockSession();
+      await request(server())
+        .get('/api/v1/creatives/creative-1/revisions/1/comments')
+        .set(auth())
+        .expect(403);
+      grantedPermissions = [PERMISSIONS.COMMENT_READ];
+      mockSession();
+      model('creative').findFirst = vi.fn(async () => null);
+      const response = await request(server())
+        .get('/api/v1/creatives/creative-other/revisions/1/comments')
+        .set(auth())
+        .expect(404);
+      expect(response.body.message).toBe('Creative not found');
+      expect(model('creative').findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            organizationId: 'org-1',
+            branch: {
+              status: 'ACTIVE',
+              users: { some: { userId: 'user-1' } },
+            },
+          }),
+        }),
+      );
+    });
+
+    it('lets a submitter read decisions and change requests for a creative in their branch', async () => {
+      grantedPermissions = [
+        PERMISSIONS.APPROVAL_READ,
+        PERMISSIONS.CHANGE_REQUEST_READ,
+      ];
+      mockSession();
+      model('creative').findFirst = vi.fn(async () => ({
+        id: 'creative-1',
+        branchId: 'branch-1',
+        name: 'Spring post',
+      }));
+      model('approvalDecision').findMany = vi.fn(async () => [
+        { id: 'decision-1', decision: 'CHANGES_REQUESTED' },
+      ]);
+      model('changeRequest').findMany = vi.fn(async () => [
+        { id: 'request-1', status: 'OPEN' },
+      ]);
+      const decisions = await request(server())
+        .get('/api/v1/creatives/creative-1/decisions')
+        .set(auth())
+        .expect(200);
+      expect(decisions.body).toEqual([
+        { id: 'decision-1', decision: 'CHANGES_REQUESTED' },
+      ]);
+      await request(server())
+        .get('/api/v1/creatives/creative-1/change-requests')
+        .set(auth())
+        .expect(200);
+    });
+  });
+
   describe('asset content streaming', () => {
     // Storage is faked so these tests never read or write asset files.
     const storage = { put: vi.fn(), get: vi.fn(), remove: vi.fn() };

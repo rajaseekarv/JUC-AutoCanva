@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { ChangeRequestStatus, Prisma } from '@prisma/client';
 import type { AuthenticatedPrincipal } from '../auth/auth.types';
 import { PERMISSIONS } from '../auth/permissions';
 import { PrismaService } from '../prisma/prisma.service';
@@ -13,6 +13,7 @@ import { AuditService } from '../audit/audit.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import {
   validateWorkflowDefinition,
+  type StageDefinition,
   type WorkflowDefinitionInput,
 } from './workflow-definition';
 
@@ -266,16 +267,34 @@ export class WorkflowsService {
       (item) => item.versionNumber === workflow.currentVersionNumber,
     );
     if (!version) throw new NotFoundException('Workflow version not found');
+    const errors = this.storedVersionErrors(workflow, version);
+    return { valid: errors.length === 0, errors };
+  }
+
+  // Validates a stored version with the current definition rules. Versions
+  // are immutable once enabled, so a version enabled before a rule existed
+  // is only caught here.
+  private storedVersionErrors(
+    workflow: { name: string; description: string | null },
+    version: {
+      stages: Array<StageDefinition & { id: string }>;
+      transitions: Array<{
+        key: string;
+        label: string;
+        sourceStageId: string;
+        destinationStageId: string;
+        requiredPermission: string | null;
+        reviewDecision: 'APPROVED' | 'CHANGES_REQUESTED' | null;
+      }>;
+    },
+  ): string[] {
     const stageKeyById = new Map(
       version.stages.map((stage) => [stage.id, stage.key]),
     );
-    const errors = validateWorkflowDefinition({
+    return validateWorkflowDefinition({
       name: workflow.name,
       description: workflow.description,
-      stages: version.stages.map((stage) => ({
-        ...stage,
-        assignedUserId: stage.assignedUserId,
-      })),
+      stages: version.stages,
       transitions: version.transitions.map((transition) => ({
         key: transition.key,
         label: transition.label,
@@ -285,7 +304,6 @@ export class WorkflowsService {
         reviewDecision: transition.reviewDecision,
       })),
     });
-    return { valid: errors.length === 0, errors };
   }
 
   async enable(user: AuthenticatedPrincipal, id: string) {
@@ -369,10 +387,18 @@ export class WorkflowsService {
             versionNumber: workflow.enabledVersionNumber,
           },
         },
-        include: { stages: true },
+        include: { stages: true, transitions: true },
       });
       if (!version || !version.immutableAt)
         throw new ConflictException('Enabled workflow version is invalid');
+      // An enabled version that fails today's rules (for example one enabled
+      // before changes-requested routes had to finish without another
+      // review) could leave the creative locked, so it starts no runs.
+      const definitionErrors = this.storedVersionErrors(workflow, version);
+      if (definitionErrors.length)
+        throw new ConflictException(
+          `Workflow ${workflow.name} cannot start new runs until it is updated and enabled again: ${definitionErrors.join(' ')}`,
+        );
       const revision = await tx.creativeRevision.findFirst({
         where: {
           id: revisionId ?? creative.currentRevisionId ?? '',
@@ -441,6 +467,11 @@ export class WorkflowsService {
         workflowInstanceId: instance.id,
         metadata: { workflowId: workflow.id, stage: entry.key },
       });
+      await this.resolveAnsweredChangeRequests(tx, user, {
+        creative,
+        revision,
+        instanceId: instance.id,
+      });
       if (initialTask.assignedUserId && initialTask.assignedUserId !== user.id)
         await this.notifications.create(tx, {
           recipientUserId: initialTask.assignedUserId,
@@ -461,6 +492,93 @@ export class WorkflowsService {
         include: this.instanceInclude(),
       });
     });
+  }
+
+  // A run for a newer revision answers the changes requested on earlier
+  // revisions, so their open requests are resolved. This runs inside the
+  // transaction that creates the run: if the run is not created, every
+  // request stays open. Requests keep their rows and audit history; a run for
+  // the same revision resolves nothing.
+  private async resolveAnsweredChangeRequests(
+    tx: Prisma.TransactionClient,
+    user: AuthenticatedPrincipal,
+    run: {
+      creative: { id: string; branchId: string; name: string };
+      revision: { id: string; revisionNumber: number };
+      instanceId: string;
+    },
+  ): Promise<void> {
+    const actionable = [
+      ChangeRequestStatus.OPEN,
+      ChangeRequestStatus.IN_PROGRESS,
+    ];
+    const answered = await tx.changeRequest.findMany({
+      where: {
+        organizationId: user.organizationId,
+        creativeId: run.creative.id,
+        status: { in: actionable },
+        revisionNumber: { lt: run.revision.revisionNumber },
+      },
+      select: {
+        id: true,
+        status: true,
+        createdById: true,
+        revisionNumber: true,
+        creativeRevisionId: true,
+        workflowInstanceId: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    for (const request of answered) {
+      const resolved = await tx.changeRequest.updateMany({
+        where: { id: request.id, status: { in: actionable } },
+        data: {
+          status: ChangeRequestStatus.RESOLVED,
+          resolvedById: user.id,
+          resolvedAt: new Date(),
+        },
+      });
+      if (resolved.count !== 1)
+        throw new ConflictException(
+          'Workflow changed concurrently; reload and retry',
+        );
+      await this.audit.write(tx, {
+        organizationId: user.organizationId,
+        actorUserId: user.id,
+        action: 'change_request.resolved',
+        entityType: 'change_request',
+        entityId: request.id,
+        branchId: run.creative.branchId,
+        creativeId: run.creative.id,
+        creativeRevisionId: request.creativeRevisionId,
+        workflowInstanceId: request.workflowInstanceId,
+        changeRequestId: request.id,
+        metadata: {
+          status: ChangeRequestStatus.RESOLVED,
+          previousStatus: request.status,
+          resolution: 'RESUBMITTED',
+          revisionNumber: request.revisionNumber,
+          resubmittedRevisionNumber: run.revision.revisionNumber,
+          resubmittedWorkflowInstanceId: run.instanceId,
+        },
+      });
+      if (request.createdById !== user.id)
+        await this.notifications.create(tx, {
+          recipientUserId: request.createdById,
+          organizationId: user.organizationId,
+          eventKey: `change_request.resolved:${request.id}`,
+          type: 'CHANGE_REQUEST.RESOLVED',
+          title: 'Creative resubmitted',
+          message: `${run.creative.name} was resubmitted as revision ${run.revision.revisionNumber}, resolving your change request on revision ${request.revisionNumber}.`,
+          entityType: 'change_request',
+          entityId: request.id,
+          branchId: run.creative.branchId,
+          creativeId: run.creative.id,
+          creativeRevisionId: request.creativeRevisionId,
+          workflowInstanceId: run.instanceId,
+          changeRequestId: request.id,
+        });
+    }
   }
 
   private instanceInclude() {
