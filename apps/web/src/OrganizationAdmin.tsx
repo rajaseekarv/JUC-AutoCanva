@@ -6,6 +6,8 @@ import type {
   UserBranchAccessResponse,
 } from '@adflow/shared-types';
 import StatusBadge from './StatusBadge';
+import FeedbackMessage from './FeedbackMessage';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -30,6 +32,25 @@ type BranchForm = Pick<
   | 'googleMapsUrl'
   | 'timezone'
 >;
+// Branch form labels; name, code and time zone are required by the API.
+const branchFieldLabels: Record<keyof BranchForm, string> = {
+  name: 'Name',
+  code: 'Code',
+  address: 'Address',
+  city: 'City',
+  state: 'State',
+  pincode: 'PIN code',
+  phone: 'Phone',
+  whatsapp: 'WhatsApp',
+  email: 'Email',
+  googleMapsUrl: 'Google Maps link',
+  timezone: 'Time zone',
+};
+const requiredBranchFields = new Set<keyof BranchForm>([
+  'name',
+  'code',
+  'timezone',
+]);
 const emptyBranch: BranchForm = {
   name: '',
   code: '',
@@ -74,6 +95,10 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  // The branch awaiting confirmation before it is deactivated, and the branch
+  // whose access the selected user is about to lose.
+  const [confirmingDeactivateId, setConfirmingDeactivateId] = useState('');
+  const [confirmingRevokeBranchId, setConfirmingRevokeBranchId] = useState('');
 
   async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -229,6 +254,7 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
           ? 'Branch deactivated.'
           : 'Branch activated.',
       );
+      setConfirmingDeactivateId('');
       await loadAdministration();
     } catch (cause: unknown) {
       setError(
@@ -259,6 +285,7 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
       );
       setUserAccess(access);
       setMessage(grant ? 'Branch access granted.' : 'Branch access revoked.');
+      setConfirmingRevokeBranchId('');
     } catch (cause: unknown) {
       setError(
         cause instanceof Error
@@ -281,8 +308,12 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
     >
       <div className="admin-heading">
         <div>
-          <p className="eyebrow">ORGANIZATION ADMINISTRATION</p>
+          <p className="eyebrow">ADMINISTRATION</p>
           <h2 id="admin-title">Organization & branches</h2>
+          <p className="service-copy">
+            Update your organization&apos;s details, add or change branches, and
+            choose which branches each person can work in.
+          </p>
         </div>
         <button
           className="secondary-button"
@@ -291,16 +322,8 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
           Refresh
         </button>
       </div>
-      {error && (
-        <p className="form-message" role="alert">
-          {error}
-        </p>
-      )}
-      {message && (
-        <p className="success-message" role="status">
-          {message}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
+      <FeedbackMessage tone="success" message={message} />
 
       {organization && (
         <section className="admin-card" aria-labelledby="organization-title">
@@ -393,12 +416,58 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
                   <button
                     className="secondary-button"
                     disabled={busy}
-                    onClick={() => void changeBranchStatus(branch)}
+                    aria-expanded={
+                      branch.status === 'ACTIVE'
+                        ? confirmingDeactivateId === branch.id
+                        : undefined
+                    }
+                    onClick={() =>
+                      branch.status === 'ACTIVE'
+                        ? setConfirmingDeactivateId(branch.id)
+                        : void changeBranchStatus(branch)
+                    }
                   >
                     {branch.status === 'ACTIVE' ? 'Deactivate' : 'Activate'}
                   </button>
                 </div>
               )}
+              {canManageBranches &&
+                branch.status === 'ACTIVE' &&
+                confirmingDeactivateId === branch.id && (
+                  <div
+                    className="confirm-panel"
+                    role="group"
+                    aria-label={'Confirm deactivating ' + branch.name}
+                  >
+                    <p>
+                      Deactivate {branch.name}? Nobody can choose or work in
+                      this branch until it is activated again. Its creatives,
+                      brand settings and history are kept, and you can activate
+                      it again at any time.
+                    </p>
+                    <div className="template-actions">
+                      <button
+                        type="button"
+                        className="danger-button"
+                        disabled={busy}
+                        onClick={() => void changeBranchStatus(branch)}
+                      >
+                        Deactivate branch
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          returnFocusToConfirmTrigger(event.currentTarget);
+                          setConfirmingDeactivateId('');
+                        }}
+                      >
+                        Keep active
+                      </button>
+                    </div>
+                  </div>
+                )}
             </li>
           ))}
         </ul>
@@ -424,9 +493,14 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
               ] as const
             ).map((field) => (
               <label key={field} htmlFor={`branch-${field}`}>
-                {field === 'googleMapsUrl'
-                  ? 'Google Maps URL'
-                  : field[0].toUpperCase() + field.slice(1)}
+                <span>
+                  {branchFieldLabels[field]}
+                  <span className="field-hint">
+                    {requiredBranchFields.has(field)
+                      ? ' (required)'
+                      : ' (optional)'}
+                  </span>
+                </span>
                 <input
                   id={`branch-${field}`}
                   type={
@@ -443,8 +517,11 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
                       [field]: event.target.value,
                     })
                   }
-                  required={
-                    field === 'name' || field === 'code' || field === 'timezone'
+                  required={requiredBranchFields.has(field)}
+                  placeholder={
+                    field === 'timezone'
+                      ? 'For example Asia/Kolkata'
+                      : undefined
                   }
                 />
               </label>
@@ -477,7 +554,10 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
           <select
             id="access-user"
             value={selectedUserId}
-            onChange={(event) => setSelectedUserId(event.target.value)}
+            onChange={(event) => {
+              setSelectedUserId(event.target.value);
+              setConfirmingRevokeBranchId('');
+            }}
           >
             {users.map((user) => (
               <option key={user.id} value={user.id}>
@@ -505,10 +585,63 @@ export default function OrganizationAdmin({ session, onUnauthorized }: Props) {
                       disabled={
                         busy || (branch.status !== 'ACTIVE' && !granted)
                       }
-                      onClick={() => void changeUserBranch(branch.id, !granted)}
+                      aria-expanded={
+                        granted
+                          ? confirmingRevokeBranchId === branch.id
+                          : undefined
+                      }
+                      onClick={() =>
+                        granted
+                          ? setConfirmingRevokeBranchId(branch.id)
+                          : void changeUserBranch(branch.id, true)
+                      }
                     >
                       {granted ? 'Revoke access' : 'Grant access'}
                     </button>
+                    {granted && confirmingRevokeBranchId === branch.id && (
+                      <div
+                        className="confirm-panel"
+                        role="group"
+                        aria-label={'Confirm revoking access to ' + branch.name}
+                      >
+                        <p>
+                          Revoke{' '}
+                          {users.find((user) => user.id === selectedUserId)
+                            ?.name ?? 'this person'}
+                          &apos;s access to {branch.name}? The branch is removed
+                          from the branches assigned to them, so they can no
+                          longer see or work on its creatives, brand or
+                          workflows through this access. If their role lets them
+                          manage every branch (as administrators&apos; roles
+                          usually do), they keep access to all branches through
+                          that role. You can grant access again at any time.
+                        </p>
+                        <div className="template-actions">
+                          <button
+                            type="button"
+                            className="danger-button"
+                            disabled={busy}
+                            aria-label={'Revoke access to ' + branch.name}
+                            onClick={() =>
+                              void changeUserBranch(branch.id, false)
+                            }
+                          >
+                            Revoke access
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={busy}
+                            onClick={(event) => {
+                              returnFocusToConfirmTrigger(event.currentTarget);
+                              setConfirmingRevokeBranchId('');
+                            }}
+                          >
+                            Keep access
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </li>
                 );
               })}

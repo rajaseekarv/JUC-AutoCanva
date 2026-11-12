@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AuthenticatedUserResponse } from '@adflow/shared-types';
+import FeedbackMessage from './FeedbackMessage';
 
 type Session = { accessToken: string; user: AuthenticatedUserResponse };
 type Notice = {
@@ -68,20 +69,25 @@ export function NotificationsWorkspace({ session }: { session: Session }) {
     >
       <div className="app-heading">
         <div>
-          <p className="card-label">IN-APP ACTIVITY</p>
-          <h2 id="notifications-title">
-            Notifications <span aria-label="unread count">{count}</span>
-          </h2>
+          <p className="card-label">UPDATES FOR YOU</p>
+          <h2 id="notifications-title">Notifications</h2>
+          <p className="notification-count">
+            {count > 0 ? (
+              <span className="badge badge-info">
+                {count === 1 ? '1 unread' : count + ' unread'}
+              </span>
+            ) : (
+              'No unread notifications'
+            )}
+          </p>
         </div>
-        <button className="secondary-button" onClick={() => void markRead()}>
-          Mark all read
-        </button>
+        {count > 0 && (
+          <button className="secondary-button" onClick={() => void markRead()}>
+            Mark all read
+          </button>
+        )}
       </div>
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
       {!error && !items.length && (
         <p className="empty-state">No notifications yet.</p>
       )}
@@ -176,8 +182,12 @@ export function AuditWorkspace({ session }: { session: Session }) {
   ]);
   return (
     <section className="service-card" id="audit" aria-labelledby="audit-title">
-      <p className="card-label">ACCOUNTABILITY</p>
+      <p className="card-label">ACTIVITY RECORD</p>
       <h2 id="audit-title">Audit history</h2>
+      <p className="service-copy">
+        A permanent record of who changed what, and when. Use the filters to
+        narrow it down.
+      </p>
       <div className="filter-grid">
         <div>
           <label htmlFor="audit-action">Action</label>
@@ -260,11 +270,7 @@ export function AuditWorkspace({ session }: { session: Session }) {
           />
         </div>
       </div>
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
       {!error && !items.length && (
         <p className="empty-state">No audit entries match.</p>
       )}

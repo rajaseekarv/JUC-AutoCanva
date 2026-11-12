@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import type {
   AuthenticatedUserResponse,
   TemplateFieldResponse,
@@ -6,12 +6,56 @@ import type {
 } from '@adflow/shared-types';
 import StatusBadge from './StatusBadge';
 import { statusLabel } from './statusDisplay';
+import FeedbackMessage from './FeedbackMessage';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
 type Session = { accessToken: string; user: AuthenticatedUserResponse };
 const can = (session: Session, permission: string) =>
   session.user.permissions.includes(permission);
+
+// Display-only labels: the option values and stored values stay the API's
+// codes (TEXT, PX, …).
+const FIELD_TYPES = [
+  'TEXT',
+  'MULTILINE_TEXT',
+  'IMAGE',
+  'LOGO',
+  'PHONE',
+  'URL',
+  'DATE',
+  'NUMBER',
+  'BOOLEAN',
+  'COLOR',
+] as const;
+const fieldTypeLabels: Record<string, string> = {
+  TEXT: 'Short text',
+  MULTILINE_TEXT: 'Paragraph',
+  IMAGE: 'Image',
+  LOGO: 'Logo',
+  PHONE: 'Phone number',
+  URL: 'Web address',
+  DATE: 'Date',
+  NUMBER: 'Number',
+  BOOLEAN: 'Yes / no',
+  COLOR: 'Colour',
+};
+const fieldTypeLabel = (type: string) => fieldTypeLabels[type] ?? type;
+const UNITS = [
+  { value: 'PX', label: 'Pixels (px)', short: 'px' },
+  { value: 'MM', label: 'Millimetres (mm)', short: 'mm' },
+  { value: 'CM', label: 'Centimetres (cm)', short: 'cm' },
+  { value: 'IN', label: 'Inches (in)', short: 'in' },
+] as const;
+const unitShort = (unit: string) =>
+  UNITS.find((item) => item.value === unit)?.short ?? unit;
+const dataSourceLabels: Record<string, string> = {
+  ORGANIZATION_BRAND: 'Organization brand',
+  EFFECTIVE_BRAND: 'Effective brand',
+  BRANCH: 'Branch data',
+  CUSTOM: 'Custom preview value',
+};
 
 export default function TemplateManager({
   session,
@@ -31,6 +75,14 @@ export default function TemplateManager({
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [editingFieldId, setEditingFieldId] = useState('');
+  // The destructive action awaiting confirmation: 'archive', or the ID of the
+  // field to remove.
+  const [confirming, setConfirming] = useState<
+    | { kind: 'activate' }
+    | { kind: 'archive' }
+    | { kind: 'remove-field'; fieldId: string }
+    | null
+  >(null);
   const [previewBranchId, setPreviewBranchId] = useState('');
   const [customPreviewValues, setCustomPreviewValues] = useState<
     Record<string, string>
@@ -43,6 +95,7 @@ export default function TemplateManager({
     validationError: string | null;
   }> | null>(null);
   const accessToken = session.accessToken;
+  const lifecycleHelpId = useId();
   const canReadTemplates = session.user.permissions.includes('templates:read');
   const unauthorizedHandler = useRef(onUnauthorized);
   unauthorizedHandler.current = onUnauthorized;
@@ -131,13 +184,27 @@ export default function TemplateManager({
     setBusy(true);
     setError('');
     setMessage('');
+    // Set once the API has accepted the change. A failure after that point
+    // only means the screen could not be refreshed: the change is reported as
+    // done (so confirmations close and are not sent again) and the user is
+    // told the screen may be out of date. Nothing is retried.
+    let applied = false;
     try {
       await action();
+      applied = true;
       await refresh();
       onTemplatesChanged?.();
       setMessage(success);
       return true;
     } catch (cause: unknown) {
+      if (applied) {
+        onTemplatesChanged?.();
+        setError(
+          success +
+            " However, the latest template details couldn't be loaded, so this screen may be out of date. Reload the page before making more changes.",
+        );
+        return true;
+      }
       setError(
         cause instanceof Error ? cause.message : 'Template request failed.',
       );
@@ -283,7 +350,7 @@ export default function TemplateManager({
       id="templates"
       aria-labelledby="templates-title"
     >
-      <p className="card-label">REUSABLE CONTENT STRUCTURE</p>
+      <p className="card-label">DESIGN TEMPLATES</p>
       <div className="service-heading">
         <h2 id="templates-title">Templates</h2>
         {can(session, 'templates:create') && (
@@ -293,18 +360,12 @@ export default function TemplateManager({
         )}
       </div>
       <p className="service-copy">
-        Manage organization templates and their immutable active versions.
+        A template lists the details every creative needs, such as a headline or
+        a logo. Creatives can use a template once a version of it is activated;
+        an activated version can no longer be changed.
       </p>
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
-      {message && (
-        <p role="status" className="form-message">
-          {message}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
+      <FeedbackMessage tone="success" message={message} />
       {creating && (
         <form
           className="template-form"
@@ -333,10 +394,11 @@ export default function TemplateManager({
           <label>
             Unit
             <select name="unit">
-              <option>PX</option>
-              <option>MM</option>
-              <option>CM</option>
-              <option>IN</option>
+              {UNITS.map((unit) => (
+                <option key={unit.value} value={unit.value}>
+                  {unit.label}
+                </option>
+              ))}
             </select>
           </label>
           <button disabled={busy}>Create draft</button>
@@ -359,6 +421,7 @@ export default function TemplateManager({
             value={selectedId}
             onChange={(event) => {
               setSelectedId(event.target.value);
+              setConfirming(null);
               void refresh(event.target.value).catch((cause: unknown) =>
                 setError(
                   cause instanceof Error
@@ -383,7 +446,7 @@ export default function TemplateManager({
             <div>
               <p className="card-label">
                 {selected.code} · {selected.formatName} · {selected.width} ×{' '}
-                {selected.height} {selected.unit}
+                {selected.height} {unitShort(selected.unit)}
               </p>
               <h3>{selected.name}</h3>
             </div>
@@ -450,11 +513,13 @@ export default function TemplateManager({
               <div>
                 <strong>{field.label}</strong>
                 <span>
-                  {field.key} · {field.type}
+                  {fieldTypeLabel(field.type)}
                   {field.required ? ' · required' : ' · optional'}
                   {field.dataSource
-                    ? ` · ${field.dataSource}${field.sourceKey ? `.${field.sourceKey}` : ''}`
+                    ? ` · filled from ${dataSourceLabels[field.dataSource] ?? field.dataSource}${field.sourceKey ? ` (${field.sourceKey})` : ''}`
                     : ''}
+                  {' · key '}
+                  <code>{field.key}</code>
                 </span>
               </div>
               {editable && (
@@ -491,21 +556,67 @@ export default function TemplateManager({
                   <button
                     type="button"
                     className="danger-button"
+                    disabled={busy}
+                    aria-label={`Remove ${field.label}`}
+                    aria-expanded={
+                      confirming?.kind === 'remove-field' &&
+                      confirming.fieldId === field.id
+                    }
                     onClick={() =>
-                      void mutate(
-                        () =>
-                          request(
-                            `/templates/${selected.id}/fields/${field.id}`,
-                            { method: 'DELETE' },
-                          ),
-                        'Field removed.',
-                      )
+                      setConfirming({ kind: 'remove-field', fieldId: field.id })
                     }
                   >
                     Remove
                   </button>
                 </div>
               )}
+              {editable &&
+                confirming?.kind === 'remove-field' &&
+                confirming.fieldId === field.id && (
+                  <div
+                    className="confirm-panel"
+                    role="group"
+                    aria-label={`Confirm removing ${field.label}`}
+                  >
+                    <p>
+                      Remove the “{field.label}” field from draft version{' '}
+                      {selected.currentVersionNumber}? Creatives made from
+                      earlier, activated versions are not affected.
+                    </p>
+                    <div className="template-actions">
+                      <button
+                        type="button"
+                        className="danger-button"
+                        disabled={busy}
+                        onClick={() =>
+                          void mutate(
+                            () =>
+                              request(
+                                `/templates/${selected.id}/fields/${field.id}`,
+                                { method: 'DELETE' },
+                              ),
+                            'Field removed.',
+                          ).then((done) => {
+                            if (done) setConfirming(null);
+                          })
+                        }
+                      >
+                        Remove field
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          returnFocusToConfirmTrigger(event.currentTarget);
+                          setConfirming(null);
+                        }}
+                      >
+                        Keep field
+                      </button>
+                    </div>
+                  </div>
+                )}
               {editable && editingFieldId === field.id && (
                 <form
                   className="template-form"
@@ -578,19 +689,10 @@ export default function TemplateManager({
                   <label>
                     Type
                     <select name="type" defaultValue={field.type}>
-                      {[
-                        'TEXT',
-                        'MULTILINE_TEXT',
-                        'IMAGE',
-                        'LOGO',
-                        'PHONE',
-                        'URL',
-                        'DATE',
-                        'NUMBER',
-                        'BOOLEAN',
-                        'COLOR',
-                      ].map((type) => (
-                        <option key={type}>{type}</option>
+                      {FIELD_TYPES.map((type) => (
+                        <option key={type} value={type}>
+                          {fieldTypeLabel(type)}
+                        </option>
                       ))}
                     </select>
                   </label>
@@ -699,19 +801,10 @@ export default function TemplateManager({
               <label>
                 Type
                 <select name="type">
-                  {[
-                    'TEXT',
-                    'MULTILINE_TEXT',
-                    'IMAGE',
-                    'LOGO',
-                    'PHONE',
-                    'URL',
-                    'DATE',
-                    'NUMBER',
-                    'BOOLEAN',
-                    'COLOR',
-                  ].map((type) => (
-                    <option key={type}>{type}</option>
+                  {FIELD_TYPES.map((type) => (
+                    <option key={type} value={type}>
+                      {fieldTypeLabel(type)}
+                    </option>
                   ))}
                 </select>
               </label>
@@ -796,7 +889,7 @@ export default function TemplateManager({
                 disabled={!previewBranchId || busy}
                 onClick={() => void previewTemplate()}
               >
-                Resolve preview
+                Show preview
               </button>
               {previewFields && (
                 <dl className="preview-results">
@@ -822,26 +915,37 @@ export default function TemplateManager({
           {/* Lifecycle buttons keep fixed positions and labels; inapplicable
               actions are disabled rather than swapped, so a repeated click
               can never trigger a different action. */}
+          {selected.status !== 'ARCHIVED' &&
+            (can(session, 'templates:activate') ||
+              can(session, 'templates:edit')) && (
+              <ul className="lifecycle-help" id={lifecycleHelpId}>
+                {can(session, 'templates:activate') && (
+                  <li>
+                    <strong>Activate draft version:</strong>{' '}
+                    {hasDraft
+                      ? `locks draft version ${selected.currentVersionNumber} so it can no longer be edited, and makes it the version new creatives use.`
+                      : 'there is no draft version to activate right now.'}
+                  </li>
+                )}
+                {can(session, 'templates:edit') && (
+                  <li>
+                    <strong>Create new draft version:</strong>{' '}
+                    {hasDraft
+                      ? 'a draft version is already in progress; activate it first.'
+                      : `copies version ${selected.currentVersionNumber} into a new draft you can edit. The active version stays in use until the draft is activated.`}
+                  </li>
+                )}
+              </ul>
+            )}
           <div className="template-actions lifecycle-actions">
             {selected.status !== 'ARCHIVED' &&
               can(session, 'templates:activate') && (
                 <button
                   type="button"
                   disabled={busy || !hasDraft}
-                  title={
-                    hasDraft
-                      ? `Freeze draft v${selected.currentVersionNumber} and make it the active version`
-                      : 'There is no draft version to activate'
-                  }
-                  onClick={() =>
-                    void mutate(
-                      () =>
-                        request(`/templates/${selected.id}/activate`, {
-                          method: 'POST',
-                        }),
-                      'Template version activated.',
-                    )
-                  }
+                  aria-describedby={lifecycleHelpId}
+                  aria-expanded={confirming?.kind === 'activate'}
+                  onClick={() => setConfirming({ kind: 'activate' })}
                 >
                   Activate draft version
                 </button>
@@ -852,11 +956,7 @@ export default function TemplateManager({
                   type="button"
                   className="secondary-button"
                   disabled={busy || hasDraft}
-                  title={
-                    hasDraft
-                      ? 'A draft version is already in progress'
-                      : `Copy active v${selected.currentVersionNumber} into a new draft; the active version stays in use`
-                  }
+                  aria-describedby={lifecycleHelpId}
                   onClick={() =>
                     void mutate(
                       () =>
@@ -873,22 +973,114 @@ export default function TemplateManager({
             {selected.status !== 'ARCHIVED' &&
               can(session, 'templates:archive') && (
                 <button
+                  type="button"
                   className="secondary-button"
                   disabled={busy}
-                  onClick={() =>
-                    void mutate(
-                      () =>
-                        request(`/templates/${selected.id}/archive`, {
-                          method: 'POST',
-                        }),
-                      'Template archived.',
-                    )
-                  }
+                  aria-expanded={confirming?.kind === 'archive'}
+                  onClick={() => setConfirming({ kind: 'archive' })}
                 >
                   Archive
                 </button>
               )}
           </div>
+          {selected.status !== 'ARCHIVED' &&
+            can(session, 'templates:activate') &&
+            hasDraft &&
+            confirming?.kind === 'activate' && (
+              <div
+                className="confirm-panel"
+                role="group"
+                aria-label={`Confirm activating version ${selected.currentVersionNumber}`}
+              >
+                <p>
+                  Activate draft version {selected.currentVersionNumber} of “
+                  {selected.name}”? The version is locked for good and can no
+                  longer be edited (to make later changes, create a new draft
+                  version), and new creatives will use it.
+                  {selected.activeVersionNumber
+                    ? ` Version ${selected.activeVersionNumber} will no longer be offered for new creatives.`
+                    : ''}{' '}
+                  Creatives already made keep their saved revisions.
+                </p>
+                <div className="template-actions">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      void mutate(
+                        () =>
+                          request(`/templates/${selected.id}/activate`, {
+                            method: 'POST',
+                          }),
+                        'Template version activated.',
+                      ).then((done) => {
+                        if (done) setConfirming(null);
+                      })
+                    }
+                  >
+                    Activate version {selected.currentVersionNumber}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy}
+                    onClick={(event) => {
+                      returnFocusToConfirmTrigger(event.currentTarget);
+                      setConfirming(null);
+                    }}
+                  >
+                    Keep current version
+                  </button>
+                </div>
+              </div>
+            )}
+          {selected.status !== 'ARCHIVED' &&
+            can(session, 'templates:archive') &&
+            confirming?.kind === 'archive' && (
+              <div
+                className="confirm-panel"
+                role="group"
+                aria-label={`Confirm archiving ${selected.name}`}
+              >
+                <p>
+                  Archive “{selected.name}”? This cannot be undone. The template
+                  can no longer be edited, activated or chosen for new
+                  creatives. Creatives already made from it keep their saved
+                  revisions.
+                </p>
+                <div className="template-actions">
+                  <button
+                    type="button"
+                    className="danger-button"
+                    disabled={busy}
+                    onClick={() =>
+                      void mutate(
+                        () =>
+                          request(`/templates/${selected.id}/archive`, {
+                            method: 'POST',
+                          }),
+                        'Template archived.',
+                      ).then((done) => {
+                        if (done) setConfirming(null);
+                      })
+                    }
+                  >
+                    Archive template
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy}
+                    onClick={(event) => {
+                      returnFocusToConfirmTrigger(event.currentTarget);
+                      setConfirming(null);
+                    }}
+                  >
+                    Keep template
+                  </button>
+                </div>
+              </div>
+            )}
         </div>
       )}
     </section>

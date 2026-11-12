@@ -274,7 +274,7 @@ describe('CanvaIntegration in real Canva mode: connecting', () => {
     renderPanel();
     expect(
       await screen.findByText(
-        'This Canva account does not have the Autofill and brand template features AdFlow needs.',
+        'This Canva account does not have the Autofill and brand template features JUC-AutoCanva needs.',
       ),
     ).toBeInTheDocument();
     expect(window.location.search).toBe('');
@@ -593,7 +593,7 @@ describe('CanvaIntegration in real Canva mode: connection health', () => {
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/rejected AdFlow's app configuration/),
+      screen.getByText(/rejected JUC-AutoCanva's app configuration/),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/2 Canva authorizations are queued for revocation/),

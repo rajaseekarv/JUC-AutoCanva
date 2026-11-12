@@ -12,6 +12,8 @@ import {
 } from './dataChanges';
 import { statusLabel } from './statusDisplay';
 import { approvalSummaryText } from './approvalText';
+import FeedbackMessage from './FeedbackMessage';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -90,6 +92,18 @@ type Instance = {
   }[];
 };
 
+// Who a task waits for, in words. The permission code itself is kept in the
+// administrator details below the run.
+const taskAudience: Record<string, string> = {
+  'approvals:decide': 'anyone who can approve creatives',
+  'workflows:transition': 'anyone who can move workflows on',
+  'workflows:manage': 'a workflow manager',
+};
+function waitingFor(permission: string | null): string {
+  if (!permission) return '';
+  return taskAudience[permission] ?? 'someone with the required permission';
+}
+
 function defaultDefinition(): string {
   return JSON.stringify(
     {
@@ -159,6 +173,7 @@ export default function WorkflowWorkspace({
   const cancelInFlight = useRef(false);
   const cancelReasonId = useId();
   const startBlockedId = useId();
+  const [confirmingDisable, setConfirmingDisable] = useState(false);
   const instanceId = instance?.id;
   useEffect(() => {
     // A different run (or none) is shown: drop any half-entered reason.
@@ -422,6 +437,7 @@ export default function WorkflowWorkspace({
           ),
         );
         setMessage(`Workflow ${action}d.`);
+        setConfirmingDisable(false);
       }
       await reload();
     } catch (cause) {
@@ -565,6 +581,34 @@ export default function WorkflowWorkspace({
       );
     return hasRequiredPermissions && eligibleForAssignment;
   }
+  const openTasks =
+    instance?.tasks.filter((task) => task.status === 'OPEN') ?? [];
+  // The run records only its revision's ID; the creative list gives the
+  // current revision's number, so an older revision is described in words.
+  // A change is only claimed when the creative's current revision is known
+  // and differs; missing data gets a neutral description.
+  const runCurrentId = selectedCreative?.currentRevisionId;
+  const runCurrentNumber = currentRevisionNumber;
+  const runRevisionText = !instance
+    ? ''
+    : !runCurrentId
+      ? "This run is for the revision it started with. The creative's current revision isn't available right now, so it can't be compared."
+      : runCurrentId === instance.creativeRevisionId
+        ? runCurrentNumber !== undefined
+          ? 'This run is for revision ' +
+            runCurrentNumber +
+            ', the current revision.'
+          : "This run is for the creative's current revision."
+        : 'This run is for an earlier revision; the creative has been changed since it started.';
+  // History entries record the transition key; show the transition's label
+  // when the version still has it.
+  function historyActionLabel(actionKey: string): string {
+    if (actionKey === 'START') return 'Started';
+    const transition = instance?.version.transitions.find(
+      (item) => item.key === actionKey,
+    );
+    return transition?.label ?? statusLabel(actionKey);
+  }
   return (
     <section
       className="admin-panel"
@@ -573,23 +617,19 @@ export default function WorkflowWorkspace({
     >
       <div className="admin-heading">
         <div>
-          <p className="eyebrow">CONFIGURABLE OPERATIONS</p>
+          <p className="eyebrow">REVIEW STEPS</p>
           <h2 id="workflow-title">Creative workflows</h2>
+          <p className="service-copy">
+            Send a creative through its review steps and follow where it is.
+            Workflow managers also set up the steps here.
+          </p>
         </div>
         <button className="secondary-button" onClick={() => void reload()}>
           Refresh
         </button>
       </div>
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
-      {message && (
-        <p role="status" className="success-message">
-          {message}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
+      <FeedbackMessage tone="success" message={message} />
       <div className="creative-layout">
         {canRead && (
           <section className="admin-card">
@@ -599,7 +639,10 @@ export default function WorkflowWorkspace({
               <select
                 aria-label="Workflow definition"
                 value={workflowId}
-                onChange={(event) => setWorkflowId(event.target.value)}
+                onChange={(event) => {
+                  setWorkflowId(event.target.value);
+                  setConfirmingDisable(false);
+                }}
               >
                 <option value="">Choose workflow</option>
                 {workflows.map((item) => (
@@ -613,7 +656,7 @@ export default function WorkflowWorkspace({
             {canManage && (
               <>
                 <label>
-                  Validated declarative definition (JSON)
+                  Workflow definition (advanced, JSON format)
                   <textarea
                     aria-label="Workflow definition JSON"
                     rows={18}
@@ -639,7 +682,8 @@ export default function WorkflowWorkspace({
                         <button
                           className="secondary-button"
                           disabled={busy}
-                          onClick={() => void mutateDefinition('disable')}
+                          aria-expanded={confirmingDisable}
+                          onClick={() => setConfirmingDisable(true)}
                         >
                           Disable
                         </button>
@@ -655,6 +699,40 @@ export default function WorkflowWorkspace({
                     </>
                   )}
                 </div>
+                {selected?.status === 'ENABLED' && confirmingDisable && (
+                  <div
+                    className="confirm-panel"
+                    role="group"
+                    aria-label={'Confirm disabling ' + selected.name}
+                  >
+                    <p>
+                      Disable {selected.name}? No new reviews can start with
+                      this workflow until it is enabled again. Reviews that are
+                      already running carry on.
+                    </p>
+                    <div className="template-actions">
+                      <button
+                        type="button"
+                        className="danger-button"
+                        disabled={busy}
+                        onClick={() => void mutateDefinition('disable')}
+                      >
+                        Disable workflow
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          returnFocusToConfirmTrigger(event.currentTarget);
+                          setConfirmingDisable(false);
+                        }}
+                      >
+                        Keep enabled
+                      </button>
+                    </div>
+                  </div>
+                )}
               </>
             )}
           </section>
@@ -696,7 +774,10 @@ export default function WorkflowWorkspace({
                 <select
                   aria-label="Workflow to start"
                   value={workflowId}
-                  onChange={(event) => setWorkflowId(event.target.value)}
+                  onChange={(event) => {
+                    setWorkflowId(event.target.value);
+                    setConfirmingDisable(false);
+                  }}
                 >
                   <option value="">Choose workflow</option>
                   {workflows
@@ -737,26 +818,18 @@ export default function WorkflowWorkspace({
                 {instance.currentStage.name} ·{' '}
                 <StatusBadge status={instance.status} />
               </h4>
+              <p>{runRevisionText}</p>
               <p>
-                Tracking creative revision{' '}
-                {creatives.find((item) => item.id === creativeId)
-                  ?.currentRevisionId === instance.creativeRevisionId
-                  ? 'currently selected'
-                  : 'snapshot retained'}{' '}
-                ({instance.creativeRevisionId})
-              </p>
-              <p>
-                Open tasks:{' '}
-                {instance.tasks
-                  .filter((task) => task.status === 'OPEN')
+                Waiting for:{' '}
+                {openTasks
                   .map(
                     (task) =>
                       task.stage.name +
                       (task.requiredPermission
-                        ? ` · ${task.requiredPermission}`
+                        ? ' (' + waitingFor(task.requiredPermission) + ')'
                         : ''),
                   )
-                  .join(', ') || 'none'}
+                  .join(', ') || 'nobody right now'}
               </p>
               {canTransition &&
                 !instance.currentStage.requiresReview &&
@@ -849,7 +922,8 @@ export default function WorkflowWorkspace({
                       ) : (
                         <>
                           {item.fromStage?.name ?? 'Start'} →{' '}
-                          {item.toStage.name} · {item.actionKey} ·{' '}
+                          {item.toStage.name} ·{' '}
+                          {historyActionLabel(item.actionKey)} ·{' '}
                           {new Date(item.createdAt).toLocaleString()}
                           {item.reason ? ` · ${item.reason}` : ''}
                         </>
@@ -859,6 +933,38 @@ export default function WorkflowWorkspace({
                 </ol>
               ) : (
                 <p className="empty-state">No transition history.</p>
+              )}
+              {canManage && (
+                <details className="admin-details">
+                  <summary>Technical details for administrators</summary>
+                  <dl className="profile-list">
+                    <dt>Revision ID</dt>
+                    <dd>
+                      <code>{instance.creativeRevisionId}</code>
+                    </dd>
+                    <dt>Run ID</dt>
+                    <dd>
+                      <code>{instance.id}</code>
+                    </dd>
+                    <dt>Open task permissions</dt>
+                    <dd>
+                      {openTasks
+                        .map(
+                          (task) =>
+                            task.stage.name +
+                            ': ' +
+                            (task.requiredPermission ?? 'none'),
+                        )
+                        .join(', ') || 'none'}
+                    </dd>
+                    <dt>History action keys</dt>
+                    <dd>
+                      {instance.history
+                        .map((item) => item.actionKey)
+                        .join(', ') || 'none'}
+                    </dd>
+                  </dl>
+                </details>
               )}
             </>
           )}

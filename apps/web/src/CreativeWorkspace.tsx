@@ -24,6 +24,7 @@ import {
   type DataChangeSource,
 } from './dataChanges';
 import ApprovalSummary from './ApprovalSummary';
+import FeedbackMessage from './FeedbackMessage';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -108,6 +109,7 @@ export default function CreativeWorkspace({
   // creative keeps showing its run instead of flickering.
   const runCreativeId = useRef('');
   const lockNoticeId = useId();
+  const fieldHelpId = useId();
   // Set while a save or resubmission is in flight, so a second click before
   // the busy state renders sends nothing.
   const actionInFlight = useRef(false);
@@ -635,6 +637,26 @@ export default function CreativeWorkspace({
   function updateValue(field: TemplateFieldResponse, value: unknown): void {
     setValues((current) => ({ ...current, [field.key]: value }));
   }
+  // "(required)" or "(optional)" after every editable field's label; the
+  // input keeps the plain label as its accessible name.
+  function fieldLabel(field: TemplateFieldResponse) {
+    return (
+      <span>
+        {field.label}
+        <span className="field-hint">
+          {field.required ? ' (required)' : ' (optional)'}
+        </span>
+      </span>
+    );
+  }
+  function helpTextId(field: TemplateFieldResponse): string | undefined {
+    return field.helpText ? fieldHelpId + '-' + field.id : undefined;
+  }
+  function helpText(field: TemplateFieldResponse) {
+    return field.helpText ? (
+      <small id={helpTextId(field)}>{field.helpText}</small>
+    ) : null;
+  }
   function renderField(
     field: TemplateFieldResponse,
     source: Record<string, unknown>,
@@ -644,7 +666,7 @@ export default function CreativeWorkspace({
     if (field.type === 'IMAGE' || field.type === 'LOGO')
       return (
         <label key={field.id}>
-          {field.label}
+          {readonly ? field.label : fieldLabel(field)}
           {readonly ? (
             <AssetReference
               assetId={value}
@@ -655,6 +677,7 @@ export default function CreativeWorkspace({
           ) : (
             <select
               aria-label={field.label}
+              aria-describedby={helpTextId(field)}
               required={field.required}
               value={typeof value === 'string' ? value : ''}
               onChange={(event) =>
@@ -674,6 +697,7 @@ export default function CreativeWorkspace({
                 ))}
             </select>
           )}
+          {!readonly && helpText(field)}
           {!readonly && typeof value === 'string' && value && (
             <AssetReference
               assetId={value}
@@ -694,26 +718,30 @@ export default function CreativeWorkspace({
     if (field.type === 'BOOLEAN')
       return (
         <label className="checkbox-label" key={field.id}>
-          {field.label}
+          {fieldLabel(field)}
           <input
             aria-label={field.label}
+            aria-describedby={helpTextId(field)}
             type="checkbox"
             checked={value === true}
             onChange={(event) => updateValue(field, event.target.checked)}
           />
+          {helpText(field)}
         </label>
       );
     if (field.type === 'MULTILINE_TEXT')
       return (
         <label key={field.id}>
-          {field.label}
+          {fieldLabel(field)}
           <textarea
             aria-label={field.label}
+            aria-describedby={helpTextId(field)}
             required={field.required}
             maxLength={10000}
             value={typeof value === 'string' ? value : ''}
             onChange={(event) => updateValue(field, event.target.value)}
           />
+          {helpText(field)}
         </label>
       );
     const inputType =
@@ -728,9 +756,10 @@ export default function CreativeWorkspace({
               : 'text';
     return (
       <label key={field.id}>
-        {field.label}
+        {fieldLabel(field)}
         <input
           aria-label={field.label}
+          aria-describedby={helpTextId(field)}
           type={inputType}
           required={field.required}
           maxLength={field.type === 'NUMBER' ? undefined : 10000}
@@ -746,12 +775,30 @@ export default function CreativeWorkspace({
             )
           }
         />
-        {field.helpText && <small>{field.helpText}</small>}
+        {helpText(field)}
       </label>
     );
   }
 
   if (!canRead) return null;
+  const formShown = (selected && canUpdate) || (!selected && canCreate);
+  const changeRequestBanner =
+    selected && openRequests.length > 0 ? (
+      <ChangeRequestBanner
+        requests={openRequests}
+        currentRevisionNumber={selected.currentRevision?.revisionNumber ?? 0}
+        runActive={latestRun?.status === 'RUNNING'}
+        canResubmit={
+          canStartWorkflow &&
+          canReadWorkflows &&
+          latestRun !== null &&
+          latestRun.status !== 'RUNNING'
+        }
+        oneClick={oneClickResubmit}
+        busy={busy}
+        onResubmit={() => void resubmit()}
+      />
+    ) : null;
   return (
     <section
       className="admin-panel creative-workspace"
@@ -760,10 +807,14 @@ export default function CreativeWorkspace({
     >
       <div className="admin-heading">
         <div>
-          <p className="eyebrow">CREATIVE OPERATIONS</p>
+          <p className="eyebrow">YOUR CREATIVES</p>
           <h2 id="creative-workspace-title">
             Creatives{branch ? ' · ' + branch.name : ''}
           </h2>
+          <p className="service-copy">
+            Create and edit this branch&apos;s creatives. Every save keeps the
+            earlier version as a revision you can look back at.
+          </p>
         </div>
         <button
           className="secondary-button"
@@ -773,16 +824,8 @@ export default function CreativeWorkspace({
           {loading ? 'Loading…' : 'Refresh'}
         </button>
       </div>
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
-      {message && (
-        <p role="status" className="success-message">
-          {message}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
+      <FeedbackMessage tone="success" message={message} />
       {!branch ? (
         <p className="admin-card">
           Select an authorized branch to manage its creatives.
@@ -826,7 +869,7 @@ export default function CreativeWorkspace({
               <button onClick={() => chooseCreative('')}>New creative</button>
             )}
           </section>
-          {((selected && canUpdate) || (!selected && canCreate)) && (
+          {formShown && (
             <form
               className="admin-card admin-form"
               onSubmit={(event) => void save(event)}
@@ -839,8 +882,12 @@ export default function CreativeWorkspace({
                   <ApprovalSummary creative={selected} />
                 </p>
               )}
+              {changeRequestBanner}
               <label>
-                Name
+                <span>
+                  Name
+                  <span className="field-hint"> (required)</span>
+                </span>
                 <input
                   required
                   maxLength={120}
@@ -849,7 +896,10 @@ export default function CreativeWorkspace({
                 />
               </label>
               <label>
-                Template
+                <span>
+                  Template
+                  <span className="field-hint"> (required)</span>
+                </span>
                 <select
                   aria-label="Template"
                   required
@@ -873,7 +923,7 @@ export default function CreativeWorkspace({
                       (item) => item.id === templateDetail.id,
                     ) && (
                       <option value={templateDetail.id}>
-                        {templateDetail.name} · retained
+                        {templateDetail.name} (no longer active)
                       </option>
                     )}
                   {templates.map((template) => (
@@ -897,7 +947,10 @@ export default function CreativeWorkspace({
               )}
               {templateDetail?.versions && (
                 <label>
-                  Template version
+                  <span>
+                    Template version
+                    <span className="field-hint"> (required)</span>
+                  </span>
                   <select
                     aria-label="Template version"
                     required
@@ -937,7 +990,7 @@ export default function CreativeWorkspace({
                           {version.id ===
                             selected?.currentRevision?.templateVersionId &&
                           templateDetail.status === 'ARCHIVED'
-                            ? ' · retained'
+                            ? ' (no longer active)'
                             : ''}
                         </option>
                       ))}
@@ -948,7 +1001,10 @@ export default function CreativeWorkspace({
                 renderField(field, values),
               )}
               <label>
-                Revision summary
+                <span>
+                  What changed?
+                  <span className="field-hint"> (optional)</span>
+                </span>
                 <textarea
                   maxLength={1000}
                   value={summary}
@@ -1022,7 +1078,7 @@ export default function CreativeWorkspace({
                         className="secondary-button"
                         onClick={() => setInspectedRevision(revision)}
                       >
-                        Inspect
+                        View
                       </button>
                     </li>
                   ))}
@@ -1033,7 +1089,7 @@ export default function CreativeWorkspace({
               {inspectedRevision && (
                 <div className="creative-inspection">
                   <h4>
-                    Revision {inspectedRevision.revisionNumber} · read only
+                    Revision {inspectedRevision.revisionNumber} (view only)
                   </h4>
                   {inspectedRevision.summary && (
                     <p>{inspectedRevision.summary}</p>
@@ -1045,24 +1101,7 @@ export default function CreativeWorkspace({
               )}
             </section>
           )}
-          {selected && openRequests.length > 0 && (
-            <ChangeRequestBanner
-              requests={openRequests}
-              currentRevisionNumber={
-                selected.currentRevision?.revisionNumber ?? 0
-              }
-              runActive={latestRun?.status === 'RUNNING'}
-              canResubmit={
-                canStartWorkflow &&
-                canReadWorkflows &&
-                latestRun !== null &&
-                latestRun.status !== 'RUNNING'
-              }
-              oneClick={oneClickResubmit}
-              busy={busy}
-              onResubmit={() => void resubmit()}
-            />
-          )}
+          {!formShown && changeRequestBanner}
           {selected && canReadFeedback && (
             <section className="admin-card">
               <ReviewFeedback
@@ -1169,7 +1208,7 @@ function ChangeRequestBanner({
           Save a new revision with the requested changes, then resubmit it for
           review.
           {oneClick &&
-            ' Save and resubmit for review in the form below does both in one step.'}
+            ' Save and resubmit for review, at the end of this form, does both in one step.'}
         </p>
       ) : runActive ? (
         <p>A review is already running for this creative.</p>

@@ -40,20 +40,53 @@ const loginResponse = {
   },
 };
 
-describe('AdFlow Sprint 1 application shell', () => {
+describe('JUC-AutoCanva application shell', () => {
   beforeEach(() => localStorage.clear());
 
-  it('continues to show API availability', async () => {
+  // Phase 2A Q14: a reachable service shows nothing; only an outage is
+  // explained.
+  it('shows no service status while the service is reachable', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({ ok: true, json: async () => healthResponse }),
     );
     render(<App />);
-    expect(await screen.findByRole('status')).toHaveTextContent('API online');
-    expect(fetch).toHaveBeenCalledWith(
-      'http://localhost:3000/api/v1/health',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        'http://localhost:3000/api/v1/health',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
     );
+    await act(async () => undefined);
+    expect(screen.queryByText(/API online/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Service unavailable')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('link', { name: 'JUC-AutoCanva home' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('contentinfo')).toHaveTextContent('JUC-AutoCanva');
+    expect(screen.getByRole('contentinfo')).not.toHaveTextContent(
+      'infrastructure',
+    );
+  });
+
+  it.each([
+    [
+      'the health check fails',
+      () => Promise.resolve({ ok: false, status: 503 }),
+    ],
+    [
+      'the network is down',
+      () => Promise.reject(new TypeError('Failed to fetch')),
+    ],
+  ])('explains an unavailable service when %s', async (_label, health) => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(health));
+    render(<App />);
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "We can't reach JUC-AutoCanva right now, so some information may not load or save. Check your internet connection, then refresh the page.",
+    );
+    expect(screen.getByText('Service unavailable')).toBeInTheDocument();
+    expect(screen.queryByText(/Failed to fetch|HTTP 503/)).toBeNull();
   });
 
   it('logs in and shows the current identity and permitted branch context', async () => {
@@ -102,12 +135,12 @@ describe('AdFlow Sprint 1 application shell', () => {
       'href',
       '#creatives',
     );
-    expect(screen.getByRole('link', { name: 'Canva mock' })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: 'Canva (demo)' })).toHaveAttribute(
       'href',
       '#canva-integration',
     );
     expect(
-      screen.queryByText('ORGANIZATION ADMINISTRATION'),
+      screen.queryByRole('heading', { name: 'Organization & branches' }),
     ).not.toBeInTheDocument();
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -124,11 +157,58 @@ describe('AdFlow Sprint 1 application shell', () => {
     );
   });
 
-  it('shows a generic login error when credentials are rejected', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => healthResponse })
-      .mockResolvedValueOnce({ ok: false, status: 401 });
+  // Phase 2A Q3: only a rejected email or password says so; server, rate
+  // limit and network failures say what happened, and the browser's own
+  // error text is never shown.
+  it.each([
+    [
+      'rejected credentials (401)',
+      () => Promise.resolve({ ok: false, status: 401 }),
+      'The email or password is incorrect.',
+    ],
+    [
+      'a malformed request (400)',
+      () => Promise.resolve({ ok: false, status: 400 }),
+      'Enter a valid email address and password.',
+    ],
+    [
+      'rate limiting (429)',
+      () => Promise.resolve({ ok: false, status: 429 }),
+      'Too many sign-in attempts. Wait a few minutes, then try again.',
+    ],
+    [
+      'a server error (500)',
+      () => Promise.resolve({ ok: false, status: 500 }),
+      "We couldn't sign you in right now. Please try again in a moment.",
+    ],
+    [
+      'an unavailable server (503)',
+      () => Promise.resolve({ ok: false, status: 503 }),
+      "We couldn't sign you in right now. Please try again in a moment.",
+    ],
+    [
+      'a network failure',
+      () => Promise.reject(new TypeError('Failed to fetch')),
+      "We couldn't reach JUC-AutoCanva. Check your internet connection and try again.",
+    ],
+    [
+      'an unreadable success response',
+      () =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new SyntaxError('Unexpected end of JSON input');
+          },
+        }),
+      "We couldn't sign you in right now. Please try again in a moment.",
+    ],
+  ])('explains %s at sign-in', async (_label, loginReply, expected) => {
+    const fetchMock = vi.fn(async (input: string) =>
+      input.endsWith('/health')
+        ? { ok: true, json: async () => healthResponse }
+        : loginReply(),
+    );
     vi.stubGlobal('fetch', fetchMock);
     render(<App />);
     fireEvent.change(screen.getByLabelText('Email'), {
@@ -138,10 +218,11 @@ describe('AdFlow Sprint 1 application shell', () => {
       target: { value: 'bad-password' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Invalid email or password',
-    );
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(expected);
+    expect(alert).not.toHaveTextContent(/Failed to fetch|Unexpected end/);
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeEnabled();
   });
 });
 
@@ -356,15 +437,24 @@ describe('session persistence across reloads and tabs', () => {
     mockApi({ '/auth/me': meHandler });
     render(<App />);
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Unable to restore your session (HTTP 503). Your saved sign-in was kept.',
+      "JUC-AutoCanva isn't responding right now, so we couldn't confirm your sign-in. Your saved sign-in has been kept, so you can try again in a moment, or sign out to use a different account.",
     );
-    expect(screen.getByRole('alert')).not.toHaveTextContent('saved-token');
+    // No status codes, API wording or token in the message.
+    expect(screen.getByRole('alert')).not.toHaveTextContent(
+      /saved-token|HTTP|503|API/,
+    );
+    expect(
+      screen.getByRole('button', { name: 'Sign out' }),
+    ).toBeInTheDocument();
     expect(storedSession()).toMatchObject({ accessToken: 'saved-token' });
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Unable to reach the API to restore your session.',
+      "We couldn't reach JUC-AutoCanva to confirm your sign-in. Check your internet connection.",
+    );
+    expect(screen.getByRole('alert')).not.toHaveTextContent(
+      /Failed to fetch|API/,
     );
     expect(storedSession()).toMatchObject({ accessToken: 'saved-token' });
 

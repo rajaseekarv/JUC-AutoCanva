@@ -8,6 +8,7 @@ import type {
 } from '@adflow/shared-types';
 import CanvaConnection from './CanvaConnection';
 import type { StatusTone } from './statusDisplay';
+import FeedbackMessage from './FeedbackMessage';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -281,7 +282,7 @@ export default function CanvaIntegration({
       id="canva-integration"
       aria-labelledby="canva-title"
     >
-      <p className="card-label">EXTERNAL CREATIVE PROVIDER</p>
+      <p className="card-label">DESIGN TOOL</p>
       <div className="service-heading canva-heading">
         <h2 id="canva-title">Canva integration</h2>
         <span className="mock-badge">
@@ -401,11 +402,7 @@ export default function CanvaIntegration({
           {notice.text}
         </p>
       )}
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
       {canRead && (
         <ul aria-label="Canva mock jobs">
           {jobs.map((job) => {

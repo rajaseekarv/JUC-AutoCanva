@@ -51,6 +51,30 @@ describe('Sprint 8 activity workspaces', () => {
     );
   });
 
+  // Phase 2A Q15: the unread count is spelled out, and Mark all read is
+  // offered only when something is unread.
+  it.each([
+    [0, 'No unread notifications', false],
+    [1, '1 unread', true],
+    [3, '3 unread', true],
+  ])('shows %i unread clearly', async (count, text, markAll) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => ({
+        ok: true,
+        json: async () => (url.endsWith('/unread-count') ? { count } : []),
+      })),
+    );
+    render(<NotificationsWorkspace session={session} />);
+    expect(await screen.findByText(text)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Mark all read' }) !== null,
+    ).toBe(markAll);
+    expect(
+      screen.getByRole('heading', { name: 'Notifications' }),
+    ).toBeInTheDocument();
+  });
+
   it('shows audit history only when mounted for an authorized user and supports action filtering', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

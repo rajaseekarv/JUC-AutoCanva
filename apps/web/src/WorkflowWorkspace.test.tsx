@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import type {
   AuthenticatedUserResponse,
@@ -798,5 +799,199 @@ describe('WorkflowWorkspace start with unresolved change requests', () => {
     fireEvent.click(startButton());
     expect(await screen.findByText(explanation)).toBeInTheDocument();
     expect(startButton()).toBeDisabled();
+  });
+});
+
+// Phase 2A Q4/Q5: Disable is confirmed first, and a run is described in
+// words, with the raw identifiers kept for administrators.
+describe('WorkflowWorkspace Phase 2A', () => {
+  const manager: AuthenticatedUserResponse = {
+    ...user,
+    permissions: [...user.permissions, 'workflows:manage'],
+  };
+  const reviewRun = {
+    ...completed,
+    tasks: [
+      {
+        id: 'task-2',
+        status: 'OPEN',
+        stage: stages[1],
+        requiredPermission: 'approvals:decide',
+      },
+    ],
+  };
+  function serve() {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/workflows/workflow-1/disable'))
+        return okReply({ ...workflow, status: 'DISABLED' });
+      if (url.endsWith('/workflows')) return okReply([workflow]);
+      if (url.endsWith('/workflows/workflow-1')) return okReply(workflow);
+      if (url.includes('/creatives?branchId='))
+        return okReply([
+          { ...creative, currentRevision: { revisionNumber: 2 } },
+        ]);
+      if (url.endsWith('/creatives/creative-1/workflow'))
+        return okReply(reviewRun);
+      return okReply([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('describes the run in words and keeps raw details for administrators', async () => {
+    serve();
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user: manager }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: creative.id } },
+    );
+    expect(
+      await screen.findByText(
+        'This run is for revision 2, the current revision.',
+      ),
+    ).toBeInTheDocument();
+    const waiting = screen.getByText(/^Waiting for:/);
+    expect(waiting).toHaveTextContent(
+      'Waiting for: Ready (anyone who can approve creatives)',
+    );
+    expect(waiting).not.toHaveTextContent('approvals:decide');
+    expect(screen.getByText(/Start → Draft · Started/)).toBeInTheDocument();
+    expect(screen.getByText(/Draft → Ready · Submit ·/)).toBeInTheDocument();
+    const details = screen
+      .getByText('Technical details for administrators')
+      .closest('details')!;
+    expect(details).not.toHaveAttribute('open');
+    expect(details).toHaveTextContent('revision-1');
+    expect(details).toHaveTextContent('Ready: approvals:decide');
+    expect(details).toHaveTextContent('START, submit');
+  });
+
+  it('describes an earlier revision and hides the raw details from non-managers', async () => {
+    serve();
+    vi.mocked(fetch).mockImplementation((async (url: string) => {
+      if (url.includes('/creatives?branchId='))
+        return okReply([
+          {
+            ...creative,
+            currentRevisionId: 'revision-3',
+            currentRevision: { revisionNumber: 3 },
+          },
+        ]);
+      if (url.endsWith('/creatives/creative-1/workflow'))
+        return okReply(reviewRun);
+      if (url.endsWith('/workflows')) return okReply([workflow]);
+      return okReply([]);
+    }) as typeof fetch);
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: creative.id } },
+    );
+    expect(
+      await screen.findByText(
+        'This run is for an earlier revision; the creative has been changed since it started.',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText('Technical details for administrators'),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/revision-1/)).not.toBeInTheDocument();
+  });
+
+  // Missing data must not be described as a change to the creative.
+  it.each([
+    [
+      'the current revision is unknown',
+      { currentRevisionId: null, currentRevision: null },
+      "This run is for the revision it started with. The creative's current revision isn't available right now, so it can't be compared.",
+    ],
+    [
+      'the current revision number is missing',
+      { currentRevisionId: 'revision-1', currentRevision: null },
+      "This run is for the creative's current revision.",
+    ],
+  ])(
+    'describes the run neutrally when %s',
+    async (_case, revisionData, expected) => {
+      serve();
+      vi.mocked(fetch).mockImplementation((async (url: string) => {
+        if (url.includes('/creatives?branchId='))
+          return okReply([{ ...creative, ...revisionData }]);
+        if (url.endsWith('/creatives/creative-1/workflow'))
+          return okReply(reviewRun);
+        if (url.endsWith('/workflows')) return okReply([workflow]);
+        return okReply([]);
+      }) as typeof fetch);
+      render(
+        <WorkflowWorkspace
+          session={{ accessToken: 'token', user }}
+          branch={branch}
+          onUnauthorized={vi.fn()}
+        />,
+      );
+      fireEvent.change(
+        await screen.findByRole('combobox', { name: 'Branch creative' }),
+        { target: { value: creative.id } },
+      );
+      expect(await screen.findByText(expected)).toBeInTheDocument();
+      expect(
+        screen.queryByText(/has been changed since it started/),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/revision-1/)).not.toBeInTheDocument();
+    },
+  );
+
+  it('disables a workflow only after explaining the consequence', async () => {
+    const fetchMock = serve();
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user: manager }}
+        branch={null}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Workflow definition' }),
+      { target: { value: workflow.id } },
+    );
+    const disable = await screen.findByRole('button', { name: 'Disable' });
+    fireEvent.click(disable);
+    expect(disable).toHaveAttribute('aria-expanded', 'true');
+    const group = screen.getByRole('group', {
+      name: 'Confirm disabling Local workflow',
+    });
+    expect(group).toHaveTextContent(
+      'Disable Local workflow? No new reviews can start with this workflow until it is enabled again. Reviews that are already running carry on.',
+    );
+    const disableCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/disable'));
+    fireEvent.click(
+      within(group).getByRole('button', { name: 'Keep enabled' }),
+    );
+    expect(disableCalls()).toHaveLength(0);
+    expect(
+      screen.queryByRole('group', { name: /Confirm disabling/ }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Disable' }));
+    fireEvent.click(
+      within(
+        screen.getByRole('group', { name: /Confirm disabling/ }),
+      ).getByRole('button', { name: 'Disable workflow' }),
+    );
+    expect(await screen.findByText('Workflow disabled.')).toBeInTheDocument();
+    expect(disableCalls()).toHaveLength(1);
   });
 });

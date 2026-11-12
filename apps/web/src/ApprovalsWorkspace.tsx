@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import type { AuthenticatedUserResponse } from '@adflow/shared-types';
 import type { AssetSource } from './assetFiles';
 import { AssetReference } from './AssetImage';
@@ -9,6 +9,8 @@ import {
   type DataChange,
   type DataChangeSource,
 } from './dataChanges';
+import FeedbackMessage from './FeedbackMessage';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -87,6 +89,9 @@ export default function ApprovalsWorkspace({
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  // The change request awaiting confirmation before it is withdrawn.
+  const [confirmingWithdrawId, setConfirmingWithdrawId] = useState('');
+  const requestChangesHintId = useId();
   const [loadingTasks, setLoadingTasks] = useState(false);
   const [loadingReview, setLoadingReview] = useState(false);
 
@@ -267,8 +272,9 @@ export default function ApprovalsWorkspace({
       setMessage(
         action === 'start'
           ? 'Change request moved to in progress.'
-          : 'Change request cancelled.',
+          : 'Change request withdrawn.',
       );
+      setConfirmingWithdrawId('');
     } catch (cause) {
       setError(
         cause instanceof Error
@@ -290,20 +296,16 @@ export default function ApprovalsWorkspace({
     >
       <div className="admin-heading">
         <div>
-          <p className="card-label">REVISION-AWARE REVIEW</p>
+          <p className="card-label">REVIEWS</p>
           <h2 id="approvals-title">Approvals & comments</h2>
+          <p className="service-copy">
+            Review creatives waiting for your decision, and read or add
+            comments.
+          </p>
         </div>
       </div>
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
-      {message && (
-        <p role="status" className="success-message">
-          {message}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
+      <FeedbackMessage tone="success" message={message} />
       <div className="creative-layout">
         {canRead && (
           <section className="admin-card">
@@ -321,7 +323,15 @@ export default function ApprovalsWorkspace({
                           ?.revisionNumber ?? 'unknown'}
                       </span>
                     </div>
-                    <button type="button" onClick={() => setTaskId(task.id)}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // A withdrawal confirmed for one review must not
+                        // carry over to the next. Focus stays on this button.
+                        setConfirmingWithdrawId('');
+                        setTaskId(task.id);
+                      }}
+                    >
                       Review
                     </button>
                   </li>
@@ -339,7 +349,7 @@ export default function ApprovalsWorkspace({
         )}
         {review && !loadingReview && (
           <section className="admin-card" aria-label="Review detail">
-            <p className="card-label">EXACT CREATIVE REVISION</p>
+            <p className="card-label">YOU ARE REVIEWING</p>
             <h3>
               {review.creative.name} · Revision {review.revision.revisionNumber}
             </h3>
@@ -371,7 +381,7 @@ export default function ApprovalsWorkspace({
               ))}
             </dl>
             {review.submittedByViewer && (
-              <p className="form-message">
+              <p className="info-message">
                 You submitted this creative, so another reviewer must decide.
               </p>
             )}
@@ -410,11 +420,20 @@ export default function ApprovalsWorkspace({
                       type="button"
                       className="warning-button"
                       disabled={busy || !reason.trim()}
+                      aria-describedby={
+                        reason.trim() ? undefined : requestChangesHintId
+                      }
                       onClick={() => void decide('CHANGES_REQUESTED')}
                     >
                       Request changes
                     </button>
                   </div>
+                  {!reason.trim() && (
+                    <p id={requestChangesHintId} className="field-hint">
+                      To request changes, first describe what needs to change
+                      under &ldquo;Decision reason or requested changes&rdquo;.
+                    </p>
+                  )}
                 </div>
               )}
             <ReviewFeedback
@@ -453,7 +472,7 @@ export default function ApprovalsWorkspace({
                           disabled={busy}
                           onClick={() => void updateRequest(item.id, 'start')}
                         >
-                          Start work
+                          Mark as in progress
                         </button>
                       )}
                     {permissions.includes('change_requests:resolve') &&
@@ -470,13 +489,60 @@ export default function ApprovalsWorkspace({
                             type="button"
                             className="danger-button"
                             disabled={busy}
-                            onClick={() =>
-                              void updateRequest(item.id, 'cancel')
-                            }
+                            aria-expanded={confirmingWithdrawId === item.id}
+                            onClick={() => setConfirmingWithdrawId(item.id)}
                           >
-                            Cancel
+                            Withdraw request
                           </button>
                         </>
+                      )}
+                    {confirmingWithdrawId === item.id &&
+                      permissions.includes('change_requests:resolve') &&
+                      ['OPEN', 'IN_PROGRESS'].includes(item.status) && (
+                        <span
+                          className="confirm-panel"
+                          role="group"
+                          aria-label={
+                            'Confirm withdrawing the change request on revision ' +
+                            item.revisionNumber
+                          }
+                        >
+                          <span>
+                            Withdraw this change request? It will be marked
+                            Cancelled and will no longer stop revision{' '}
+                            {item.revisionNumber} from being resubmitted. The
+                            request and its history are kept.
+                          </span>
+                          <span className="template-actions">
+                            <button
+                              type="button"
+                              className="danger-button"
+                              disabled={busy}
+                              aria-label={
+                                'Withdraw request on revision ' +
+                                item.revisionNumber
+                              }
+                              onClick={() =>
+                                void updateRequest(item.id, 'cancel')
+                              }
+                            >
+                              Withdraw request
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              disabled={busy}
+                              onClick={(event) => {
+                                returnFocusToConfirmTrigger(
+                                  event.currentTarget,
+                                );
+                                setConfirmingWithdrawId('');
+                              }}
+                            >
+                              Keep request
+                            </button>
+                          </span>
+                        </span>
                       )}
                   </p>
                 ))}

@@ -33,6 +33,21 @@ type AuthSession = { accessToken: string; user: AuthenticatedUserResponse };
 const apiBaseUrl =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
 
+// What a failed sign-in tells the user. Only a rejected email or password
+// says so; anything else is a problem on our side or with the connection,
+// and the browser's own network error text is never shown.
+function loginFailureMessage(status: number | null): string {
+  if (status === 401) return 'The email or password is incorrect.';
+  if (status === 400) return 'Enter a valid email address and password.';
+  if (status === 429)
+    return 'Too many sign-in attempts. Wait a few minutes, then try again.';
+  if (status === null)
+    return "We couldn't reach JUC-AutoCanva. Check your internet connection and try again.";
+  return "We couldn't sign you in right now. Please try again in a moment.";
+}
+
+class LoginFailure extends Error {}
+
 export default function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>({ state: 'checking' });
   const [session, setSession] = useState<AuthSession | null>(null);
@@ -86,7 +101,7 @@ export default function App() {
         // Temporary outages keep the saved token so the user can retry.
         if (!response.ok) {
           setRestoreError(
-            `Unable to restore your session (HTTP ${response.status}).`,
+            "JUC-AutoCanva isn't responding right now, so we couldn't confirm your sign-in.",
           );
           return;
         }
@@ -98,7 +113,9 @@ export default function App() {
         setRestoringToken(null);
       } catch {
         if (controller.signal.aborted) return;
-        setRestoreError('Unable to reach the API to restore your session.');
+        setRestoreError(
+          "We couldn't reach JUC-AutoCanva to confirm your sign-in. Check your internet connection.",
+        );
       }
     }
     void restoreSession();
@@ -193,15 +210,22 @@ export default function App() {
     setIsSubmitting(true);
     const form = new FormData(event.currentTarget);
     try {
-      const response = await fetch(`${apiBaseUrl}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: form.get('email'),
-          password: form.get('password'),
-        }),
-      });
-      if (!response.ok) throw new Error('Invalid email or password');
+      let response: Response;
+      try {
+        response = await fetch(`${apiBaseUrl}/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: form.get('email'),
+            password: form.get('password'),
+          }),
+        });
+      } catch {
+        // The request never reached the server (offline, DNS, CORS).
+        throw new LoginFailure(loginFailureMessage(null));
+      }
+      if (!response.ok)
+        throw new LoginFailure(loginFailureMessage(response.status));
       const result = (await response.json()) as LoginResponse;
       saveStoredSession(result.accessToken, result.expiresIn);
       setRestoringToken(null);
@@ -209,8 +233,12 @@ export default function App() {
       setSelectedBranchId(result.user.branches[0]?.id ?? '');
       setSessionExpired(false);
     } catch (error: unknown) {
+      // Only our own messages are shown; an unexpected error (for example an
+      // unreadable response) gets the generic one.
       setLoginError(
-        error instanceof Error ? error.message : 'Unable to sign in',
+        error instanceof LoginFailure
+          ? error.message
+          : loginFailureMessage(500),
       );
     } finally {
       setIsSubmitting(false);
@@ -230,23 +258,26 @@ export default function App() {
     }
   }
 
-  const statusLabel =
-    apiStatus.state === 'checking'
-      ? 'Checking API'
-      : apiStatus.state === 'online'
-        ? 'API online'
-        : 'API unavailable';
-
-  const statusChip = (
-    <span className={`status-chip status-${apiStatus.state}`} role="status">
+  // Nothing is shown while the service is reachable (or still being
+  // checked); only an outage gets a notice, in the top bar and as a short
+  // explanation above the page content.
+  const serviceUnavailable = apiStatus.state === 'offline';
+  const statusChip = serviceUnavailable ? (
+    <span className="status-chip status-offline">
       <span className="status-dot" aria-hidden="true" />
-      {statusLabel}
+      Service unavailable
     </span>
-  );
+  ) : null;
+  const serviceNotice = serviceUnavailable ? (
+    <p role="alert" className="form-message">
+      We can&apos;t reach JUC-AutoCanva right now, so some information may not
+      load or save. Check your internet connection, then refresh the page.
+    </p>
+  ) : null;
   const footer = (
     <footer className="footer">
-      <span>AdFlow infrastructure</span>
-      <span>Multi-branch operations</span>
+      <span>JUC-AutoCanva</span>
+      <span>Advertising operations for every branch</span>
     </footer>
   );
 
@@ -267,7 +298,11 @@ export default function App() {
             id="branch-context"
             aria-labelledby="branch-title"
           >
-            <p className="card-label">PERMITTED BRANCH CONTEXT</p>
+            <p className="card-label">YOUR BRANCH</p>
+            <p className="service-copy">
+              Choose the branch you are working for. Creatives, brand settings
+              and workflows on other screens follow this choice.
+            </p>
             <label htmlFor="branch-select">Select branch</label>
             <select
               id="branch-select"
@@ -347,7 +382,7 @@ export default function App() {
       },
       {
         id: 'canva-integration',
-        label: 'Canva mock',
+        label: 'Canva (demo)',
         icon: 'canva',
         available: permissions.some((permission) =>
           permission.startsWith('canva:'),
@@ -431,13 +466,16 @@ export default function App() {
         defaultModuleId="branch-context"
         statusChip={statusChip}
         heading={
-          <div className="app-heading workspace-greeting">
-            <div>
-              <p className="eyebrow">YOUR WORKSPACE</p>
-              <h1 id="page-title">Hello, {session.user.name}.</h1>
-              <p className="intro">{session.user.email}</p>
+          <>
+            <div className="app-heading workspace-greeting">
+              <div>
+                <p className="eyebrow">YOUR WORKSPACE</p>
+                <h1 id="page-title">Hello, {session.user.name}.</h1>
+                <p className="intro">{session.user.email}</p>
+              </div>
             </div>
-          </div>
+            {serviceNotice}
+          </>
         }
         contextLabel={branch?.name}
         userName={session.user.name}
@@ -450,14 +488,15 @@ export default function App() {
   return (
     <main className="page-shell">
       <header className="topbar">
-        <a className="brand" href="/" aria-label="AdFlow home">
+        <a className="brand" href="/" aria-label="JUC-AutoCanva home">
           <span className="brand-mark" aria-hidden="true">
-            A
+            J
           </span>
-          <span>adflow</span>
+          <span>JUC-AutoCanva</span>
         </a>
         {statusChip}
       </header>
+      {serviceNotice}
       {restoringToken ? (
         <section className="auth-panel" aria-labelledby="page-title">
           <p className="eyebrow">ADVERTISING OPERATIONS</p>
@@ -465,7 +504,8 @@ export default function App() {
           {restoreError ? (
             <>
               <p role="alert" className="form-message">
-                {restoreError} Your saved sign-in was kept.
+                {restoreError} Your saved sign-in has been kept, so you can try
+                again in a moment, or sign out to use a different account.
               </p>
               <div className="login-form">
                 <button

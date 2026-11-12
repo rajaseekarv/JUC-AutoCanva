@@ -1534,3 +1534,83 @@ p[role='status'][aria-busy='true'] {
     margin-left: var(--space-2);
   }
 }
+
+/* Inline confirmation for a destructive action: states the consequence, then
+   a confirm and a keep button (Phase 2A). */
+.confirm-panel {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-md);
+  background: var(--color-warning-soft);
+  color: var(--color-text);
+}
+.confirm-panel p {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.confirm-panel .template-actions {
+  flex-wrap: wrap;
+}
+.lifecycle-help {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-5) 0 0;
+  padding-left: var(--space-5);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.field-hint {
+  color: var(--color-text-subtle);
+  font-size: var(--text-sm);
+  font-weight: 400;
+}
+/* A confirmation inside a list row takes the full width below the row. */
+.admin-list li:has(> .confirm-panel) {
+  flex-wrap: wrap;
+}
+.admin-list li > .confirm-panel {
+  flex-basis: 100%;
+  margin-top: 0;
+}
+/* Rows are columns on phones (see the asset rows above): stack the
+   confirmation below the row instead of wrapping into a new column. */
+@media (max-width: 640px) {
+  .admin-list li:has(> .confirm-panel) {
+    flex-wrap: nowrap;
+  }
+  .admin-list li > .confirm-panel {
+    flex-basis: auto;
+    align-self: stretch;
+  }
+}
+
+/* Raw identifiers kept for administrators, collapsed by default. */
+.admin-details {
+  margin-top: var(--space-4);
+  font-size: var(--text-sm);
+}
+.admin-details summary {
+  cursor: pointer;
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+.admin-details dd {
+  overflow-wrap: anywhere;
+}
+
+.notification-count {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-subtle);
+  font-size: var(--text-sm);
+}
+
+/* A screen message scrolled into view after an action keeps a little space
+   around it; it is focusable only by script (see FeedbackMessage). */
+.feedback-message {
+  scroll-margin: var(--space-4);
+}

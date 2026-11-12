@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import type { AuthenticatedUserResponse } from '@adflow/shared-types';
 import ApprovalsWorkspace from './ApprovalsWorkspace';
@@ -165,7 +166,9 @@ describe('ApprovalsWorkspace', () => {
     expect(
       await screen.findByText(/Keep the price label aligned/),
     ).toBeInTheDocument();
-    fireEvent.click(await screen.findByRole('button', { name: 'Start work' }));
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Mark as in progress' }),
+    );
     expect(
       await screen.findByText(/Revision 3 · In progress:/),
     ).toBeInTheDocument();
@@ -193,6 +196,161 @@ describe('ApprovalsWorkspace', () => {
         expect.objectContaining({ method: 'POST' }),
       ),
     );
+  });
+});
+
+// Phase 2A Q4: withdrawing a change request is confirmed first.
+describe('ApprovalsWorkspace change request withdrawal', () => {
+  // A second review task of the same creative (a later run) shows the same
+  // change request.
+  const secondTask = { ...task, id: 'task-2' };
+  const secondReview = { ...review, task: { ...review.task, id: 'task-2' } };
+  function serveOpenRequest(options: { failCancel?: boolean } = {}) {
+    let requestStatus = 'OPEN';
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/approvals/tasks'))
+        return statusReply(200, [task, secondTask]);
+      if (url.endsWith('/approvals/tasks/task-1'))
+        return statusReply(200, review);
+      if (url.endsWith('/approvals/tasks/task-2'))
+        return statusReply(200, secondReview);
+      if (url.endsWith('/change-requests'))
+        return statusReply(200, [
+          {
+            id: 'request-1',
+            revisionNumber: 2,
+            requestedChanges: 'Bigger logo',
+            explanation: null,
+            status: requestStatus,
+          },
+        ]);
+      if (url.endsWith('/change-requests/request-1/cancel')) {
+        expect(init?.method).toBe('POST');
+        if (options.failCancel)
+          return statusReply(409, {
+            message: 'Change request is no longer open',
+          });
+        requestStatus = 'CANCELLED';
+        return statusReply(200, {});
+      }
+      return statusReply(200, []);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+  const cancelCalls = (fetchMock: ReturnType<typeof serveOpenRequest>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/cancel'));
+  function renderApprovals() {
+    render(
+      <ApprovalsWorkspace
+        session={{ accessToken: 'token', user }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+  }
+  async function openFirstReview() {
+    fireEvent.click(
+      (await screen.findAllByRole('button', { name: 'Review' }))[0],
+    );
+    return screen.findByRole('button', { name: 'Withdraw request' });
+  }
+
+  it('explains the consequence and withdraws only after confirmation', async () => {
+    const fetchMock = serveOpenRequest();
+    renderApprovals();
+    const withdraw = await openFirstReview();
+    fireEvent.click(withdraw);
+    expect(withdraw).toHaveAttribute('aria-expanded', 'true');
+    const confirm = screen.getByRole('group', {
+      name: 'Confirm withdrawing the change request on revision 2',
+    });
+    expect(confirm).toHaveTextContent(
+      'Withdraw this change request? It will be marked Cancelled and will no longer stop revision 2 from being resubmitted. The request and its history are kept.',
+    );
+    expect(cancelCalls(fetchMock)).toHaveLength(0);
+
+    // Keep request closes the confirmation, sends nothing and returns focus
+    // to the button that opened it.
+    fireEvent.click(screen.getByRole('button', { name: 'Keep request' }));
+    expect(
+      screen.queryByRole('group', { name: /Confirm withdrawing/ }),
+    ).not.toBeInTheDocument();
+    expect(cancelCalls(fetchMock)).toHaveLength(0);
+    expect(withdraw).toHaveFocus();
+
+    fireEvent.click(withdraw);
+    const group = screen.getByRole('group', { name: /Confirm withdrawing/ });
+    fireEvent.click(
+      within(group).getByRole('button', {
+        name: 'Withdraw request on revision 2',
+      }),
+    );
+    expect(
+      await screen.findByText('Change request withdrawn.'),
+    ).toHaveAttribute('role', 'status');
+    expect(cancelCalls(fetchMock)).toHaveLength(1);
+    expect(
+      await screen.findByText(/Revision 2 · Cancelled:/),
+    ).toBeInTheDocument();
+  });
+
+  it('names the confirm button differently from the button that opens it', async () => {
+    serveOpenRequest();
+    renderApprovals();
+    fireEvent.click(await openFirstReview());
+    // The visible text stays "Withdraw request"; only the trigger has that
+    // exact accessible name.
+    expect(
+      screen.getAllByRole('button', { name: 'Withdraw request' }),
+    ).toHaveLength(1);
+    const confirm = screen.getByRole('button', {
+      name: 'Withdraw request on revision 2',
+    });
+    expect(confirm).toHaveTextContent('Withdraw request');
+  });
+
+  it('keeps the confirmation open with the reason when withdrawing fails', async () => {
+    const fetchMock = serveOpenRequest({ failCancel: true });
+    renderApprovals();
+    fireEvent.click(await openFirstReview());
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Withdraw request on revision 2' }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Change request is no longer open',
+    );
+    expect(cancelCalls(fetchMock)).toHaveLength(1);
+    expect(
+      screen.getByRole('group', { name: /Confirm withdrawing/ }),
+    ).toBeInTheDocument();
+  });
+
+  it('closes an open withdrawal confirmation when another review is opened', async () => {
+    const fetchMock = serveOpenRequest();
+    renderApprovals();
+    fireEvent.click(await openFirstReview());
+    expect(
+      screen.getByRole('group', { name: /Confirm withdrawing/ }),
+    ).toBeInTheDocument();
+    const second = screen.getAllByRole('button', { name: 'Review' })[1];
+    second.focus();
+    fireEvent.click(second);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/approvals/tasks/task-2'),
+        expect.anything(),
+      ),
+    );
+    // The same request is listed for the second review, but its
+    // confirmation is not carried over, and focus stays where the user is.
+    expect(
+      await screen.findByRole('button', { name: 'Withdraw request' }),
+    ).toHaveAttribute('aria-expanded', 'false');
+    expect(
+      screen.queryByRole('group', { name: /Confirm withdrawing/ }),
+    ).not.toBeInTheDocument();
+    expect(second).toHaveFocus();
+    expect(cancelCalls(fetchMock)).toHaveLength(0);
   });
 });
 
@@ -362,5 +520,39 @@ describe('ApprovalsWorkspace review feedback', () => {
     expect(
       screen.queryByLabelText('Decision reason or requested changes'),
     ).toBeNull();
+    // An explanation, not an error (Phase 2A Q12).
+    expect(
+      screen.getByText(
+        'You submitted this creative, so another reviewer must decide.',
+      ),
+    ).toHaveClass('info-message');
+  });
+
+  // Phase 2A Q7: the disabled Request changes button says why.
+  it('explains why Request changes is disabled until changes are described', async () => {
+    serveReview(review);
+    render(
+      <ApprovalsWorkspace
+        session={{ accessToken: 'token', user }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Review' }));
+    const requestChanges = await screen.findByRole('button', {
+      name: 'Request changes',
+    });
+    expect(requestChanges).toBeDisabled();
+    expect(requestChanges).toHaveAccessibleDescription(
+      'To request changes, first describe what needs to change under “Decision reason or requested changes”.',
+    );
+    fireEvent.change(
+      screen.getByLabelText('Decision reason or requested changes'),
+      { target: { value: 'Bigger logo' } },
+    );
+    expect(requestChanges).toBeEnabled();
+    expect(requestChanges).not.toHaveAttribute('aria-describedby');
+    expect(
+      screen.queryByText(/first describe what needs to change/),
+    ).not.toBeInTheDocument();
   });
 });

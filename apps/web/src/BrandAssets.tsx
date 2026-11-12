@@ -14,6 +14,7 @@ import {
   formatLabel,
   type AssetSource,
 } from './assetFiles';
+import FeedbackMessage from './FeedbackMessage';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -417,10 +418,15 @@ export default function BrandAssets({
     >
       <div className="admin-heading">
         <div>
-          <p className="eyebrow">BRAND MANAGEMENT</p>
+          <p className="eyebrow">BRAND & IMAGES</p>
           <h2 id="brand-assets-title">
             {scopeBranch ? scopeBranch.name + ' brand' : 'Organization brand'}
           </h2>
+          <p className="service-copy">
+            Set the logo, colours and website used in creatives, and upload
+            images. Branches use the organization&apos;s settings unless they
+            are changed for that branch.
+          </p>
         </div>
         <label>
           Brand scope
@@ -441,16 +447,8 @@ export default function BrandAssets({
           Refresh
         </button>
       </div>
-      {error && (
-        <p role="alert" className="form-message">
-          {error}
-        </p>
-      )}
-      {message && (
-        <p role="status" className="success-message">
-          {message}
-        </p>
-      )}
+      <FeedbackMessage tone="error" message={error} />
+      <FeedbackMessage tone="success" message={message} />
       {brand && (
         <section className="admin-card">
           <h3>

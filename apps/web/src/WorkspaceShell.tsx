@@ -178,11 +178,16 @@ export default function WorkspaceShell({
         >
           <NavIcon name={drawerOpen ? 'close' : 'menu'} />
         </button>
-        <a ref={brandRef} className="brand" href="/" aria-label="AdFlow home">
+        <a
+          ref={brandRef}
+          className="brand"
+          href="/"
+          aria-label="JUC-AutoCanva home"
+        >
           <span className="brand-mark" aria-hidden="true">
-            A
+            J
           </span>
-          <span>adflow</span>
+          <span>JUC-AutoCanva</span>
         </a>
         <div ref={topbarActionsRef} className="app-topbar-actions">
           {statusChip}
