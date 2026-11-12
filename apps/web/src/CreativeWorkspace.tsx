@@ -108,6 +108,9 @@ export default function CreativeWorkspace({
   // creative keeps showing its run instead of flickering.
   const runCreativeId = useRef('');
   const lockNoticeId = useId();
+  // Set while a save or resubmission is in flight, so a second click before
+  // the busy state renders sends nothing.
+  const actionInFlight = useRef(false);
   // What the form values were last loaded from (see the effect below).
   const appliedFormSource = useRef('');
   const [openRequests, setOpenRequests] = useState<FeedbackChangeRequest[]>([]);
@@ -142,6 +145,24 @@ export default function CreativeWorkspace({
   // Without workflows:read the API's 409 remains the protection.
   const editLocked = !!selected && latestRun?.status === 'RUNNING';
   const awaitingRunState = !!selected && canReadWorkflows && runLoading;
+  // One-click resubmission is offered when changes were requested on the
+  // current revision itself (a request on an older revision is already
+  // answered and uses Resubmit for review), no run is active, and the user
+  // may save a revision, start workflows and read the latest run (whose
+  // workflow is resubmitted). Change requests reach this screen only with
+  // change_requests:read.
+  const currentRevisionNumber = selected?.currentRevision?.revisionNumber;
+  const oneClickResubmit =
+    !!selected &&
+    canUpdate &&
+    canStartWorkflow &&
+    canReadWorkflows &&
+    latestRun !== null &&
+    latestRun.status !== 'RUNNING' &&
+    currentRevisionNumber !== undefined &&
+    openRequests.some(
+      (request) => request.revisionNumber === currentRevisionNumber,
+    );
   const canSubmit =
     !!selectedVersion?.immutableAt &&
     name.trim().length > 0 &&
@@ -409,21 +430,44 @@ export default function CreativeWorkspace({
     setTemplateVersionId(creative.currentRevision?.templateVersionId ?? '');
   }
 
-  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    if (!branch || !selectedVersion) return;
-    // Defense in depth: the server re-checks branch access, but the UI never
-    // writes to a creative from a different branch than the one selected.
+  // Whether the form may be written now. Defense in depth: the server
+  // re-checks branch access, but the UI never writes to a creative from a
+  // different branch than the one selected, and the disabled button is not
+  // the only guard against a revision the API would refuse while locked.
+  function canWriteForm(): boolean {
+    if (!branch || !selectedVersion) return false;
     if (selected && selected.branchId !== branch.id) {
       setError('Select a creative from the current branch.');
-      return;
+      return false;
     }
-    // The disabled button already blocks this; Enter in a field or any other
-    // submit path must not send a revision the API would refuse.
-    if (selected && (editLocked || awaitingRunState)) return;
+    return !(selected && (editLocked || awaitingRunState));
+  }
+
+  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (actionInFlight.current || !canWriteForm()) return;
+    actionInFlight.current = true;
     setBusy(true);
     setError('');
     setMessage('');
+    try {
+      const saved = await persistForm();
+      if (saved)
+        setMessage(
+          selected
+            ? 'A new immutable revision was saved.'
+            : 'Creative created.',
+        );
+    } finally {
+      actionInFlight.current = false;
+      setBusy(false);
+    }
+  }
+
+  // Saves the form as a new revision of the selected creative, or as a new
+  // creative. Returns what the API saved, or null after showing why not.
+  async function persistForm(): Promise<CreativeResponse | null> {
+    if (!branch) return null;
     try {
       const saved = selected
         ? await request<CreativeResponse>(
@@ -453,12 +497,10 @@ export default function CreativeWorkspace({
         ...current.filter((item) => item.id !== saved.id),
       ]);
       setSelectedId(saved.id);
-      setMessage(
-        selected ? 'A new immutable revision was saved.' : 'Creative created.',
-      );
       setSummary('');
       if (selected) setReviewKey((key) => key + 1);
       onDataChanged?.('creatives');
+      return saved;
     } catch (cause) {
       if (selected && cause instanceof RequestError && cause.status === 409) {
         // For example a run started elsewhere, or the user cannot read
@@ -473,49 +515,65 @@ export default function CreativeWorkspace({
         setError(
           cause instanceof Error ? cause.message : 'Unable to save creative.',
         );
-    } finally {
-      setBusy(false);
+      return null;
     }
   }
 
-  // Starts a new run of the previous workflow for the current revision. The
-  // API resolves the change requests on older revisions in the same
-  // transaction, and leaves them open if the run cannot be created.
+  // Starts a new run of the latest run's workflow for one revision and says
+  // where it landed. The API resolves the change requests on older
+  // revisions in the same transaction, and leaves them open if the run
+  // cannot be created; failures are thrown to the caller.
+  async function startRun(
+    creativeId: string,
+    workflowId: string,
+    revisionId: string,
+    revisionLabel: string,
+    savedFirst = false,
+  ): Promise<string> {
+    const run = await request<{
+      currentStage?: { name: string; requiresReview?: boolean } | null;
+    } | null>('/creatives/' + encodeURIComponent(creativeId) + '/workflows', {
+      method: 'POST',
+      body: JSON.stringify({ workflowId, creativeRevisionId: revisionId }),
+    });
+    const done = savedFirst ? ' was saved and resubmitted' : ' was resubmitted';
+    // The run starts at the workflow's entry stage. Only a review stage
+    // reaches a reviewer; otherwise say where the run is waiting.
+    const stage = run?.currentStage;
+    return !stage || stage.requiresReview
+      ? revisionLabel + done + ' for review.'
+      : revisionLabel +
+          done +
+          '. Its workflow is at the ' +
+          stage.name +
+          ' stage; move it on from Workflows to send it to a reviewer.';
+  }
+
+  // After a successful start the creative's status and requests changed.
+  function afterStart(): void {
+    setReviewKey((key) => key + 1);
+    void reload();
+    onDataChanged?.('creatives');
+  }
+
+  // Resubmits the already saved current revision.
   async function resubmit(): Promise<void> {
     if (!selected?.currentRevisionId || !latestRun) return;
+    if (actionInFlight.current) return;
+    actionInFlight.current = true;
     setBusy(true);
     setError('');
     setMessage('');
     try {
-      const run = await request<{
-        currentStage?: { name: string; requiresReview?: boolean } | null;
-      } | null>(
-        '/creatives/' + encodeURIComponent(selected.id) + '/workflows',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            workflowId: latestRun.workflowId,
-            creativeRevisionId: selected.currentRevisionId,
-          }),
-        },
-      );
-      const revision =
-        'Revision ' + (selected.currentRevision?.revisionNumber ?? '');
-      // The run starts at the workflow's entry stage. Only a review stage
-      // reaches a reviewer; otherwise say where the run is waiting.
-      const stage = run?.currentStage;
       setMessage(
-        !stage || stage.requiresReview
-          ? revision + ' was resubmitted for review.'
-          : revision +
-              ' was resubmitted. Its workflow is at the ' +
-              stage.name +
-              ' stage; move it on from Workflows to send it to a reviewer.',
+        await startRun(
+          selected.id,
+          latestRun.workflowId,
+          selected.currentRevisionId,
+          'Revision ' + (selected.currentRevision?.revisionNumber ?? ''),
+        ),
       );
-      setReviewKey((key) => key + 1);
-      // The creative's status changed with the new run.
-      void reload();
-      onDataChanged?.('creatives');
+      afterStart();
     } catch (cause) {
       setError(
         cause instanceof Error
@@ -523,6 +581,53 @@ export default function CreativeWorkspace({
           : 'Unable to resubmit for review.',
       );
     } finally {
+      actionInFlight.current = false;
+      setBusy(false);
+    }
+  }
+
+  // One click after changes were requested on the current revision: save
+  // the form as a new revision, then start the latest run's workflow for
+  // exactly that revision. Two existing API calls, not one transaction: if
+  // the save fails nothing is started; if the start fails the saved
+  // revision is kept and the Resubmit for review action retries.
+  async function saveAndResubmit(): Promise<void> {
+    if (!oneClickResubmit || !latestRun || actionInFlight.current) return;
+    if (!canWriteForm()) return;
+    const workflowId = latestRun.workflowId;
+    actionInFlight.current = true;
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const saved = await persistForm();
+      if (!saved) return;
+      const label = 'Revision ' + (saved.currentRevision?.revisionNumber ?? '');
+      if (!saved.currentRevisionId) {
+        setError(label + ' was saved, but it could not be resubmitted.');
+        return;
+      }
+      try {
+        setMessage(
+          await startRun(
+            saved.id,
+            workflowId,
+            saved.currentRevisionId,
+            label,
+            true,
+          ),
+        );
+        afterStart();
+      } catch (cause) {
+        setError(
+          label +
+            ' was saved, but it could not be resubmitted: ' +
+            (cause instanceof Error ? cause.message : 'unknown error') +
+            ' Use Resubmit for review to try again.',
+        );
+      }
+    } finally {
+      actionInFlight.current = false;
       setBusy(false);
     }
   }
@@ -884,6 +989,18 @@ export default function CreativeWorkspace({
                     ? 'Save new revision'
                     : 'Create creative'}
               </button>
+              {oneClickResubmit && (
+                <button
+                  type="button"
+                  disabled={busy || !canSubmit}
+                  aria-describedby={
+                    editLocked || awaitingRunState ? lockNoticeId : undefined
+                  }
+                  onClick={() => void saveAndResubmit()}
+                >
+                  Save and resubmit for review
+                </button>
+              )}
             </form>
           )}
           {selected && (
@@ -941,6 +1058,7 @@ export default function CreativeWorkspace({
                 latestRun !== null &&
                 latestRun.status !== 'RUNNING'
               }
+              oneClick={oneClickResubmit}
               busy={busy}
               onResubmit={() => void resubmit()}
             />
@@ -1016,6 +1134,7 @@ function ChangeRequestBanner({
   currentRevisionNumber,
   runActive,
   canResubmit,
+  oneClick,
   busy,
   onResubmit,
 }: {
@@ -1023,6 +1142,8 @@ function ChangeRequestBanner({
   currentRevisionNumber: number;
   runActive: boolean;
   canResubmit: boolean;
+  // Save and resubmit for review is offered in the form.
+  oneClick: boolean;
   busy: boolean;
   onResubmit: () => void;
 }) {
@@ -1047,6 +1168,8 @@ function ChangeRequestBanner({
         <p>
           Save a new revision with the requested changes, then resubmit it for
           review.
+          {oneClick &&
+            ' Save and resubmit for review in the form below does both in one step.'}
         </p>
       ) : runActive ? (
         <p>A review is already running for this creative.</p>

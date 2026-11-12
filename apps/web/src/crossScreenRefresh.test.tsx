@@ -43,6 +43,7 @@ const user: AuthenticatedUserResponse = {
     'workflows:transition',
     'approvals:read',
     'approvals:decide',
+    'change_requests:read',
   ],
   branches: [{ id: 'branch-1', name: 'North', code: 'NORTH' }],
 };
@@ -116,6 +117,7 @@ const stages = {
     assignedPermission: 'approvals:decide',
   }),
   approved: stage('approved', { isTerminal: true }),
+  changes: stage('changes', { isTerminal: true }),
 };
 const workflowVersion = {
   id: 'wf-version-1',
@@ -140,6 +142,15 @@ const workflowVersion = {
       requiredPermission: null,
       reviewDecision: 'APPROVED',
     },
+    {
+      id: 'transition-request',
+      key: 'request_changes',
+      label: 'Request changes',
+      sourceStageId: 'stage-review',
+      destinationStageId: 'stage-changes',
+      requiredPermission: null,
+      reviewDecision: 'CHANGES_REQUESTED',
+    },
   ],
 };
 const workflow = {
@@ -163,6 +174,14 @@ function serveApi() {
     cancelReason?: string;
   } | null = null;
   let approvedRevision: number | null = null;
+  // Change requests, as GET /creatives/:id/change-requests returns them.
+  const changeRequests: Array<{
+    id: string;
+    status: string;
+    revisionNumber: number;
+    requestedChanges: string;
+    explanation: string | null;
+  }> = [];
   const revisionOf = (number: number) => ({
     id: 'revision-' + number,
     revisionNumber: number,
@@ -201,7 +220,7 @@ function serveApi() {
       status:
         run.cancelReason !== undefined
           ? 'CANCELLED'
-          : run.stage === 'approved'
+          : run.stage === 'approved' || run.stage === 'changes'
             ? 'COMPLETED'
             : 'RUNNING',
       startedById: 'user-1',
@@ -250,6 +269,10 @@ function serveApi() {
     const method = init?.method ?? 'GET';
     const path = url.replace(/^https?:\/\/[^/]+\/api\/v1/, '');
     if (method === 'POST' && path === '/creatives/creative-1/workflows') {
+      // A run for a newer revision resolves older requests, as the API does.
+      for (const request of changeRequests)
+        if (request.revisionNumber < revisionNumber)
+          request.status = 'RESOLVED';
       run = { stage: 'draft', revisionNumber };
       status = 'draft';
       return reply(instance(), 201);
@@ -270,6 +293,22 @@ function serveApi() {
       return reply(instance(), 201);
     }
     if (method === 'POST' && path === '/approvals/tasks/task-1/decision') {
+      const body = JSON.parse(String(init!.body)) as {
+        decision: string;
+        reason?: string;
+      };
+      if (body.decision === 'CHANGES_REQUESTED') {
+        run!.stage = 'changes';
+        status = 'changes';
+        changeRequests.push({
+          id: 'request-' + (changeRequests.length + 1),
+          status: 'OPEN',
+          revisionNumber: run!.revisionNumber,
+          requestedChanges: body.reason ?? '',
+          explanation: null,
+        });
+        return reply({ id: 'decision-cr' }, 201);
+      }
       run!.stage = 'approved';
       status = 'approved';
       approvedRevision = run!.revisionNumber;
@@ -291,6 +330,8 @@ function serveApi() {
         ),
       );
     if (path === '/creatives/creative-1/workflow') return reply(instance());
+    if (path === '/creatives/creative-1/change-requests')
+      return reply(changeRequests.map((request) => ({ ...request })));
     if (path === '/workflows') return reply([workflow]);
     if (path === '/approvals/tasks')
       return reply(
@@ -543,6 +584,100 @@ describe('cross-screen refresh', () => {
     expect(headline).toHaveValue('Typed while locked');
     await waitFor(() => expect(creativeRow()).toHaveTextContent('Draft'));
     await waitFor(() => expect(picker()).toHaveTextContent('Launch · Draft'));
+  });
+
+  // Stage 12: changes requested in Approvals, one click in Creatives, and
+  // the new review task appears in Approvals without a reload.
+  it('resubmits with one click after changes are requested, and Approvals shows the new task', async () => {
+    const { calls } = serveApi();
+    render(<Screens />);
+    await waitFor(() => expect(picker()).toHaveTextContent('Launch · Draft'));
+    fireEvent.change(picker(), { target: { value: 'creative-1' } });
+    fireEvent.change(
+      await within(workflowsScreen()).findByRole('combobox', {
+        name: 'Workflow to start',
+      }),
+      { target: { value: 'workflow-1' } },
+    );
+    fireEvent.click(
+      within(workflowsScreen()).getByRole('button', { name: 'Start workflow' }),
+    );
+    fireEvent.click(
+      await within(workflowsScreen()).findByRole('button', {
+        name: 'Submit for review',
+      }),
+    );
+    fireEvent.click(
+      await within(approvalsScreen()).findByRole('button', { name: 'Review' }),
+    );
+    fireEvent.change(
+      await within(approvalsScreen()).findByLabelText(
+        'Decision reason or requested changes',
+      ),
+      { target: { value: 'Bigger logo' } },
+    );
+    fireEvent.click(
+      within(approvalsScreen()).getByRole('button', {
+        name: 'Request changes',
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        within(approvalsScreen()).queryByRole('button', { name: 'Review' }),
+      ).not.toBeInTheDocument(),
+    );
+
+    // Creatives: the request on the current revision offers one click.
+    fireEvent.click(
+      within(creativesScreen()).getByRole('button', { name: 'Open' }),
+    );
+    expect(
+      await within(creativesScreen()).findByRole('region', {
+        name: 'Open change requests',
+      }),
+    ).toHaveTextContent('Revision 1: Bigger logo');
+    fireEvent.change(
+      await within(creativesScreen()).findByRole('textbox', {
+        name: 'Headline',
+      }),
+      { target: { value: 'Headline with a bigger logo' } },
+    );
+    const tasksBefore = calls((path) => path === '/approvals/tasks');
+    fireEvent.click(
+      await within(creativesScreen()).findByRole('button', {
+        name: 'Save and resubmit for review',
+      }),
+    );
+    expect(
+      await within(creativesScreen()).findByText(
+        'Revision 2 was saved and resubmitted.',
+        { exact: false },
+      ),
+    ).toBeInTheDocument();
+    expect(
+      calls((path, m) => m === 'PATCH' && path === '/creatives/creative-1'),
+    ).toBe(1);
+
+    // Workflows: the run is at Draft for revision 2. Submitting it sends the
+    // new task to Approvals, which refreshes without a reload.
+    fireEvent.click(
+      await within(workflowsScreen()).findByRole('button', {
+        name: 'Submit for review',
+      }),
+    );
+    expect(
+      await within(approvalsScreen()).findByRole('button', { name: 'Review' }),
+    ).toBeInTheDocument();
+    expect(calls((path) => path === '/approvals/tasks')).toBeGreaterThan(
+      tasksBefore,
+    );
+    await waitFor(() =>
+      expect(
+        within(creativesScreen()).queryByRole('region', {
+          name: 'Open change requests',
+        }),
+      ).not.toBeInTheDocument(),
+    );
   });
 });
 

@@ -809,8 +809,20 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
       startStage?: { key: string; name: string; requiresReview: boolean };
       // Extra fields of the creative as the list returns it.
       listed?: Partial<CreativeResponse>;
+      // Stage 12: a refused revision save, and requests held until released.
+      patchStatus?: number;
+      holdPatch?: boolean;
+      holdRun?: boolean;
     } = {},
   ) {
+    let releasePatch: () => void = () => undefined;
+    const patchHeld = new Promise<void>((resolve) => {
+      releasePatch = resolve;
+    });
+    let releaseRun: () => void = () => undefined;
+    const runHeld = new Promise<void>((resolve) => {
+      releaseRun = resolve;
+    });
     let current = options.current ?? revisionTwo;
     let runStatus = options.runStatus ?? 'COMPLETED';
     let creativeStatus = 'changes';
@@ -844,6 +856,11 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
         });
       }
       if (url.endsWith('/creatives/creative-1') && method === 'PATCH') {
+        if (options.holdPatch) await patchHeld;
+        if (options.patchStatus)
+          return statusReply(options.patchStatus, {
+            message: 'Headline is required',
+          });
         current = revisionTwo;
         return statusReply(200, atRevision(current));
       }
@@ -859,13 +876,15 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
           200,
           current.revisionNumber === 2 ? [revisionTwo, revision] : [revision],
         );
-      if (url.endsWith('/creatives/creative-1/workflow'))
+      if (url.endsWith('/creatives/creative-1/workflow')) {
+        if (options.holdRun) await runHeld;
         return statusReply(200, {
           id: 'instance-1',
           status: runStatus,
           workflowId: 'workflow-1',
           creativeRevisionId: 'revision-1',
         });
+      }
       if (url.endsWith('/revisions/1/comments'))
         return statusReply(200, [
           {
@@ -896,14 +915,20 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
       return statusReply(200, []);
     });
     vi.stubGlobal('fetch', fetchMock);
-    return { fetchMock, requests };
+    return {
+      fetchMock,
+      requests,
+      releasePatch: () => releasePatch(),
+      releaseRun: () => releaseRun(),
+    };
   }
 
-  async function openCreative(session = submitter) {
+  async function openCreative(session = submitter, onDataChanged = vi.fn()) {
     render(
       <CreativeWorkspace
         session={{ accessToken: 'token', user: session }}
         branch={branch}
+        onDataChanged={onDataChanged}
         onUnauthorized={vi.fn()}
       />,
     );
@@ -1166,6 +1191,195 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
         /\/(comments|decisions|change-requests|workflow)$/.test(String(url)),
       ),
     ).toBe(false);
+  });
+
+  // Stage 12: one-click resubmission after changes were requested on the
+  // current revision: the existing save, then the existing start.
+  describe('Save and resubmit for review', () => {
+    const oneClick = () =>
+      screen.queryByRole('button', { name: 'Save and resubmit for review' });
+    const writes = (fetchMock: ReturnType<typeof serveReview>['fetchMock']) =>
+      fetchMock.mock.calls
+        .filter(([, init]) =>
+          ['PATCH', 'POST'].includes(
+            (init as RequestInit | undefined)?.method ?? 'GET',
+          ),
+        )
+        .map(([url, init]) => ({
+          method: (init as RequestInit).method,
+          url: String(url).replace(/^.*\/api\/v1/, ''),
+          body: JSON.parse(String((init as RequestInit).body)) as unknown,
+        }));
+    // Changes were requested on revision 1, which is still current.
+    async function openWithRequestOnCurrent(
+      options: Parameters<typeof serveReview>[0] = {},
+      session = submitter,
+    ) {
+      const served = serveReview({ current: revision, ...options });
+      const onDataChanged = vi.fn();
+      await openCreative(session, onDataChanged);
+      await banner();
+      fireEvent.change(
+        await screen.findByRole('textbox', { name: 'Headline' }),
+        { target: { value: 'Bigger logo' } },
+      );
+      return { ...served, onDataChanged };
+    }
+
+    it('saves the new revision, then resubmits that revision with the latest run workflow', async () => {
+      const { fetchMock, requests, onDataChanged } =
+        await openWithRequestOnCurrent();
+      expect(await banner()).toHaveTextContent(
+        'Save and resubmit for review in the form below does both in one step.',
+      );
+      fireEvent.click(oneClick()!);
+      expect(await screen.findByRole('status')).toHaveTextContent(
+        'Revision 2 was saved and resubmitted for review.',
+      );
+      expect(writes(fetchMock)).toEqual([
+        {
+          method: 'PATCH',
+          url: '/creatives/creative-1',
+          body: expect.objectContaining({
+            values: { headline: 'Bigger logo' },
+          }),
+        },
+        {
+          method: 'POST',
+          url: '/creatives/creative-1/workflows',
+          body: { workflowId: 'workflow-1', creativeRevisionId: 'revision-2' },
+        },
+      ]);
+      expect(requests[0]!.status).toBe('RESOLVED');
+      expect(onDataChanged).toHaveBeenCalledWith('creatives');
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('region', { name: 'Open change requests' }),
+        ).not.toBeInTheDocument(),
+      );
+    });
+
+    it('says where the run waits when the workflow starts at a non-review stage', async () => {
+      await openWithRequestOnCurrent({
+        startStage: { key: 'draft', name: 'Draft', requiresReview: false },
+      });
+      fireEvent.click(oneClick()!);
+      expect(await screen.findByRole('status')).toHaveTextContent(
+        'Revision 2 was saved and resubmitted. Its workflow is at the Draft stage; move it on from Workflows to send it to a reviewer.',
+      );
+    });
+
+    it('starts no workflow when the save fails, and keeps the edits', async () => {
+      const { fetchMock, requests } = await openWithRequestOnCurrent({
+        patchStatus: 400,
+      });
+      fireEvent.click(oneClick()!);
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Headline is required',
+      );
+      expect(writes(fetchMock).map((write) => write.method)).toEqual(['PATCH']);
+      expect(requests[0]!.status).toBe('OPEN');
+      expect(screen.getByRole('textbox', { name: 'Headline' })).toHaveValue(
+        'Bigger logo',
+      );
+    });
+
+    it('keeps the saved revision when the start fails, and offers Resubmit for review to retry', async () => {
+      const { fetchMock, requests } = await openWithRequestOnCurrent({
+        startStatus: 404,
+      });
+      fireEvent.click(oneClick()!);
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Revision 2 was saved, but it could not be resubmitted: Enabled workflow not found Use Resubmit for review to try again.',
+      );
+      expect(writes(fetchMock).map((write) => write.method)).toEqual([
+        'PATCH',
+        'POST',
+      ]);
+      expect(requests[0]!.status).toBe('OPEN');
+      // Revision 2 now answers the request on revision 1: the existing
+      // resubmission path takes over.
+      expect(
+        await within(await banner()).findByRole('button', {
+          name: 'Resubmit for review',
+        }),
+      ).toBeInTheDocument();
+      await waitFor(() => expect(oneClick()).not.toBeInTheDocument());
+    });
+
+    it.each(['creatives:update', 'workflows:start', 'workflows:read'])(
+      'is not offered without %s',
+      async (missing) => {
+        await openWithRequestOnCurrent(
+          {},
+          {
+            ...submitter,
+            permissions: submitter.permissions.filter(
+              (permission) => permission !== missing,
+            ),
+          },
+        ).catch(() => undefined);
+        await banner();
+        expect(oneClick()).not.toBeInTheDocument();
+      },
+    );
+
+    it('is not offered when no change request is unresolved', async () => {
+      serveReview({ current: revision, requests: [] });
+      await openCreative();
+      await screen.findByRole('textbox', { name: 'Headline' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(oneClick()).not.toBeInTheDocument();
+    });
+
+    it('is not offered for a request on an older revision, where Resubmit for review applies', async () => {
+      serveReview();
+      await openCreative();
+      expect(
+        await within(await banner()).findByRole('button', {
+          name: 'Resubmit for review',
+        }),
+      ).toBeInTheDocument();
+      expect(oneClick()).not.toBeInTheDocument();
+    });
+
+    it('is not offered while a run is active (the edit lock applies)', async () => {
+      serveReview({ current: revision, runStatus: 'RUNNING' });
+      await openCreative();
+      await screen.findByRole('region', { name: 'Editing locked' });
+      expect(oneClick()).not.toBeInTheDocument();
+    });
+
+    it('is not offered until the run state has loaded', async () => {
+      const { releaseRun } = serveReview({ current: revision, holdRun: true });
+      await openCreative();
+      await banner();
+      expect(oneClick()).not.toBeInTheDocument();
+      releaseRun();
+      expect(
+        await screen.findByRole('button', {
+          name: 'Save and resubmit for review',
+        }),
+      ).toBeEnabled();
+    });
+
+    it('sends one save and one start when clicked twice', async () => {
+      const { fetchMock, releasePatch } = await openWithRequestOnCurrent({
+        holdPatch: true,
+      });
+      fireEvent.click(oneClick()!);
+      fireEvent.click(oneClick()!);
+      expect(oneClick()).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+      releasePatch();
+      expect(await screen.findByRole('status')).toHaveTextContent(
+        'Revision 2 was saved and resubmitted for review.',
+      );
+      expect(writes(fetchMock).map((write) => write.method)).toEqual([
+        'PATCH',
+        'POST',
+      ]);
+    });
   });
 });
 
