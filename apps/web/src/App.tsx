@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react';
 import {
   SESSION_STORAGE_KEY,
   loadStoredSession,
@@ -16,12 +22,20 @@ import CanvaIntegration from './CanvaIntegration';
 import StatusBadge from './StatusBadge';
 import WorkspaceShell, { type WorkspaceModule } from './WorkspaceShell';
 import { useDataChanges } from './dataChanges';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
+import { useNotifications } from './useNotifications';
+import { useRecordLinks, type CreativeFormState } from './useRecordLinks';
 import type {
   AuthenticatedUserResponse,
   BranchResponse,
+  BranchSummary,
   HealthResponse,
   LoginResponse,
 } from '@adflow/shared-types';
+
+// Stable empty lists while signed out.
+const NO_ITEMS: readonly string[] = [];
+const NO_BRANCHES: readonly BranchSummary[] = [];
 
 type ApiStatus =
   | { state: 'checking' }
@@ -81,6 +95,75 @@ export default function App() {
     },
     [],
   );
+  // Notifications are owned here and shared, so only one copy is polled. A
+  // 401 signs out through the same path as every other screen.
+  const notifications = useNotifications({
+    accessToken: session?.accessToken ?? null,
+    dataChange,
+    onUnauthorized: (accessToken) => clearSession(true, accessToken),
+  });
+  const { setScreenOpen: setNotificationsOpen } = notifications;
+  // What the Creatives form holds, so a notification link or the Branch
+  // selector can ask before discarding unsaved edits.
+  const creativeForm = useRef<CreativeFormState>({
+    creativeId: '',
+    dirty: false,
+  });
+  // Sign out pressed while the Creatives form has unsaved changes: signing
+  // out waits for the user to confirm discarding them.
+  const [confirmingSignOut, setConfirmingSignOut] = useState(false);
+  // Set once signing out has started, so a repeated click sends nothing.
+  const signingOut = useRef(false);
+  const reportCreativeForm = useCallback((state: CreativeFormState) => {
+    creativeForm.current = state;
+    // Nothing left to protect (saved or reverted): stop asking.
+    if (!state.dirty) setConfirmingSignOut(false);
+  }, []);
+  // A branch chosen in the Branch selector while the Creatives form has
+  // unsaved changes; switching waits for the user to confirm discarding them.
+  const [pendingBranchId, setPendingBranchId] = useState('');
+  const branchSelectRef = useRef<HTMLSelectElement>(null);
+  const sessionToken = session?.accessToken ?? null;
+  useEffect(() => {
+    setPendingBranchId('');
+    setConfirmingSignOut(false);
+    signingOut.current = false;
+    // The previous session's form is gone. Creatives reports its new form
+    // when it mounts; without Creatives there is nothing to protect.
+    if (!sessionToken) creativeForm.current = { creativeId: '', dirty: false };
+  }, [sessionToken]);
+  const selectBranchForLink = useCallback((branchId: string) => {
+    // A notification link asked (or had nothing to ask) on its own.
+    setPendingBranchId('');
+    setBranchError('');
+    setSelectedBranchId(branchId);
+  }, []);
+  function chooseBranch(branchId: string): void {
+    if (branchId === selectedBranchId) {
+      setPendingBranchId('');
+      return;
+    }
+    // Switching branch resets the Creatives form, so unsaved edits are only
+    // discarded after an explicit confirmation.
+    if (creativeForm.current.dirty) {
+      setPendingBranchId(branchId);
+      return;
+    }
+    setPendingBranchId('');
+    setSelectedBranchId(branchId);
+  }
+  // Following a notification to its record (one pending request at a time).
+  const recordLinks = useRecordLinks({
+    accessToken: session?.accessToken ?? null,
+    permissions: session?.user.permissions ?? NO_ITEMS,
+    branches: session?.user.branches ?? NO_BRANCHES,
+    selectedBranchId,
+    selectBranch: selectBranchForLink,
+    branchError,
+    creativeForm,
+    markRead: notifications.markRead,
+  });
+  const { openRequest, reportOpen } = recordLinks;
 
   useEffect(() => {
     if (!restoringToken) return;
@@ -245,6 +328,23 @@ export default function App() {
     }
   }
 
+  // Sign out from the workspace. Signing out discards the Creatives form, so
+  // unsaved edits are only discarded after an explicit confirmation.
+  function requestSignOut(accessToken: string): void {
+    if (signingOut.current) return;
+    if (creativeForm.current.dirty) {
+      setConfirmingSignOut(true);
+      return;
+    }
+    signOut(accessToken);
+  }
+  function signOut(accessToken: string): void {
+    if (signingOut.current) return;
+    signingOut.current = true;
+    setConfirmingSignOut(false);
+    void logout(accessToken);
+  }
+
   async function logout(accessToken: string): Promise<void> {
     // Clear locally first so a failed or slow revocation never leaves the user signed in.
     clearSession(false, accessToken);
@@ -306,8 +406,9 @@ export default function App() {
             <label htmlFor="branch-select">Select branch</label>
             <select
               id="branch-select"
+              ref={branchSelectRef}
               value={selectedBranchId}
-              onChange={(event) => setSelectedBranchId(event.target.value)}
+              onChange={(event) => chooseBranch(event.target.value)}
             >
               {session.user.branches.map((permittedBranch) => (
                 <option key={permittedBranch.id} value={permittedBranch.id}>
@@ -315,6 +416,46 @@ export default function App() {
                 </option>
               ))}
             </select>
+            {pendingBranchId && (
+              // The selector keeps showing the current branch until the
+              // switch is confirmed.
+              <div
+                className="confirm-panel"
+                role="group"
+                aria-label="Unsaved changes in Creatives"
+              >
+                <p role="alert">
+                  You have unsaved changes in Creatives. Switching to the{' '}
+                  {session.user.branches.find(
+                    (item) => item.id === pendingBranchId,
+                  )?.name ?? 'selected'}{' '}
+                  branch discards them.
+                </p>
+                <div className="template-actions">
+                  <button
+                    type="button"
+                    className="danger-button"
+                    onClick={() => {
+                      const next = pendingBranchId;
+                      setPendingBranchId('');
+                      setSelectedBranchId(next);
+                    }}
+                  >
+                    Discard changes and continue
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      setPendingBranchId('');
+                      branchSelectRef.current?.focus();
+                    }}
+                  >
+                    Keep my changes
+                  </button>
+                </div>
+              </div>
+            )}
             {branch && (
               <div className="branch-summary">
                 <h2 id="branch-title">{branch.name}</h2>
@@ -377,6 +518,11 @@ export default function App() {
             dataChange={dataChange}
             onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
+            openRequest={
+              openRequest?.module === 'creatives' ? openRequest : null
+            }
+            onOpenResult={reportOpen}
+            onFormStateChange={reportCreativeForm}
           />
         ),
       },
@@ -409,6 +555,10 @@ export default function App() {
             dataChange={dataChange}
             onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
+            openRequest={
+              openRequest?.module === 'workflows' ? openRequest : null
+            }
+            onOpenResult={reportOpen}
           />
         ),
       },
@@ -425,6 +575,10 @@ export default function App() {
             dataChange={dataChange}
             onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
+            openRequest={
+              openRequest?.module === 'approvals' ? openRequest : null
+            }
+            onOpenResult={reportOpen}
           />
         ),
       },
@@ -433,7 +587,21 @@ export default function App() {
         label: 'Notifications',
         icon: 'notifications',
         available: true,
-        content: <NotificationsWorkspace session={session} />,
+        // The shared unread count; no badge while the count is unavailable
+        // (its last request failed). Before the first reply the count is 0,
+        // which the shell does not show.
+        badge: notifications.countError
+          ? undefined
+          : {
+              count: notifications.count,
+              description: `${notifications.count} unread`,
+            },
+        content: (
+          <NotificationsWorkspace
+            notifications={notifications}
+            navigation={recordLinks.navigation}
+          />
+        ),
       },
       {
         id: 'audit',
@@ -479,8 +647,44 @@ export default function App() {
         }
         contextLabel={branch?.name}
         userName={session.user.name}
-        onSignOut={() => void logout(session.accessToken)}
+        onSignOut={() => requestSignOut(session.accessToken)}
+        signOutConfirmation={
+          confirmingSignOut ? (
+            <div
+              className="confirm-panel"
+              role="group"
+              aria-label="Unsaved changes in Creatives"
+            >
+              <p role="alert">
+                You have unsaved changes in Creatives. Signing out discards
+                them.
+              </p>
+              <div className="template-actions">
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={() => signOut(session.accessToken)}
+                >
+                  Discard changes and continue
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={(event) => {
+                    returnFocusToConfirmTrigger(event.currentTarget);
+                    setConfirmingSignOut(false);
+                  }}
+                >
+                  Keep my changes
+                </button>
+              </div>
+            </div>
+          ) : null
+        }
         footer={footer}
+        onActiveModuleChange={(moduleId) =>
+          setNotificationsOpen(moduleId === 'notifications')
+        }
       />
     );
   }

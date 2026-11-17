@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { AuthenticatedUserResponse } from '@adflow/shared-types';
 import type { AssetSource } from './assetFiles';
 import { AssetReference } from './AssetImage';
@@ -10,6 +10,7 @@ import {
   type DataChangeSource,
 } from './dataChanges';
 import FeedbackMessage from './FeedbackMessage';
+import type { ReportOpen } from './useRecordLinks';
 import { returnFocusToConfirmTrigger } from './confirmFocus';
 
 const apiBase =
@@ -62,15 +63,25 @@ export default function ApprovalsWorkspace({
   dataChange,
   onDataChanged,
   onUnauthorized,
+  openRequest = null,
+  onOpenResult,
 }: {
   session: Session;
   dataChange?: DataChange;
   onDataChanged?: (source: DataChangeSource) => void;
   onUnauthorized: () => void;
+  // A request (from a notification) to open the user's pending review of
+  // one workflow run.
+  openRequest?: { key: number; workflowInstanceId: string } | null;
+  onOpenResult?: ReportOpen;
 }) {
   const permissions = session.user.permissions;
   const canRead = permissions.includes('approvals:read');
   const canDecide = permissions.includes('approvals:decide');
+  // Requesting changes also creates a change request, which the API allows
+  // only with change_requests:create. The API still checks both.
+  const canRequestChanges =
+    canDecide && permissions.includes('change_requests:create');
   const canReadComments = permissions.includes('comments:read');
   const assetSource: AssetSource = {
     apiBase,
@@ -84,14 +95,29 @@ export default function ApprovalsWorkspace({
   const [feedbackKey, setFeedbackKey] = useState(0);
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [requests, setRequests] = useState<ChangeRequest[]>([]);
-  const [reason, setReason] = useState('');
-  const [explanation, setExplanation] = useState('');
+  // The reviewer picks a decision first; each decision keeps its own text,
+  // so an approval comment can never be sent as requested changes (or the
+  // other way round).
+  const [decisionChoice, setDecisionChoice] = useState<
+    'APPROVED' | 'CHANGES_REQUESTED' | ''
+  >('');
+  const [approveComment, setApproveComment] = useState('');
+  const [requestedChanges, setRequestedChanges] = useState('');
+  const [changesExplanation, setChangesExplanation] = useState('');
+  const [changesMissing, setChangesMissing] = useState(false);
+  // The decision awaiting confirmation before it is sent.
+  const [confirmingDecision, setConfirmingDecision] = useState(false);
+  // Set while a decision is being sent, so a second click before the busy
+  // state renders sends nothing.
+  const decisionInFlight = useRef(false);
+  const requestedChangesRef = useRef<HTMLTextAreaElement>(null);
+  const decisionFieldsId = useId();
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   // The change request awaiting confirmation before it is withdrawn.
   const [confirmingWithdrawId, setConfirmingWithdrawId] = useState('');
-  const requestChangesHintId = useId();
+  const changesErrorId = useId();
   const [loadingTasks, setLoadingTasks] = useState(false);
   const [loadingReview, setLoadingReview] = useState(false);
 
@@ -197,40 +223,113 @@ export default function ApprovalsWorkspace({
     else setReview(null); /* Scoped to selected task. */ // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId, session.accessToken]);
 
-  async function decide(
-    decision: 'APPROVED' | 'CHANGES_REQUESTED',
-  ): Promise<void> {
-    if (!review || (decision === 'CHANGES_REQUESTED' && !reason.trim())) return;
+  // A notification asked to open a review: reload the user's pending review
+  // tasks, find the one for that workflow run and open it exactly as its
+  // Review button does. Only the pending list is searched, so a review that
+  // was decided or reassigned is reported as not found. A newer request
+  // replaces an older one still loading.
+  const latestOpen = useRef(0);
+  useEffect(() => {
+    if (!openRequest || latestOpen.current === openRequest.key) return;
+    const { key, workflowInstanceId } = openRequest;
+    latestOpen.current = key;
+    void loadTasks().then((loaded) => {
+      if (latestOpen.current !== key) return;
+      if (!loaded) {
+        onOpenResult?.(key, 'unavailable');
+        return;
+      }
+      const task = loaded.find(
+        (item) => item.instance.id === workflowInstanceId,
+      );
+      if (!task) {
+        onOpenResult?.(key, 'not-found');
+        return;
+      }
+      setConfirmingWithdrawId('');
+      if (task.id !== taskId) resetDecisionForm();
+      setTaskId(task.id);
+      onOpenResult?.(key, 'opened');
+    });
+    // Runs once per request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openRequest]);
+
+  // Clears the decision form, for example after a decision was recorded or
+  // when another review is opened, so no text carries over.
+  function resetDecisionForm(): void {
+    setDecisionChoice('');
+    setApproveComment('');
+    setRequestedChanges('');
+    setChangesExplanation('');
+    setChangesMissing(false);
+    setConfirmingDecision(false);
+  }
+
+  function chooseDecision(choice: 'APPROVED' | 'CHANGES_REQUESTED'): void {
+    setDecisionChoice(choice);
+    setChangesMissing(false);
+    // A confirmation always shows the decision it will send.
+    setConfirmingDecision(false);
+  }
+
+  // "Review decision": checks the required text, then opens the
+  // confirmation. Nothing is sent yet.
+  function reviewDecision(): void {
+    if (!decisionChoice) return;
+    if (decisionChoice === 'CHANGES_REQUESTED' && !requestedChanges.trim()) {
+      setChangesMissing(true);
+      requestedChangesRef.current?.focus();
+      return;
+    }
+    setConfirmingDecision(true);
+  }
+
+  // What the API receives: the request shape is unchanged. An approval sends
+  // only its optional comment as `reason`; a change request sends what needs
+  // to change as `reason` and its optional `explanation`.
+  function decisionBody(): Record<string, string> {
+    if (decisionChoice === 'APPROVED') {
+      const comment = approveComment.trim();
+      return { decision: 'APPROVED', ...(comment ? { reason: comment } : {}) };
+    }
+    const explanation = changesExplanation.trim();
+    return {
+      decision: 'CHANGES_REQUESTED',
+      reason: requestedChanges.trim(),
+      ...(explanation ? { explanation } : {}),
+    };
+  }
+
+  async function sendDecision(): Promise<void> {
+    if (!review || !decisionChoice || decisionInFlight.current) return;
+    if (decisionChoice === 'CHANGES_REQUESTED' && !requestedChanges.trim())
+      return;
+    const decision = decisionChoice;
+    decisionInFlight.current = true;
     setBusy(true);
     setError('');
     setMessage('');
     try {
       await request(
         `/approvals/tasks/${encodeURIComponent(review.task.id)}/decision`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            decision,
-            ...(reason.trim() ? { reason: reason.trim() } : {}),
-            ...(decision === 'CHANGES_REQUESTED' && explanation.trim()
-              ? { explanation: explanation.trim() }
-              : {}),
-          }),
-        },
+        { method: 'POST', body: JSON.stringify(decisionBody()) },
       );
       setMessage(
         decision === 'APPROVED' ? 'Review approved.' : 'Changes requested.',
       );
-      setReason('');
-      setExplanation('');
+      resetDecisionForm();
       onDataChanged?.('approvals');
       await loadTasks();
       await loadDetail(review.task.id);
     } catch (cause) {
+      // The confirmation stays open with the entered text, so the decision
+      // can be sent again or edited.
       setError(
         cause instanceof Error ? cause.message : 'Unable to record decision.',
       );
     } finally {
+      decisionInFlight.current = false;
       setBusy(false);
     }
   }
@@ -326,9 +425,11 @@ export default function ApprovalsWorkspace({
                     <button
                       type="button"
                       onClick={() => {
-                        // A withdrawal confirmed for one review must not
-                        // carry over to the next. Focus stays on this button.
+                        // A withdrawal or decision prepared for one review
+                        // must not carry over to the next. Focus stays on
+                        // this button.
                         setConfirmingWithdrawId('');
+                        if (task.id !== taskId) resetDecisionForm();
                         setTaskId(task.id);
                       }}
                     >
@@ -389,50 +490,202 @@ export default function ApprovalsWorkspace({
               review.current &&
               !review.submittedByViewer &&
               review.task.status === 'OPEN' && (
-                <div className="template-preview">
-                  <label htmlFor="review-reason">
-                    Decision reason or requested changes
-                  </label>
-                  <textarea
-                    id="review-reason"
-                    value={reason}
-                    onChange={(event) => setReason(event.target.value)}
-                    maxLength={5000}
-                  />
-                  <label htmlFor="review-explanation">
-                    Optional explanation
-                  </label>
-                  <textarea
-                    id="review-explanation"
-                    value={explanation}
-                    onChange={(event) => setExplanation(event.target.value)}
-                    maxLength={5000}
-                  />
+                <div className="template-preview decision-form">
+                  <fieldset className="decision-choice" disabled={busy}>
+                    <legend>Your decision</legend>
+                    <label className="checkbox-label">
+                      <input
+                        type="radio"
+                        name={decisionFieldsId + '-decision'}
+                        value="APPROVED"
+                        checked={decisionChoice === 'APPROVED'}
+                        onChange={() => chooseDecision('APPROVED')}
+                      />
+                      Approve
+                    </label>
+                    {canRequestChanges && (
+                      <label className="checkbox-label">
+                        <input
+                          type="radio"
+                          name={decisionFieldsId + '-decision'}
+                          value="CHANGES_REQUESTED"
+                          checked={decisionChoice === 'CHANGES_REQUESTED'}
+                          onChange={() => chooseDecision('CHANGES_REQUESTED')}
+                        />
+                        Request changes
+                      </label>
+                    )}
+                  </fieldset>
+                  {!canRequestChanges && (
+                    <p className="field-hint">
+                      You can approve this revision. Requesting changes needs
+                      permission to create change requests.
+                    </p>
+                  )}
+                  {decisionChoice === 'APPROVED' && (
+                    <>
+                      <label>
+                        <span>
+                          Comment
+                          <span className="field-hint"> (optional)</span>
+                        </span>
+                        <textarea
+                          value={approveComment}
+                          onChange={(event) =>
+                            setApproveComment(event.target.value)
+                          }
+                          maxLength={5000}
+                          disabled={busy}
+                          aria-describedby={decisionFieldsId + '-comment-help'}
+                        />
+                      </label>
+                      {/* Outside the label, so it describes the field
+                          without becoming part of its name. */}
+                      <small id={decisionFieldsId + '-comment-help'}>
+                        Saved with your decision. To discuss the creative with
+                        others, use Comments below.
+                      </small>
+                    </>
+                  )}
+                  {decisionChoice === 'CHANGES_REQUESTED' && (
+                    <>
+                      <label>
+                        <span>
+                          What needs to change
+                          <span className="field-hint"> (required)</span>
+                        </span>
+                        <textarea
+                          ref={requestedChangesRef}
+                          value={requestedChanges}
+                          onChange={(event) => {
+                            setRequestedChanges(event.target.value);
+                            if (event.target.value.trim())
+                              setChangesMissing(false);
+                          }}
+                          maxLength={5000}
+                          disabled={busy}
+                          aria-required="true"
+                          aria-invalid={changesMissing || undefined}
+                          aria-describedby={
+                            changesMissing ? changesErrorId : undefined
+                          }
+                        />
+                      </label>
+                      {changesMissing && (
+                        <small id={changesErrorId} className="field-error">
+                          Describe what needs to change before requesting
+                          changes.
+                        </small>
+                      )}
+                      <label>
+                        <span>
+                          Explanation
+                          <span className="field-hint"> (optional)</span>
+                        </span>
+                        <textarea
+                          value={changesExplanation}
+                          onChange={(event) =>
+                            setChangesExplanation(event.target.value)
+                          }
+                          maxLength={5000}
+                          disabled={busy}
+                        />
+                      </label>
+                    </>
+                  )}
                   <div className="template-actions">
                     <button
                       type="button"
-                      disabled={busy}
-                      onClick={() => void decide('APPROVED')}
-                    >
-                      Approve
-                    </button>
-                    <button
-                      type="button"
-                      className="warning-button"
-                      disabled={busy || !reason.trim()}
+                      disabled={busy || !decisionChoice}
+                      aria-expanded={confirmingDecision}
                       aria-describedby={
-                        reason.trim() ? undefined : requestChangesHintId
+                        decisionChoice
+                          ? undefined
+                          : decisionFieldsId + '-choose-hint'
                       }
-                      onClick={() => void decide('CHANGES_REQUESTED')}
+                      onClick={reviewDecision}
                     >
-                      Request changes
+                      Review decision
                     </button>
                   </div>
-                  {!reason.trim() && (
-                    <p id={requestChangesHintId} className="field-hint">
-                      To request changes, first describe what needs to change
-                      under &ldquo;Decision reason or requested changes&rdquo;.
+                  {!decisionChoice && (
+                    <p
+                      id={decisionFieldsId + '-choose-hint'}
+                      className="field-hint"
+                    >
+                      Choose a decision to continue.
                     </p>
+                  )}
+                  {confirmingDecision && decisionChoice && (
+                    <div
+                      className="confirm-panel"
+                      role="group"
+                      aria-label={
+                        (decisionChoice === 'APPROVED'
+                          ? 'Confirm approving revision '
+                          : 'Confirm requesting changes to revision ') +
+                        review.revision.revisionNumber
+                      }
+                    >
+                      {decisionChoice === 'APPROVED' ? (
+                        <p>
+                          Approve revision {review.revision.revisionNumber} of “
+                          {review.creative.name}”? Your decision is final and
+                          moves the creative on in its workflow.
+                        </p>
+                      ) : (
+                        <p>
+                          Request changes to revision{' '}
+                          {review.revision.revisionNumber} of “
+                          {review.creative.name}”? Your decision is final. A
+                          change request is opened, and whoever submitted the
+                          creative is asked to save a new revision.
+                        </p>
+                      )}
+                      <dl className="decision-summary">
+                        {decisionChoice === 'APPROVED' ? (
+                          <>
+                            <dt>Comment</dt>
+                            <dd>{approveComment.trim() || 'No comment'}</dd>
+                          </>
+                        ) : (
+                          <>
+                            <dt>What needs to change</dt>
+                            <dd>{requestedChanges.trim()}</dd>
+                            <dt>Explanation</dt>
+                            <dd>{changesExplanation.trim() || 'None'}</dd>
+                          </>
+                        )}
+                      </dl>
+                      <div className="template-actions">
+                        <button
+                          type="button"
+                          className={
+                            decisionChoice === 'APPROVED'
+                              ? undefined
+                              : 'warning-button'
+                          }
+                          disabled={busy}
+                          onClick={() => void sendDecision()}
+                        >
+                          {decisionChoice === 'APPROVED'
+                            ? 'Approve revision '
+                            : 'Request changes to revision '}
+                          {review.revision.revisionNumber}
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={busy}
+                          onClick={(event) => {
+                            returnFocusToConfirmTrigger(event.currentTarget);
+                            setConfirmingDecision(false);
+                          }}
+                        >
+                          Back to edit
+                        </button>
+                      </div>
+                    </div>
                   )}
                 </div>
               )}

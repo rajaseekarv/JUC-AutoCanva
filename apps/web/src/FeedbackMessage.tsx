@@ -29,21 +29,45 @@ function onScreen(element: HTMLElement): boolean {
 // mean focus was lost. It was lost only when the element that last had focus
 // has since been removed, for example a confirm button that disappeared with
 // its confirmation. Tracking starts when this module loads, before any
-// action, and is shared by every message.
+// action, and is shared by every message. The element focused before it is
+// kept too (see focusWasLost).
 let lastFocused: Element | null = null;
+let previousFocused: Element | null = null;
 if (typeof document !== 'undefined')
   document.addEventListener(
     'focusin',
     (event) => {
+      previousFocused = lastFocused;
       lastFocused = event.target instanceof Element ? event.target : null;
     },
     true,
   );
 
-function focusWasLost(): boolean {
+// A container around the message that only scripts can focus (tabindex="-1"),
+// such as the screen's own module, and that is not itself a control.
+function isOwningContainer(node: Element, message: HTMLElement): boolean {
+  return (
+    node !== message &&
+    node.getAttribute('tabindex') === '-1' &&
+    node.contains(message) &&
+    !node.matches('a, button, input, select, textarea, summary, [role]')
+  );
+}
+
+// Whether focus has nowhere meaningful to be, so the new message may take it.
+function focusWasLost(message: HTMLElement): boolean {
   const active = document.activeElement;
-  if (active && active !== document.body) return false;
-  return lastFocused !== null && !lastFocused.isConnected;
+  if (!active || active === document.body)
+    return lastFocused !== null && !lastFocused.isConnected;
+  // A click on a button that was disabled meanwhile (for example a second
+  // click on a confirm button while it is being sent) moves focus to the
+  // nearest focusable container: the screen itself. That is not a control
+  // either, so focus counts as lost when the control focused just before it
+  // has since disappeared. Focus that reached the container any other way,
+  // while that control is still on the page, is left alone.
+  if (active === lastFocused && isOwningContainer(active, message))
+    return previousFocused !== null && !previousFocused.isConnected;
+  return false;
 }
 
 // A screen's success or error message. It keeps the live-region role, so it
@@ -75,7 +99,7 @@ export default function FeedbackMessage({
     // button with it, and focus falls back to the page. Once that update has
     // rendered, give focus to the result instead.
     const frame = requestAnimationFrame(() => {
-      if (element.isConnected && focusWasLost())
+      if (element.isConnected && focusWasLost(element))
         element.focus({ preventScroll: true });
     });
     return () => cancelAnimationFrame(frame);

@@ -147,6 +147,126 @@ describe('FeedbackMessage', () => {
     expect(document.activeElement).toBe(document.body);
   });
 
+  // Phase 2B: a second click on a confirm button while it is disabled (it is
+  // being sent) moves focus to the screen's own container, #module-approvals
+  // (tabindex="-1"). When the confirmation then closes, that is lost focus.
+  describe('when focus rests on the screen container', () => {
+    function screenWith(children: JSX.Element) {
+      return (
+        <main className="app-main">
+          <div
+            id="module-approvals"
+            className="workspace-module"
+            data-module="approvals"
+            tabIndex={-1}
+          >
+            {children}
+          </div>
+        </main>
+      );
+    }
+    const container = () =>
+      document.getElementById('module-approvals') as HTMLElement;
+
+    it('gives a visible message focus once the confirm button has gone', async () => {
+      placeAt(100);
+      HTMLElement.prototype.scrollIntoView = vi.fn();
+      const view = render(
+        screenWith(
+          <>
+            <button type="button">Request changes to revision 3</button>
+            <FeedbackMessage tone="success" message="" />
+          </>,
+        ),
+      );
+      // The confirm button had focus; the extra click on it while disabled
+      // moved focus to the container.
+      screen
+        .getByRole('button', { name: 'Request changes to revision 3' })
+        .focus();
+      container().focus();
+      expect(container()).toHaveFocus();
+      view.rerender(
+        screenWith(
+          <FeedbackMessage tone="success" message="Changes requested." />,
+        ),
+      );
+      await waitFor(() => expect(screen.getByRole('status')).toHaveFocus());
+      expect(HTMLElement.prototype.scrollIntoView).not.toHaveBeenCalled();
+    });
+
+    it('leaves focus on the container while the control before it is still there', async () => {
+      placeAt(100);
+      HTMLElement.prototype.scrollIntoView = vi.fn();
+      const view = render(
+        screenWith(
+          <>
+            <input aria-label="Comment" />
+            <FeedbackMessage tone="success" message="" />
+          </>,
+        ),
+      );
+      // For example a Safari click: focus reached the container, but nothing
+      // the user was working with has disappeared.
+      screen.getByRole('textbox', { name: 'Comment' }).focus();
+      container().focus();
+      view.rerender(
+        screenWith(
+          <>
+            <input aria-label="Comment" />
+            <FeedbackMessage tone="success" message="Saved." />
+          </>,
+        ),
+      );
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      expect(container()).toHaveFocus();
+      expect(screen.getByRole('status')).not.toHaveFocus();
+    });
+
+    it('never takes focus from another control the user moved to', async () => {
+      placeAt(100);
+      HTMLElement.prototype.scrollIntoView = vi.fn();
+      const view = render(
+        screenWith(
+          <>
+            <button key="confirm" type="button">
+              Request changes to revision 3
+            </button>
+            <button key="refresh" type="button">
+              Refresh
+            </button>
+            <FeedbackMessage key="message" tone="success" message="" />
+          </>,
+        ),
+      );
+      screen
+        .getByRole('button', { name: 'Request changes to revision 3' })
+        .focus();
+      container().focus();
+      // While the decision was being sent, the user moved on to Refresh.
+      screen.getByRole('button', { name: 'Refresh' }).focus();
+      view.rerender(
+        screenWith(
+          <>
+            <button key="refresh" type="button">
+              Refresh
+            </button>
+            <FeedbackMessage
+              key="message"
+              tone="success"
+              message="Changes requested."
+            />
+          </>,
+        ),
+      );
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      expect(screen.getByRole('button', { name: 'Refresh' })).toHaveFocus();
+      expect(screen.getByRole('status')).not.toHaveFocus();
+    });
+  });
+
   it('reveals the message again for each new action', () => {
     placeAt(-600);
     const scrollIntoView = vi.fn();

@@ -13,6 +13,7 @@ import {
 import { statusLabel } from './statusDisplay';
 import { approvalSummaryText } from './approvalText';
 import FeedbackMessage from './FeedbackMessage';
+import type { ReportOpen } from './useRecordLinks';
 import { returnFocusToConfirmTrigger } from './confirmFocus';
 
 const apiBase =
@@ -140,12 +141,17 @@ export default function WorkflowWorkspace({
   dataChange,
   onDataChanged,
   onUnauthorized,
+  openRequest = null,
+  onOpenResult,
 }: {
   session: Session;
   branch: BranchResponse | null;
   dataChange?: DataChange;
   onDataChanged?: (source: DataChangeSource) => void;
   onUnauthorized: () => void;
+  // A request (from a notification) to select one creative of a branch.
+  openRequest?: { key: number; branchId: string; creativeId: string } | null;
+  onOpenResult?: ReportOpen;
 }) {
   // Bumped to reload the selected creative's run after another screen
   // changed it.
@@ -171,8 +177,17 @@ export default function WorkflowWorkspace({
   const [cancelReason, setCancelReason] = useState('');
   const [cancelError, setCancelError] = useState('');
   const cancelInFlight = useRef(false);
+  // True only while a cancellation is being sent (not for other actions).
+  const [cancelling, setCancelling] = useState(false);
   const cancelReasonId = useId();
+  const cancelReasonRef = useRef<HTMLTextAreaElement>(null);
+  // Opening the cancellation moves focus to its reason.
+  useEffect(() => {
+    if (cancelOpen) cancelReasonRef.current?.focus();
+  }, [cancelOpen]);
   const startBlockedId = useId();
+  const startHintId = useId();
+  const transitionHintId = useId();
   const [confirmingDisable, setConfirmingDisable] = useState(false);
   const instanceId = instance?.id;
   useEffect(() => {
@@ -212,7 +227,20 @@ export default function WorkflowWorkspace({
     return (text ? JSON.parse(text) : null) as T;
   }
 
+  // Only the latest reload may apply its results, so a slower reply for a
+  // previous branch cannot replace the current branch's creatives.
+  const loadSequence = useRef(0);
+  // The branch whose creatives the picker holds once its latest load
+  // finished, and whether that load succeeded; null while loading.
+  const [loadedBranch, setLoadedBranch] = useState<{
+    branchId: string;
+    ok: boolean;
+  } | null>(null);
+
   async function reload(): Promise<void> {
+    const sequence = ++loadSequence.current;
+    const branchId = branch?.id ?? null;
+    setLoadedBranch(null);
     try {
       const [definitions, branchCreatives] = await Promise.all([
         canRead ? request<Workflow[]>('/workflows') : Promise.resolve([]),
@@ -223,19 +251,28 @@ export default function WorkflowWorkspace({
             )
           : Promise.resolve([]),
       ]);
+      if (sequence !== loadSequence.current) return;
       setWorkflows(definitions);
       setCreatives(branchCreatives);
       if (workflowId && !definitions.some((item) => item.id === workflowId))
         setWorkflowId('');
       setError('');
+      if (branchId) setLoadedBranch({ branchId, ok: true });
     } catch (cause) {
+      if (sequence !== loadSequence.current) return;
       setError(
         cause instanceof Error ? cause.message : 'Unable to load workflows.',
       );
+      if (branchId) setLoadedBranch({ branchId, ok: false });
     }
   }
 
   useEffect(() => {
+    // A creative belongs to one branch: a new branch (or session) starts with
+    // none chosen, so the previous branch's creative and its run are never
+    // shown under it. A notification link selects its creative once this
+    // branch's creatives have loaded.
+    setCreativeId('');
     void reload(); /* Reload is scoped to user and selected branch. */ // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.accessToken, branch?.id]);
   useEffect(() => {
@@ -332,24 +369,75 @@ export default function WorkflowWorkspace({
     currentRevisionNumber !== undefined &&
     unresolvedRevisions.includes(currentRevisionNumber);
 
+  // The selected creative's latest run. It is only ever shown for the
+  // creative it belongs to: choosing another creative clears it at once, a
+  // reply for a creative no longer selected is ignored, and a failed load
+  // clears it instead of leaving an outdated run (and its actions) on screen.
+  // Reloading the same creative keeps its run visible until the reply.
+  const [runState, setRunState] = useState<
+    'idle' | 'loading' | 'loaded' | 'failed'
+  >('idle');
+  const runCreative = useRef('');
+  // The creative selected now, for replies to actions started earlier.
+  const selectedCreativeRef = useRef(creativeId);
+  selectedCreativeRef.current = creativeId;
   useEffect(() => {
     if (!creativeId) {
+      runCreative.current = '';
       setInstance(null);
+      setRunState('idle');
       return;
     }
+    if (runCreative.current !== creativeId) {
+      runCreative.current = creativeId;
+      setInstance(null);
+    }
+    setRunState('loading');
+    let cancelled = false;
     void request<Instance | null>(
       `/creatives/${encodeURIComponent(creativeId)}/workflow`,
     )
-      .then(setInstance)
-      .catch((cause: unknown) =>
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : 'Unable to load workflow state.',
-        ),
-      );
+      .then((run) => {
+        if (cancelled) return;
+        setInstance(run);
+        setRunState('loaded');
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setInstance(null);
+        setRunState('failed');
+      });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [creativeId, session.accessToken, instanceKey]);
+
+  // A notification asked to open a creative: once this branch's creatives
+  // have loaded, select it in the picker and report the outcome. Each
+  // request is answered once.
+  const answeredOpen = useRef(0);
+  useEffect(() => {
+    if (!openRequest || answeredOpen.current === openRequest.key) return;
+    if (!branch || branch.id !== openRequest.branchId) return;
+    if (!loadedBranch || loadedBranch.branchId !== branch.id) return;
+    answeredOpen.current = openRequest.key;
+    if (!loadedBranch.ok) {
+      onOpenResult?.(openRequest.key, 'unavailable');
+      return;
+    }
+    if (!creatives.some((item) => item.id === openRequest.creativeId)) {
+      onOpenResult?.(openRequest.key, 'not-found');
+      return;
+    }
+    if (creativeId !== openRequest.creativeId) {
+      setMessage('');
+      setCreativeId(openRequest.creativeId);
+    }
+    onOpenResult?.(openRequest.key, 'opened');
+    // Runs when the request or the loaded data changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openRequest, branch?.id, loadedBranch, creatives]);
 
   // Another screen changed review data: refresh the creative picker and the
   // selected creative's run. Definitions and selections are kept.
@@ -451,6 +539,7 @@ export default function WorkflowWorkspace({
 
   async function startWorkflow(): Promise<void> {
     if (!creativeId || !selected) return;
+    const forCreative = creativeId;
     setBusy(true);
     setError('');
     setMessage('');
@@ -459,8 +548,12 @@ export default function WorkflowWorkspace({
         `/creatives/${encodeURIComponent(creativeId)}/workflows`,
         { method: 'POST', body: JSON.stringify({ workflowId: selected.id }) },
       );
-      setInstance(started);
-      setMessage('Workflow started against the selected creative revision.');
+      // Another creative was chosen meanwhile: its own run loads instead.
+      if (selectedCreativeRef.current === forCreative) {
+        setInstance(started);
+        setRunState('loaded');
+        setMessage('Workflow started against the selected creative revision.');
+      }
       await reload();
       onDataChanged?.('workflows');
     } catch (cause) {
@@ -497,7 +590,9 @@ export default function WorkflowWorkspace({
       );
       return;
     }
+    const forCreative = creativeId;
     cancelInFlight.current = true;
+    setCancelling(true);
     setBusy(true);
     setCancelError('');
     setError('');
@@ -507,12 +602,15 @@ export default function WorkflowWorkspace({
         `/workflow-instances/${encodeURIComponent(instance.id)}/cancel`,
         { method: 'POST', body: JSON.stringify({ reason }) },
       );
-      setInstance(cancelled);
-      setCancelOpen(false);
-      setCancelReason('');
-      setMessage(
-        'Run cancelled. The creative can be revised and submitted again.',
-      );
+      if (selectedCreativeRef.current === forCreative) {
+        setInstance(cancelled);
+        setRunState('loaded');
+        setCancelOpen(false);
+        setCancelReason('');
+        setMessage(
+          'Run cancelled. The creative can be revised and submitted again.',
+        );
+      }
       await reload();
       onDataChanged?.('workflows');
     } catch (cause) {
@@ -524,12 +622,14 @@ export default function WorkflowWorkspace({
       setInstanceKey((key) => key + 1);
     } finally {
       cancelInFlight.current = false;
+      setCancelling(false);
       setBusy(false);
     }
   }
 
   async function transition(key: string): Promise<void> {
     if (!instance) return;
+    const forCreative = creativeId;
     setBusy(true);
     setError('');
     setMessage('');
@@ -538,8 +638,11 @@ export default function WorkflowWorkspace({
         `/workflow-instances/${encodeURIComponent(instance.id)}/transitions`,
         { method: 'POST', body: JSON.stringify({ transitionKey: key }) },
       );
-      setInstance(changed);
-      setMessage('Workflow moved to ' + changed.currentStage.name + '.');
+      if (selectedCreativeRef.current === forCreative) {
+        setInstance(changed);
+        setRunState('loaded');
+        setMessage('Workflow moved to ' + changed.currentStage.name + '.');
+      }
       await reload();
       onDataChanged?.('workflows');
     } catch (cause) {
@@ -608,6 +711,58 @@ export default function WorkflowWorkspace({
       (item) => item.key === actionKey,
     );
     return transition?.label ?? statusLabel(actionKey);
+  }
+  const canOpenApprovals = session.user.permissions.includes('approvals:read');
+  const enabledWorkflows = workflows.filter(
+    (item) => item.status === 'ENABLED',
+  );
+  const needsWorkflowChoice = !selected || selected.status !== 'ENABLED';
+  // The run's status in words: what it is waiting for, or how it ended and
+  // when (from its history).
+  const cancelRow = instance?.history.find(
+    (item) => item.actionKey === 'CANCEL',
+  );
+  const lastStep = instance?.history[instance.history.length - 1];
+  const when = (iso: string | undefined) =>
+    iso ? ' on ' + new Date(iso).toLocaleString() : '';
+  const runSummary = !instance
+    ? ''
+    : instance.status === 'RUNNING'
+      ? instance.currentStage.requiresReview
+        ? "Waiting for a reviewer's decision."
+        : `In progress at the ${instance.currentStage.name} stage.`
+      : instance.status === 'COMPLETED'
+        ? `Finished at the ${instance.currentStage.name} stage${when(lastStep?.createdAt)}.`
+        : instance.status === 'CANCELLED'
+          ? `Cancelled at the ${instance.currentStage.name} stage${when(cancelRow?.createdAt ?? lastStep?.createdAt)}.`
+          : `Status: ${statusLabel(instance.status)}.`;
+  // Why the user cannot take a transition, in words (no permission codes).
+  function transitionBlockReason(item: Transition): string {
+    if (!instance) return '';
+    const destination = instance.version.stages.find(
+      (stage) => stage.id === item.destinationStageId,
+    );
+    const missing = [
+      instance.currentStage.requiredPermission,
+      item.requiredPermission,
+      destination?.requiredPermission,
+    ].find(
+      (permission) =>
+        permission && !session.user.permissions.includes(permission),
+    );
+    if (missing)
+      return "You can't take this step: it is for " + waitingFor(missing) + '.';
+    const stage = instance.currentStage;
+    if (
+      stage.assignedPermission &&
+      !session.user.permissions.includes(stage.assignedPermission)
+    )
+      return (
+        "You can't take this step: it is for " +
+        waitingFor(stage.assignedPermission) +
+        '.'
+      );
+    return "You can't take this step: it is assigned to someone else.";
   }
   return (
     <section
@@ -739,7 +894,21 @@ export default function WorkflowWorkspace({
         )}
         <section className="admin-card">
           <h3>Branch creative state</h3>
-          {branch ? (
+          {!branch ? (
+            <p>Select a branch to view its creatives.</p>
+          ) : loadedBranch?.ok && !creatives.length ? (
+            <p className="empty-state">
+              No creatives in this branch yet.{' '}
+              {session.user.permissions.includes('creatives:read') ? (
+                <>
+                  Create one in <a href="#creatives">Creatives</a>, then send it
+                  for review here.
+                </>
+              ) : (
+                'Once one is created it can be sent for review here.'
+              )}
+            </p>
+          ) : (
             <label>
               Creative
               <select
@@ -761,145 +930,177 @@ export default function WorkflowWorkspace({
                 ))}
               </select>
             </label>
-          ) : (
-            <p>Select a branch to view its creatives.</p>
+          )}
+          {/* The selected creative's run: loading, failed, none yet, or the
+              run itself. Nothing from another creative's run is shown. */}
+          {creativeId && runState === 'failed' && (
+            <div className="run-load-error">
+              <FeedbackMessage
+                tone="error"
+                message="We couldn't load this creative's workflow, so nothing about it is shown. Please try again."
+              />
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setInstanceKey((key) => key + 1)}
+              >
+                Try again
+              </button>
+            </div>
+          )}
+          {creativeId && !instance && runState === 'loading' && (
+            <p className="empty-state" role="status">
+              Loading this creative&apos;s workflow…
+            </p>
+          )}
+          {creativeId && !instance && runState === 'loaded' && (
+            <p className="empty-state">
+              No workflow has been started for this creative yet.
+            </p>
           )}
           {/* Only one run may be active per creative; after a run completes
               (for example with changes requested) a new run can start
-              against the creative's latest revision. */}
-          {creativeId && instance?.status !== 'RUNNING' && canStart && (
-            <>
-              <label>
-                Enabled workflow
-                <select
-                  aria-label="Workflow to start"
-                  value={workflowId}
-                  onChange={(event) => {
-                    setWorkflowId(event.target.value);
-                    setConfirmingDisable(false);
-                  }}
-                >
-                  <option value="">Choose workflow</option>
-                  {workflows
-                    .filter((item) => item.status === 'ENABLED')
-                    .map((item) => (
+              against the creative's latest revision. Start is offered only
+              once the creative's run is known. */}
+          {creativeId &&
+            (instance !== null || runState === 'loaded') &&
+            instance?.status !== 'RUNNING' &&
+            canStart &&
+            (loadedBranch?.ok && !enabledWorkflows.length ? (
+              <p className="empty-state">
+                {canRead
+                  ? 'No workflow is enabled yet. A workflow manager needs to enable one before this creative can be sent for review.'
+                  : "You can't see the organization's workflows, so a workflow can't be started here. Ask a workflow manager for access."}
+              </p>
+            ) : (
+              <>
+                <label>
+                  Enabled workflow
+                  <select
+                    aria-label="Workflow to start"
+                    value={workflowId}
+                    onChange={(event) => {
+                      setWorkflowId(event.target.value);
+                      setConfirmingDisable(false);
+                    }}
+                  >
+                    <option value="">Choose workflow</option>
+                    {enabledWorkflows.map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.name}
                       </option>
                     ))}
-                </select>
-              </label>
-              {startBlockedByRequests && (
-                <p className="empty-state" id={startBlockedId}>
-                  Revision {currentRevisionNumber} has unresolved change
-                  requests. Save a new revision with the requested changes in
-                  Creatives before resubmitting it for review.
-                </p>
-              )}
-              <button
-                disabled={
-                  busy ||
-                  !selected ||
-                  selected.status !== 'ENABLED' ||
-                  startBlockedByRequests
-                }
-                aria-describedby={
-                  startBlockedByRequests ? startBlockedId : undefined
-                }
-                onClick={() => void startWorkflow()}
-              >
-                Start workflow
-              </button>
-            </>
-          )}
+                  </select>
+                </label>
+                {startBlockedByRequests && (
+                  <p className="empty-state" id={startBlockedId}>
+                    Revision {currentRevisionNumber} has unresolved change
+                    requests. Save a new revision with the requested changes in
+                    Creatives before resubmitting it for review.
+                  </p>
+                )}
+                {needsWorkflowChoice && (
+                  <p className="field-hint" id={startHintId}>
+                    Choose an enabled workflow to start.
+                  </p>
+                )}
+                <button
+                  disabled={
+                    busy || needsWorkflowChoice || startBlockedByRequests
+                  }
+                  aria-describedby={
+                    [
+                      startBlockedByRequests ? startBlockedId : '',
+                      needsWorkflowChoice ? startHintId : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ') || undefined
+                  }
+                  onClick={() => void startWorkflow()}
+                >
+                  Start workflow
+                </button>
+              </>
+            ))}
           {instance && (
             <>
               <h4>
                 {instance.currentStage.name} ·{' '}
                 <StatusBadge status={instance.status} />
               </h4>
-              <p>{runRevisionText}</p>
-              <p>
-                Waiting for:{' '}
-                {openTasks
-                  .map(
-                    (task) =>
-                      task.stage.name +
-                      (task.requiredPermission
-                        ? ' (' + waitingFor(task.requiredPermission) + ')'
-                        : ''),
-                  )
-                  .join(', ') || 'nobody right now'}
-              </p>
-              {canTransition &&
-                !instance.currentStage.requiresReview &&
-                outgoing.map((item) => (
-                  <button
-                    key={item.id}
-                    disabled={busy || !canTakeTransition(item)}
-                    onClick={() => void transition(item.key)}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-              {canCancel &&
-                (cancelOpen ? (
-                  <div
-                    className="template-preview"
-                    role="group"
-                    aria-label="Cancel run"
-                  >
-                    <label htmlFor={cancelReasonId}>
-                      Reason for cancelling (required)
-                    </label>
-                    <textarea
-                      id={cancelReasonId}
-                      value={cancelReason}
-                      maxLength={CANCEL_REASON_MAX_LENGTH}
-                      aria-invalid={cancelError ? true : undefined}
-                      onChange={(event) => {
-                        setCancelReason(event.target.value);
-                        setCancelError('');
-                      }}
-                    />
-                    <p className="empty-state">
-                      Cancelling ends this run at the{' '}
-                      {instance.currentStage.name} stage. Its decisions, change
-                      requests and history are kept, open tasks close, and the
-                      creative can be revised again.
-                    </p>
-                    {cancelError && (
-                      <p role="alert" className="form-message">
-                        {cancelError}
-                      </p>
+              <div className="run-summary">
+                <p>
+                  {runSummary}
+                  {instance.status === 'RUNNING' &&
+                    instance.currentStage.requiresReview &&
+                    canOpenApprovals && (
+                      <>
+                        {' '}
+                        Reviewers record it in{' '}
+                        <a href="#approvals">Approvals</a>.
+                      </>
                     )}
-                    <div className="template-actions">
-                      <button
-                        type="button"
-                        className="warning-button"
-                        disabled={busy}
-                        onClick={() => void cancelRun()}
-                      >
-                        {busy ? 'Cancelling…' : 'Confirm cancellation'}
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => {
-                          setCancelOpen(false);
-                          setCancelReason('');
-                          setCancelError('');
-                        }}
-                      >
-                        Keep running
-                      </button>
+                </p>
+                {instance.status === 'CANCELLED' && cancelRow?.reason && (
+                  <p>Reason: {cancelRow.reason}</p>
+                )}
+              </div>
+              <p>{runRevisionText}</p>
+              {instance.status === 'RUNNING' && (
+                <p>
+                  Waiting for:{' '}
+                  {openTasks
+                    .map(
+                      (task) =>
+                        task.stage.name +
+                        (task.requiredPermission
+                          ? ' (' + waitingFor(task.requiredPermission) + ')'
+                          : ''),
+                    )
+                    .join(', ') || 'nobody right now'}
+                </p>
+              )}
+              {canTransition &&
+                instance.status === 'RUNNING' &&
+                !instance.currentStage.requiresReview &&
+                outgoing.length > 0 && (
+                  <div className="run-actions">
+                    <div className="button-row">
+                      {outgoing.map((item) => (
+                        <button
+                          key={item.id}
+                          disabled={busy || !canTakeTransition(item)}
+                          aria-describedby={
+                            canTakeTransition(item)
+                              ? undefined
+                              : `${transitionHintId}-${item.id}`
+                          }
+                          onClick={() => void transition(item.key)}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
                     </div>
+                    {outgoing
+                      .filter((item) => !canTakeTransition(item))
+                      .map((item) => (
+                        <p
+                          key={item.id}
+                          className="field-hint"
+                          id={`${transitionHintId}-${item.id}`}
+                        >
+                          {item.label}: {transitionBlockReason(item)}
+                        </p>
+                      ))}
                   </div>
-                ) : (
+                )}
+              {canCancel && (
+                <div className="run-cancel">
                   <button
                     type="button"
                     className="warning-button"
                     disabled={busy}
+                    aria-expanded={cancelOpen}
                     onClick={() => {
                       setCancelOpen(true);
                       setCancelError('');
@@ -907,7 +1108,64 @@ export default function WorkflowWorkspace({
                   >
                     Cancel run
                   </button>
-                ))}
+                  {cancelOpen && (
+                    <div
+                      className="confirm-panel"
+                      role="group"
+                      aria-label="Cancel run"
+                    >
+                      <p>
+                        Cancelling ends this run at the{' '}
+                        {instance.currentStage.name} stage. Its decisions,
+                        change requests and history are kept, open tasks close,
+                        and the creative can be revised again.
+                      </p>
+                      <label htmlFor={cancelReasonId}>
+                        Reason for cancelling (required)
+                      </label>
+                      <textarea
+                        id={cancelReasonId}
+                        ref={cancelReasonRef}
+                        value={cancelReason}
+                        maxLength={CANCEL_REASON_MAX_LENGTH}
+                        aria-invalid={cancelError ? true : undefined}
+                        onChange={(event) => {
+                          setCancelReason(event.target.value);
+                          setCancelError('');
+                        }}
+                      />
+                      {cancelError && (
+                        <p role="alert" className="form-message">
+                          {cancelError}
+                        </p>
+                      )}
+                      <div className="template-actions">
+                        <button
+                          type="button"
+                          className="warning-button"
+                          disabled={busy}
+                          onClick={() => void cancelRun()}
+                        >
+                          {cancelling ? 'Cancelling…' : 'Confirm cancellation'}
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={busy}
+                          onClick={(event) => {
+                            returnFocusToConfirmTrigger(event.currentTarget);
+                            setCancelOpen(false);
+                            setCancelReason('');
+                            setCancelError('');
+                          }}
+                        >
+                          Keep running
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
               <h4>Transition history</h4>
               {instance.history.length ? (
                 <ol>

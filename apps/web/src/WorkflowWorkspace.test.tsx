@@ -809,8 +809,11 @@ describe('WorkflowWorkspace Phase 2A', () => {
     ...user,
     permissions: [...user.permissions, 'workflows:manage'],
   };
+  // Running at Ready with an open task (Phase 2B: only a running run says
+  // what it is waiting for).
   const reviewRun = {
     ...completed,
+    status: 'RUNNING',
     tasks: [
       {
         id: 'task-2',
@@ -993,5 +996,593 @@ describe('WorkflowWorkspace Phase 2A', () => {
     );
     expect(await screen.findByText('Workflow disabled.')).toBeInTheDocument();
     expect(disableCalls()).toHaveLength(1);
+  });
+});
+
+// Phase 2B step 6: the run shown always belongs to the selected creative,
+// its status is described in words with permission-aware actions, missing
+// data has empty, loading and error states, and cancelling follows the
+// shared confirmation pattern.
+describe('WorkflowWorkspace Phase 2B step 6', () => {
+  const second = { ...creative, id: 'creative-2', name: 'Summer post' };
+  const managerUser: AuthenticatedUserResponse = {
+    ...user,
+    id: 'manager-1',
+    permissions: [
+      'workflows:read',
+      'workflows:start',
+      'workflows:transition',
+      'workflows:manage',
+      'creatives:read',
+    ],
+  };
+  const reviewStage = {
+    ...stages[1],
+    id: 'stage-review',
+    key: 'review',
+    name: 'Review',
+    isTerminal: false,
+    requiresReview: true,
+  };
+  const atReview = {
+    ...running,
+    currentStage: reviewStage,
+    tasks: [
+      {
+        id: 'task-r',
+        status: 'OPEN',
+        stage: reviewStage,
+        requiredPermission: 'approvals:decide',
+      },
+    ],
+  };
+  const cancelled = {
+    ...running,
+    status: 'CANCELLED',
+    tasks: [],
+    history: [
+      ...running.history,
+      {
+        id: 'history-cancel',
+        actionKey: 'CANCEL',
+        reason: 'Reviewer is away',
+        createdAt: '2026-10-22T11:00:00Z',
+        fromStage: stages[0],
+        toStage: stages[0],
+      },
+    ],
+  };
+  type Reply = { status: number; body: unknown };
+
+  // A stubbed API. Run replies come from `runs` (per creative), can be held
+  // until released, or fail.
+  function serve(
+    options: {
+      runs?: Record<string, unknown>;
+      creatives?: unknown[];
+      workflows?: unknown[];
+      hold?: string[];
+      fail?: string[];
+      holdPaths?: string[];
+    } = {},
+  ) {
+    const runs: Record<string, unknown> = {
+      'creative-1': running,
+      'creative-2': null,
+      ...options.runs,
+    };
+    const hold = new Set(options.hold ?? []);
+    const fail = new Set(options.fail ?? []);
+    const heldPaths = new Set(options.holdPaths ?? []);
+    const waiting = new Map<string, (() => void)[]>();
+    const reply = ({ status, body }: Reply) =>
+      status === 200
+        ? okReply(body)
+        : {
+            ok: false,
+            status,
+            json: async () => ({ message: 'Server error' }),
+            text: async () => JSON.stringify({ message: 'Server error' }),
+          };
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const run = /\/creatives\/([^/]+)\/workflow$/.exec(url);
+      if (run) {
+        const id = run[1]!;
+        if (hold.has(id))
+          await new Promise<void>((resolve) =>
+            waiting.set(id, [...(waiting.get(id) ?? []), resolve]),
+          );
+        if (fail.has(id)) return reply({ status: 500, body: null });
+        return reply({ status: 200, body: runs[id] ?? null });
+      }
+      const path = new URL(url).pathname;
+      const heldPath = (options.holdPaths ?? []).find((held) =>
+        path.endsWith(held),
+      );
+      if (heldPath && heldPaths.has(heldPath))
+        await new Promise<void>((resolve) =>
+          waiting.set(heldPath, [...(waiting.get(heldPath) ?? []), resolve]),
+        );
+      if (url.endsWith('/creatives/creative-1/workflows') && init?.method)
+        return reply({ status: 200, body: running });
+      if (url.endsWith('/workflow-instances/instance-1/transitions'))
+        return reply({ status: 200, body: completed });
+      if (url.endsWith('/workflows'))
+        return reply({ status: 200, body: options.workflows ?? [workflow] });
+      if (url.includes('/creatives?branchId='))
+        return reply({
+          status: 200,
+          body: options.creatives ?? [creative, second],
+        });
+      return reply({ status: 200, body: [] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return {
+      fetchMock,
+      runs,
+      hold,
+      fail,
+      release(key: string) {
+        hold.delete(key);
+        heldPaths.delete(key);
+        for (const resolve of waiting.get(key) ?? []) resolve();
+        waiting.delete(key);
+      },
+      runCalls: (id: string) =>
+        fetchMock.mock.calls.filter(([url]) =>
+          String(url).endsWith(`/creatives/${id}/workflow`),
+        ).length,
+    };
+  }
+  function show(sessionUser: AuthenticatedUserResponse = managerUser) {
+    render(
+      <WorkflowWorkspace
+        session={{ accessToken: 'token', user: sessionUser }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+  }
+  async function choose(id: string) {
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Branch creative' }),
+      { target: { value: id } },
+    );
+  }
+  const loading = () => screen.queryByText("Loading this creative's workflow…");
+  const noRun = () =>
+    screen.queryByText('No workflow has been started for this creative yet.');
+  const runHeading = () =>
+    screen.queryByRole('heading', { level: 4, name: / · / });
+  const button = (name: string | RegExp) =>
+    screen.queryByRole('button', { name });
+
+  describe('the run always belongs to the selected creative', () => {
+    it("clears the previous creative's run and its actions while the next one loads", async () => {
+      const api = serve({ hold: ['creative-2'] });
+      show();
+      await choose('creative-1');
+      expect(
+        await screen.findByRole('heading', { level: 4, name: / · / }),
+      ).toHaveTextContent('Draft');
+      expect(button('Cancel run')).toBeInTheDocument();
+      expect(button('Submit')).toBeInTheDocument();
+
+      await choose('creative-2');
+      // At once: nothing of creative-1's run, and no action for it.
+      expect(runHeading()).toBeNull();
+      expect(button('Cancel run')).toBeNull();
+      expect(button('Submit')).toBeNull();
+      expect(button('Start workflow')).toBeNull();
+      expect(screen.queryByText(/This run is for/)).toBeNull();
+      expect(screen.queryByText(/^Waiting for/)).toBeNull();
+      expect(loading()).toBeInTheDocument();
+
+      api.release('creative-2');
+      expect(
+        await screen.findByText(
+          'No workflow has been started for this creative yet.',
+        ),
+      ).toBeInTheDocument();
+      expect(loading()).toBeNull();
+      expect(button('Start workflow')).toBeInTheDocument();
+    });
+
+    it('ignores a slower reply for a creative that is no longer selected', async () => {
+      const api = serve({
+        runs: { 'creative-2': completed },
+        hold: ['creative-1', 'creative-2'],
+      });
+      show();
+      await choose('creative-1');
+      await choose('creative-2');
+      api.release('creative-2');
+      expect(
+        await screen.findByText(/^Finished at the Ready stage/),
+      ).toBeInTheDocument();
+      // creative-1's running run arrives last and is ignored.
+      api.release('creative-1');
+      await waitFor(() => expect(api.runCalls('creative-1')).toBe(1));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(
+        screen.getByText(/^Finished at the Ready stage/),
+      ).toBeInTheDocument();
+      expect(button('Cancel run')).toBeNull();
+      expect(runHeading()).toHaveTextContent('Ready');
+    });
+
+    it('shows a failed load inline with nothing about the run, and Try again reloads only the run', async () => {
+      const api = serve({ fail: ['creative-1'] });
+      show();
+      await choose('creative-1');
+      expect(
+        await screen.findByText(
+          "We couldn't load this creative's workflow, so nothing about it is shown. Please try again.",
+        ),
+      ).toHaveAttribute('role', 'alert');
+      expect(runHeading()).toBeNull();
+      expect(button('Cancel run')).toBeNull();
+      expect(button('Start workflow')).toBeNull();
+      expect(noRun()).toBeNull();
+      const workflowListCalls = () =>
+        api.fetchMock.mock.calls.filter(([url]) =>
+          String(url).endsWith('/workflows'),
+        ).length;
+      const listsBefore = workflowListCalls();
+      api.fail.delete('creative-1');
+      fireEvent.click(button('Try again')!);
+      expect(
+        await screen.findByRole('heading', { level: 4, name: / · / }),
+      ).toHaveTextContent('Draft');
+      expect(api.runCalls('creative-1')).toBe(2);
+      expect(workflowListCalls()).toBe(listsBefore);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('clears a shown run when reloading it fails, instead of leaving it on screen', async () => {
+      const api = serve();
+      show();
+      await choose('creative-1');
+      await screen.findByRole('heading', { level: 4, name: / · / });
+      // A failed cancellation reloads the run; that reload fails too.
+      api.fetchMock.mockImplementation((async (url: string) => {
+        if (url.endsWith('/cancel'))
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({ message: 'Workflow is not running' }),
+            text: async () => '',
+          };
+        if (url.endsWith('/creatives/creative-1/workflow'))
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({}),
+            text: async () => '',
+          };
+        return okReply([]);
+      }) as never);
+      fireEvent.click(button('Cancel run')!);
+      fireEvent.change(
+        screen.getByRole('textbox', {
+          name: 'Reason for cancelling (required)',
+        }),
+        { target: { value: 'Stuck' } },
+      );
+      fireEvent.click(button('Confirm cancellation')!);
+      expect(
+        await screen.findByText(/We couldn't load this creative's workflow/),
+      ).toBeInTheDocument();
+      expect(runHeading()).toBeNull();
+      expect(button('Cancel run')).toBeNull();
+    });
+
+    it('does not attach a started run to a creative chosen while starting', async () => {
+      const api = serve({
+        runs: { 'creative-1': null },
+        holdPaths: ['/creatives/creative-1/workflows'],
+      });
+      show();
+      await choose('creative-1');
+      fireEvent.change(
+        await screen.findByRole('combobox', { name: 'Workflow to start' }),
+        { target: { value: 'workflow-1' } },
+      );
+      fireEvent.click(button('Start workflow')!);
+      await choose('creative-2');
+      await screen.findByText(
+        'No workflow has been started for this creative yet.',
+      );
+      api.release('/creatives/creative-1/workflows');
+      await waitFor(() =>
+        expect(
+          api.fetchMock.mock.calls.filter(
+            ([url, init]) =>
+              String(url).endsWith('/creatives/creative-1/workflows') &&
+              (init as RequestInit | undefined)?.method === 'POST',
+          ),
+        ).toHaveLength(1),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(noRun()).toBeInTheDocument();
+      expect(runHeading()).toBeNull();
+      expect(
+        screen.queryByText(
+          'Workflow started against the selected creative revision.',
+        ),
+      ).toBeNull();
+    });
+
+    it('clears the creative and its run when the branch changes', async () => {
+      serve();
+      const view = render(
+        <WorkflowWorkspace
+          session={{ accessToken: 'token', user: managerUser }}
+          branch={branch}
+          onUnauthorized={vi.fn()}
+        />,
+      );
+      await choose('creative-1');
+      await screen.findByRole('heading', { level: 4, name: / · / });
+      expect(button('Cancel run')).toBeInTheDocument();
+      view.rerender(
+        <WorkflowWorkspace
+          session={{ accessToken: 'token', user: managerUser }}
+          branch={{ ...branch, id: 'branch-2', name: 'South' }}
+          onUnauthorized={vi.fn()}
+        />,
+      );
+      // At once, before the new branch's creatives arrive.
+      expect(runHeading()).toBeNull();
+      expect(button('Cancel run')).toBeNull();
+      expect(button('Submit')).toBeNull();
+      expect(
+        await screen.findByRole('combobox', { name: 'Branch creative' }),
+      ).toHaveValue('');
+      expect(runHeading()).toBeNull();
+    });
+
+    it('does not offer Start until the run is known', async () => {
+      const api = serve({ runs: { 'creative-1': null }, hold: ['creative-1'] });
+      show();
+      await choose('creative-1');
+      expect(loading()).toBeInTheDocument();
+      expect(button('Start workflow')).toBeNull();
+      api.release('creative-1');
+      expect(
+        await screen.findByRole('button', { name: 'Start workflow' }),
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe('status in words and permission-aware actions', () => {
+    it('says a review stage waits for a reviewer and links to Approvals', async () => {
+      serve({ runs: { 'creative-1': atReview } });
+      show({
+        ...managerUser,
+        permissions: [...managerUser.permissions, 'approvals:read'],
+      });
+      await choose('creative-1');
+      const summary = await screen.findByText(
+        /^Waiting for a reviewer's decision\./,
+      );
+      expect(summary).toHaveTextContent(
+        "Waiting for a reviewer's decision. Reviewers record it in Approvals.",
+      );
+      expect(
+        within(summary).getByRole('link', { name: 'Approvals' }),
+      ).toHaveAttribute('href', '#approvals');
+      // Decisions are made in Approvals, not with transition buttons here.
+      expect(button('Submit')).toBeNull();
+    });
+
+    it('does not link to Approvals without permission to open it', async () => {
+      serve({ runs: { 'creative-1': atReview } });
+      show();
+      await choose('creative-1');
+      const summary = await screen.findByText(
+        /^Waiting for a reviewer's decision\./,
+      );
+      expect(within(summary).queryByRole('link')).toBeNull();
+    });
+
+    it('describes a run in progress, a finished run and a cancelled run', async () => {
+      const api = serve({
+        runs: { 'creative-1': running, 'creative-2': completed },
+      });
+      show();
+      await choose('creative-1');
+      expect(
+        await screen.findByText('In progress at the Draft stage.'),
+      ).toBeInTheDocument();
+      expect(screen.getByText(/^Waiting for:/)).toBeInTheDocument();
+
+      await choose('creative-2');
+      expect(
+        await screen.findByText(
+          `Finished at the Ready stage on ${new Date('2026-10-22T10:05:00Z').toLocaleString()}.`,
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/^Waiting for/)).toBeNull();
+      expect(button('Cancel run')).toBeNull();
+
+      api.runs['creative-2'] = cancelled;
+      await choose('creative-1');
+      await screen.findByText('In progress at the Draft stage.');
+      await choose('creative-2');
+      expect(
+        await screen.findByText(
+          `Cancelled at the Draft stage on ${new Date('2026-10-22T11:00:00Z').toLocaleString()}.`,
+        ),
+      ).toBeInTheDocument();
+      expect(screen.getByText('Reason: Reviewer is away')).toBeInTheDocument();
+      // A cancelled run offers no transitions, even from a stage that has them.
+      expect(button('Submit')).toBeNull();
+      expect(screen.queryByText(/^Waiting for/)).toBeNull();
+    });
+
+    it('explains, without permission codes, why a transition cannot be taken', async () => {
+      const guarded = {
+        ...running,
+        version: {
+          ...running.version,
+          transitions: [
+            {
+              ...running.version.transitions[0]!,
+              requiredPermission: 'workflows:manage',
+            },
+          ],
+        },
+      };
+      serve({ runs: { 'creative-1': guarded } });
+      show(user);
+      await choose('creative-1');
+      const submit = await screen.findByRole('button', { name: 'Submit' });
+      expect(submit).toBeDisabled();
+      expect(submit).toHaveAccessibleDescription(
+        "Submit: You can't take this step: it is for a workflow manager.",
+      );
+      expect(screen.queryByText(/workflows:manage/)).toBeNull();
+    });
+
+    it('explains a step assigned to someone else, and leaves allowed steps undescribed', async () => {
+      const assigned = {
+        ...running,
+        currentStage: { ...stages[0], assignedUserId: 'someone-else' },
+      };
+      const api = serve({ runs: { 'creative-1': assigned } });
+      show(user);
+      await choose('creative-1');
+      const submit = await screen.findByRole('button', { name: 'Submit' });
+      expect(submit).toHaveAccessibleDescription(
+        "Submit: You can't take this step: it is assigned to someone else.",
+      );
+      api.runs['creative-2'] = running;
+      await choose('creative-2');
+      const allowed = await screen.findByRole('button', { name: 'Submit' });
+      expect(allowed).toBeEnabled();
+      expect(allowed).not.toHaveAttribute('aria-describedby');
+    });
+  });
+
+  describe('empty states', () => {
+    it('says the branch has no creatives yet and points to Creatives', async () => {
+      serve({ creatives: [] });
+      show();
+      const empty = await screen.findByText(
+        /^No creatives in this branch yet\./,
+      );
+      expect(
+        within(empty).getByRole('link', { name: 'Creatives' }),
+      ).toHaveAttribute('href', '#creatives');
+      expect(
+        screen.queryByRole('combobox', { name: 'Branch creative' }),
+      ).toBeNull();
+    });
+
+    it('says when no workflow is enabled, instead of an empty choice', async () => {
+      serve({
+        runs: { 'creative-1': null },
+        workflows: [{ ...workflow, status: 'DISABLED' }],
+      });
+      show();
+      await choose('creative-1');
+      expect(
+        await screen.findByText(
+          'No workflow is enabled yet. A workflow manager needs to enable one before this creative can be sent for review.',
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole('combobox', { name: 'Workflow to start' }),
+      ).toBeNull();
+      expect(button('Start workflow')).toBeNull();
+    });
+
+    it('explains that starting needs permission to see workflows', async () => {
+      serve({ runs: { 'creative-1': null } });
+      show({ ...user, permissions: ['workflows:start', 'creatives:read'] });
+      await choose('creative-1');
+      expect(
+        await screen.findByText(/You can't see the organization's workflows/),
+      ).toBeInTheDocument();
+    });
+
+    it('says why Start is disabled until an enabled workflow is chosen', async () => {
+      serve({ runs: { 'creative-1': null } });
+      show();
+      await choose('creative-1');
+      const start = await screen.findByRole('button', {
+        name: 'Start workflow',
+      });
+      expect(start).toBeDisabled();
+      expect(start).toHaveAccessibleDescription(
+        'Choose an enabled workflow to start.',
+      );
+      fireEvent.change(
+        screen.getByRole('combobox', { name: 'Workflow to start' }),
+        {
+          target: { value: 'workflow-1' },
+        },
+      );
+      expect(start).toBeEnabled();
+      expect(start).not.toHaveAttribute('aria-describedby');
+    });
+
+    it('says a creative has no run yet, also to users who cannot start one', async () => {
+      serve({ runs: { 'creative-1': null } });
+      show({ ...user, permissions: ['workflows:read', 'creatives:read'] });
+      await choose('creative-1');
+      expect(
+        await screen.findByText(
+          'No workflow has been started for this creative yet.',
+        ),
+      ).toBeInTheDocument();
+      expect(button('Start workflow')).toBeNull();
+    });
+  });
+
+  describe('cancellation confirmation', () => {
+    it('moves focus into the confirmation and back to Cancel run on Keep running', async () => {
+      serve();
+      show();
+      await choose('creative-1');
+      const cancel = await screen.findByRole('button', { name: 'Cancel run' });
+      expect(cancel).toHaveAttribute('aria-expanded', 'false');
+      fireEvent.click(cancel);
+      const panel = screen.getByRole('group', { name: 'Cancel run' });
+      expect(panel).toHaveClass('confirm-panel');
+      expect(cancel).toHaveAttribute('aria-expanded', 'true');
+      const reason = within(panel).getByRole('textbox', {
+        name: 'Reason for cancelling (required)',
+      });
+      await waitFor(() => expect(reason).toHaveFocus());
+      // The trigger stays in place while the confirmation is open.
+      expect(screen.getByRole('button', { name: 'Cancel run' })).toBe(cancel);
+      fireEvent.click(
+        within(panel).getByRole('button', { name: 'Keep running' }),
+      );
+      expect(screen.queryByRole('group', { name: 'Cancel run' })).toBeNull();
+      expect(cancel).toHaveFocus();
+      expect(cancel).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('says Cancelling… only while a cancellation is sent, not during other actions', async () => {
+      const api = serve({
+        holdPaths: ['/workflow-instances/instance-1/transitions'],
+      });
+      show();
+      await choose('creative-1');
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'Cancel run' }),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Submit' }));
+      const confirm = screen.getByRole('button', {
+        name: /Confirm cancellation|Cancelling…/,
+      });
+      expect(confirm).toBeDisabled();
+      expect(confirm).toHaveTextContent('Confirm cancellation');
+      api.release('/workflow-instances/instance-1/transitions');
+      await screen.findByText(/^Finished at the Ready stage/);
+    });
   });
 });

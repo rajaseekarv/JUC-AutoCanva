@@ -25,6 +25,8 @@ import {
 } from './dataChanges';
 import ApprovalSummary from './ApprovalSummary';
 import FeedbackMessage from './FeedbackMessage';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
+import type { CreativeFormState, ReportOpen } from './useRecordLinks';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -53,6 +55,22 @@ type AssetOption = {
   branchId: string | null;
 };
 
+// Template values compared as saved: empty values (null, undefined or '')
+// count as absent, and key order does not matter.
+function comparableValues(values: Record<string, unknown>): string {
+  return JSON.stringify(
+    Object.keys(values)
+      .filter(
+        (key) =>
+          values[key] !== null &&
+          values[key] !== undefined &&
+          values[key] !== '',
+      )
+      .sort()
+      .map((key) => [key, values[key]]),
+  );
+}
+
 export default function CreativeWorkspace({
   session,
   branch,
@@ -60,6 +78,9 @@ export default function CreativeWorkspace({
   dataChange,
   onDataChanged,
   onUnauthorized,
+  openRequest = null,
+  onOpenResult,
+  onFormStateChange,
 }: {
   session: Session;
   branch: BranchResponse | null;
@@ -67,6 +88,11 @@ export default function CreativeWorkspace({
   dataChange?: DataChange;
   onDataChanged?: (source: DataChangeSource) => void;
   onUnauthorized: () => void;
+  // A request (from a notification) to select one creative of a branch.
+  openRequest?: { key: number; branchId: string; creativeId: string } | null;
+  onOpenResult?: ReportOpen;
+  // Told which creative the form holds and whether it has unsaved edits.
+  onFormStateChange?: (state: CreativeFormState) => void;
 }) {
   const canRead = session.user.permissions.includes('creatives:read');
   const canCreate = session.user.permissions.includes('creatives:create');
@@ -119,6 +145,12 @@ export default function CreativeWorkspace({
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const loadSequence = useRef(0);
+  // The branch whose creatives the list holds once its latest load finished,
+  // and whether that load succeeded; null while loading.
+  const [loadedBranch, setLoadedBranch] = useState<{
+    branchId: string;
+    ok: boolean;
+  } | null>(null);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const selected =
@@ -203,6 +235,7 @@ export default function CreativeWorkspace({
     // A slower response for a previous branch or session must not overwrite
     // the current branch's data; only the latest reload may apply results.
     const sequence = ++loadSequence.current;
+    setLoadedBranch(null);
     if (!canRead || !branch) {
       setCreatives([]);
       setTemplates([]);
@@ -237,11 +270,13 @@ export default function CreativeWorkspace({
       );
       setAssets(assetList);
       setError('');
+      setLoadedBranch({ branchId: branch.id, ok: true });
     } catch (cause) {
       if (sequence !== loadSequence.current) return;
       setError(
         cause instanceof Error ? cause.message : 'Unable to load creatives.',
       );
+      setLoadedBranch({ branchId: branch.id, ok: false });
     } finally {
       if (sequence === loadSequence.current) setLoading(false);
     }
@@ -414,6 +449,7 @@ export default function CreativeWorkspace({
 
   function chooseCreative(id: string): void {
     const creative = creatives.find((item) => item.id === id);
+    setPendingOpen(null);
     setSelectedId(id);
     setInspectedRevision(null);
     setSummary('');
@@ -431,6 +467,86 @@ export default function CreativeWorkspace({
     setValues(creative.currentRevision?.values ?? {});
     setTemplateVersionId(creative.currentRevision?.templateVersionId ?? '');
   }
+
+  // Whether the form holds edits that are not saved: for an open creative,
+  // anything that differs from its current revision; for a new one, any
+  // input at all. A form the user cannot edit is never dirty.
+  const formDirty = (() => {
+    if (!canRead) return false;
+    if (summary.trim()) return true;
+    if (!selected) return canCreate && (!!name.trim() || !!selectedTemplateId);
+    if (!canUpdate) return false;
+    const revision = selected.currentRevision;
+    if (name !== selected.name) return true;
+    if (!revision) return Object.keys(values).length > 0;
+    if (templateVersionId && templateVersionId !== revision.templateVersionId)
+      return true;
+    return comparableValues(values) !== comparableValues(revision.values);
+  })();
+  const formStateChange = useRef(onFormStateChange);
+  formStateChange.current = onFormStateChange;
+  useEffect(() => {
+    formStateChange.current?.({ creativeId: selectedId, dirty: formDirty });
+  }, [selectedId, formDirty]);
+
+  // The creative ('' for a new one) chosen with Open or New creative while
+  // the form had unsaved changes: it opens only once the user confirms
+  // discarding them. Null when nothing is waiting.
+  const [pendingOpen, setPendingOpen] = useState<string | null>(null);
+  // Nothing left to protect (saved, reverted, or reset): stop asking.
+  useEffect(() => {
+    if (!formDirty) setPendingOpen(null);
+  }, [formDirty]);
+  function requestCreative(id: string): void {
+    if (!formDirty) {
+      chooseCreative(id);
+      return;
+    }
+    // The form already holds this creative (or the new one): keep editing.
+    if (id === selectedId) {
+      setPendingOpen(null);
+      return;
+    }
+    setPendingOpen(id);
+  }
+  // Leaving the page (reload, tab close, another site) with unsaved changes
+  // gets the browser's own confirmation.
+  useEffect(() => {
+    if (!formDirty) return;
+    function onBeforeUnload(event: BeforeUnloadEvent): void {
+      event.preventDefault();
+      // Older browsers show the prompt only when returnValue is set.
+      event.returnValue = '';
+    }
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [formDirty]);
+
+  // A notification asked to open a creative: once this branch's creatives
+  // have loaded, select it (keeping the form when it is already open) and
+  // report the outcome. Each request is answered once.
+  const answeredOpen = useRef(0);
+  useEffect(() => {
+    if (!openRequest || answeredOpen.current === openRequest.key) return;
+    if (!branch || branch.id !== openRequest.branchId) return;
+    if (!loadedBranch || loadedBranch.branchId !== branch.id) return;
+    answeredOpen.current = openRequest.key;
+    if (!loadedBranch.ok) {
+      onOpenResult?.(openRequest.key, 'unavailable');
+      return;
+    }
+    if (!creatives.some((item) => item.id === openRequest.creativeId)) {
+      onOpenResult?.(openRequest.key, 'not-found');
+      return;
+    }
+    if (selectedId !== openRequest.creativeId) {
+      setMessage('');
+      chooseCreative(openRequest.creativeId);
+    }
+    onOpenResult?.(openRequest.key, 'opened');
+    // Runs when the request or the loaded data changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openRequest, branch?.id, loadedBranch, creatives]);
 
   // Whether the form may be written now. Defense in depth: the server
   // re-checks branch access, but the UI never writes to a creative from a
@@ -841,7 +957,12 @@ export default function CreativeWorkspace({
             ) : creatives.length ? (
               <ul className="admin-list">
                 {creatives.map((creative) => (
-                  <li key={creative.id}>
+                  <li
+                    key={creative.id}
+                    className={
+                      pendingOpen === creative.id ? 'has-confirm' : undefined
+                    }
+                  >
                     <div>
                       <strong>{creative.name}</strong>
                       <span>
@@ -852,10 +973,26 @@ export default function CreativeWorkspace({
                     </div>
                     <button
                       className="secondary-button"
-                      onClick={() => chooseCreative(creative.id)}
+                      aria-expanded={
+                        pendingOpen === creative.id ? true : undefined
+                      }
+                      onClick={() => requestCreative(creative.id)}
                     >
                       Open
                     </button>
+                    {pendingOpen === creative.id && (
+                      <DiscardEditsPanel
+                        message={
+                          'You have unsaved changes to ' +
+                          (selected ? selected.name : 'the new creative') +
+                          '. Opening ' +
+                          creative.name +
+                          ' discards them.'
+                        }
+                        onDiscard={() => chooseCreative(creative.id)}
+                        onKeep={() => setPendingOpen(null)}
+                      />
+                    )}
                   </li>
                 ))}
               </ul>
@@ -866,7 +1003,25 @@ export default function CreativeWorkspace({
               </p>
             )}
             {canCreate && (
-              <button onClick={() => chooseCreative('')}>New creative</button>
+              <div className="new-creative-action">
+                <button
+                  aria-expanded={pendingOpen === '' ? true : undefined}
+                  onClick={() => requestCreative('')}
+                >
+                  New creative
+                </button>
+                {pendingOpen === '' && (
+                  <DiscardEditsPanel
+                    message={
+                      'You have unsaved changes to ' +
+                      (selected ? selected.name : 'the new creative') +
+                      '. Starting a new creative discards them.'
+                    }
+                    onDiscard={() => chooseCreative('')}
+                    onKeep={() => setPendingOpen(null)}
+                  />
+                )}
+              </div>
             )}
           </section>
           {formShown && (
@@ -1229,5 +1384,42 @@ function ChangeRequestBanner({
         </p>
       )}
     </section>
+  );
+}
+
+// Asks before an action in the creatives list replaces unsaved form edits.
+// Keep returns focus to the button that asked (see confirmFocus).
+function DiscardEditsPanel({
+  message,
+  onDiscard,
+  onKeep,
+}: {
+  message: string;
+  onDiscard: () => void;
+  onKeep: () => void;
+}) {
+  return (
+    <div
+      className="confirm-panel"
+      role="group"
+      aria-label="Unsaved changes in Creatives"
+    >
+      <p role="alert">{message}</p>
+      <div className="template-actions">
+        <button type="button" className="danger-button" onClick={onDiscard}>
+          Discard changes and continue
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={(event) => {
+            returnFocusToConfirmTrigger(event.currentTarget);
+            onKeep();
+          }}
+        >
+          Keep my changes
+        </button>
+      </div>
+    </div>
   );
 }

@@ -44,6 +44,8 @@ const user: AuthenticatedUserResponse = {
     'approvals:read',
     'approvals:decide',
     'change_requests:read',
+    // Requesting changes creates a change request; the API requires this.
+    'change_requests:create',
   ],
   branches: [{ id: 'branch-1', name: 'North', code: 'NORTH' }],
 };
@@ -459,8 +461,18 @@ describe('cross-screen refresh', () => {
       within(approvalsScreen()).getByRole('button', { name: 'Review' }),
     );
     fireEvent.click(
-      await within(approvalsScreen()).findByRole('button', {
+      await within(approvalsScreen()).findByRole('radio', {
         name: 'Approve',
+      }),
+    );
+    fireEvent.click(
+      within(approvalsScreen()).getByRole('button', {
+        name: 'Review decision',
+      }),
+    );
+    fireEvent.click(
+      within(approvalsScreen()).getByRole('button', {
+        name: /^Approve revision \d+$/,
       }),
     );
     await waitFor(() =>
@@ -610,15 +622,25 @@ describe('cross-screen refresh', () => {
     fireEvent.click(
       await within(approvalsScreen()).findByRole('button', { name: 'Review' }),
     );
+    fireEvent.click(
+      await within(approvalsScreen()).findByRole('radio', {
+        name: 'Request changes',
+      }),
+    );
     fireEvent.change(
-      await within(approvalsScreen()).findByLabelText(
-        'Decision reason or requested changes',
+      within(approvalsScreen()).getByLabelText(
+        'What needs to change (required)',
       ),
       { target: { value: 'Bigger logo' } },
     );
     fireEvent.click(
       within(approvalsScreen()).getByRole('button', {
-        name: 'Request changes',
+        name: 'Review decision',
+      }),
+    );
+    fireEvent.click(
+      within(approvalsScreen()).getByRole('button', {
+        name: /^Request changes to revision \d+$/,
       }),
     );
     await waitFor(() =>

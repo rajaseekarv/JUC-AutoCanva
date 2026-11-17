@@ -1,18 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import type { AuthenticatedUserResponse } from '@adflow/shared-types';
 import FeedbackMessage from './FeedbackMessage';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
+import type { Notifications } from './useNotifications';
+import type { RecordNavigation } from './useRecordLinks';
 
 type Session = { accessToken: string; user: AuthenticatedUserResponse };
-type Notice = {
-  id: string;
-  title: string;
-  message: string;
-  type: string;
-  createdAt: string;
-  readAt: string | null;
-  entityType: string;
-  entityId: string;
-};
 type Audit = {
   id: string;
   action: string;
@@ -26,41 +19,19 @@ type Audit = {
 const base =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
 
-export function NotificationsWorkspace({ session }: { session: Session }) {
-  const [items, setItems] = useState<Notice[]>([]);
-  const [count, setCount] = useState(0);
-  const [error, setError] = useState('');
-  const headers = { Authorization: `Bearer ${session.accessToken}` };
-  const refresh = useCallback(async () => {
-    const authorization = { Authorization: `Bearer ${session.accessToken}` };
-    try {
-      const [listResponse, countResponse] = await Promise.all([
-        fetch(`${base}/notifications`, { headers: authorization }),
-        fetch(`${base}/notifications/unread-count`, { headers: authorization }),
-      ]);
-      if (!listResponse.ok || !countResponse.ok)
-        throw new Error('Notifications are unavailable.');
-      setItems((await listResponse.json()) as Notice[]);
-      setCount(((await countResponse.json()) as { count: number }).count);
-      setError('');
-    } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : 'Notifications are unavailable.',
-      );
-    }
-  }, [session.accessToken]);
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-  async function markRead(id?: string) {
-    const response = await fetch(
-      `${base}/notifications${id ? `/${encodeURIComponent(id)}/read` : '/read-all'}`,
-      { method: 'POST', headers },
-    );
-    if (response.ok) await refresh();
-  }
+// Shows the shared notification state the app shell owns (see
+// useNotifications); this screen makes no requests of its own.
+export function NotificationsWorkspace({
+  notifications,
+  navigation,
+}: {
+  notifications: Notifications;
+  // Opens the record a notification is about (see useRecordLinks).
+  navigation?: RecordNavigation;
+}) {
+  const { items, count, error, listError, actionError, markRead } =
+    notifications;
+  const idPrefix = useId();
   return (
     <section
       className="service-card"
@@ -88,33 +59,111 @@ export function NotificationsWorkspace({ session }: { session: Session }) {
         )}
       </div>
       <FeedbackMessage tone="error" message={error} />
-      {!error && !items.length && (
+      <FeedbackMessage tone="error" message={actionError} />
+      {!listError && !items.length && (
         <p className="empty-state">No notifications yet.</p>
       )}
       <ul className="activity-list">
-        {items.map((item) => (
-          <li
-            key={item.id}
-            aria-label={
-              item.readAt ? 'Read notification' : 'Unread notification'
-            }
-          >
-            <strong>{item.title}</strong>{' '}
-            {item.readAt ? '' : <span className="unread-marker">• Unread</span>}
-            <p>{item.message}</p>
-            <time dateTime={item.createdAt}>
-              {new Date(item.createdAt).toLocaleString()}
-            </time>
-            {!item.readAt && (
-              <button
-                className="secondary-button"
-                onClick={() => void markRead(item.id)}
-              >
-                Mark read
-              </button>
-            )}
-          </li>
-        ))}
+        {items.map((item, index) => {
+          const destination = navigation?.destination(item) ?? null;
+          const linkState =
+            navigation?.state?.noticeId === item.id ? navigation.state : null;
+          const titleId = `${idPrefix}-${index}`;
+          return (
+            <li
+              key={item.id}
+              aria-label={
+                item.readAt ? 'Read notification' : 'Unread notification'
+              }
+            >
+              <strong id={titleId}>{item.title}</strong>{' '}
+              {item.readAt ? (
+                ''
+              ) : (
+                <span className="unread-marker">• Unread</span>
+              )}
+              <p>{item.message}</p>
+              <time dateTime={item.createdAt}>
+                {new Date(item.createdAt).toLocaleString()}
+              </time>
+              {(destination || !item.readAt) && (
+                <div className="notification-actions">
+                  {navigation && destination && (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      aria-describedby={titleId}
+                      aria-expanded={
+                        linkState?.status === 'confirm' ? true : undefined
+                      }
+                      disabled={linkState?.status === 'opening'}
+                      onClick={() => navigation.open(item)}
+                    >
+                      {linkState?.status === 'opening'
+                        ? 'Opening…'
+                        : destination.label}
+                    </button>
+                  )}
+                  {!item.readAt && (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      aria-describedby={titleId}
+                      onClick={() => void markRead(item.id)}
+                    >
+                      Mark read
+                    </button>
+                  )}
+                </div>
+              )}
+              {navigation && linkState?.status === 'confirm' && (
+                <div
+                  className="confirm-panel"
+                  role="group"
+                  aria-label="Unsaved changes in Creatives"
+                >
+                  <p role="alert">{linkState.message}</p>
+                  <div className="template-actions">
+                    <button
+                      type="button"
+                      className="danger-button"
+                      onClick={navigation.confirm}
+                    >
+                      Discard changes and open
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={(event) => {
+                        returnFocusToConfirmTrigger(event.currentTarget);
+                        navigation.cancel();
+                      }}
+                    >
+                      Keep my changes
+                    </button>
+                  </div>
+                </div>
+              )}
+              {navigation && linkState?.status === 'failed' && (
+                <div className="notification-link-error">
+                  <FeedbackMessage tone="error" message={linkState.message} />
+                  {linkState.creativeInstead && (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      aria-describedby={titleId}
+                      onClick={() =>
+                        navigation.open(item, { creativeInstead: true })
+                      }
+                    >
+                      Open creative instead
+                    </button>
+                  )}
+                </div>
+              )}
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

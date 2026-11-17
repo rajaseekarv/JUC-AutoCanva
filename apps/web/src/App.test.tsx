@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import App from './App';
 import { SESSION_STORAGE_KEY } from './authStorage';
@@ -514,6 +515,192 @@ describe('session persistence across reloads and tabs', () => {
     render(<App />);
     expect(await screen.findByLabelText('Password')).toBeInTheDocument();
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+  });
+
+  // Phase 2B step 2: the app owns the notification state.
+  it('clears the saved session when the unread count returns 401', async () => {
+    saveSession('saved-token');
+    mockApi({
+      '/auth/me': meOk,
+      '/notifications/unread-count': () => ({ ok: false, status: 401 }),
+    });
+    render(<App />);
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
+    expect(
+      screen.getByText('Your session expired. Please sign in again.'),
+    ).toBeInTheDocument();
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+  });
+
+  it('loads the unread count on sign-in, and the list only when Notifications opens', async () => {
+    saveSession('saved-token');
+    window.location.hash = '';
+    const fetchMock = mockApi({ '/auth/me': meOk });
+    render(<App />);
+    await screen.findByText('Hello, Server Admin.');
+    await waitFor(() =>
+      expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(1),
+    );
+    expect(callsTo(fetchMock, '/notifications')).toHaveLength(0);
+    try {
+      act(() => {
+        window.location.hash = '#notifications';
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      });
+      await waitFor(() =>
+        expect(callsTo(fetchMock, '/notifications')).toHaveLength(1),
+      );
+      expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(2);
+      expect(
+        await screen.findByText('No unread notifications'),
+      ).toBeInTheDocument();
+    } finally {
+      window.location.hash = '';
+    }
+  });
+
+  // Phase 2B step 3: the Notifications nav item shows the shared count.
+  describe('Notifications navigation badge', () => {
+    const modulesNav = () =>
+      screen.getByRole('navigation', { name: 'Workspace modules' });
+    const findNav = () =>
+      screen.findByRole('navigation', { name: 'Workspace modules' });
+    const countReply =
+      (count: number): RouteHandler =>
+      () => ({ ok: true, json: async () => ({ count }) });
+
+    it('shows the unread count from the shared notification state', async () => {
+      saveSession('saved-token');
+      const fetchMock = mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': countReply(5),
+      });
+      render(<App />);
+      const link = await within(await findNav()).findByRole('link', {
+        name: 'Notifications, 5 unread',
+      });
+      expect(link).toHaveAttribute('href', '#notifications');
+      expect(link.querySelector('.nav-badge')).toHaveTextContent(/^5$/);
+      expect(link.querySelector('.nav-badge')).toHaveAttribute(
+        'aria-hidden',
+        'true',
+      );
+      // The badge reuses the count request; nothing else is fetched for it.
+      expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(1);
+      expect(callsTo(fetchMock, '/notifications')).toHaveLength(0);
+      // Other modules are unchanged.
+      expect(
+        within(modulesNav()).getByRole('link', { name: 'Branch' }),
+      ).not.toHaveAttribute('aria-label');
+    });
+
+    it('names one unread notification and caps large counts at 99+', async () => {
+      saveSession('saved-token');
+      mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': countReply(1),
+      });
+      render(<App />);
+      expect(
+        await within(await findNav()).findByRole('link', {
+          name: 'Notifications, 1 unread',
+        }),
+      ).toBeInTheDocument();
+      cleanup();
+      mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': countReply(250),
+      });
+      render(<App />);
+      const link = await within(await findNav()).findByRole('link', {
+        name: 'Notifications, 250 unread',
+      });
+      expect(link.querySelector('.nav-badge')).toHaveTextContent(/^99\+$/);
+    });
+
+    it('shows no badge for zero unread', async () => {
+      saveSession('saved-token');
+      const fetchMock = mockApi({ '/auth/me': meOk });
+      render(<App />);
+      await screen.findByText('Hello, Server Admin.');
+      await waitFor(() =>
+        expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(
+          1,
+        ),
+      );
+      const link = within(modulesNav()).getByRole('link', {
+        name: 'Notifications',
+      });
+      expect(link.querySelector('.nav-badge')).toBeNull();
+    });
+
+    it('shows no badge before the count loads or while it is unavailable', async () => {
+      saveSession('saved-token');
+      let reply: (response: MockResponse) => void = () => undefined;
+      mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': () =>
+          new Promise<MockResponse>((resolve) => {
+            reply = resolve;
+          }),
+      });
+      render(<App />);
+      await screen.findByText('Hello, Server Admin.');
+      // Not loaded yet.
+      expect(modulesNav().querySelector('.nav-badge')).toBeNull();
+      // Unavailable: the count request failed.
+      await act(async () => {
+        reply({ ok: false, status: 500, json: async () => ({}) });
+      });
+      expect(modulesNav().querySelector('.nav-badge')).toBeNull();
+      expect(
+        within(modulesNav()).getByRole('link', { name: 'Notifications' }),
+      ).not.toHaveAttribute('aria-label');
+    });
+
+    it('hides a loaded count once a refresh fails, and shows it again on recovery', async () => {
+      saveSession('saved-token');
+      let countResponse: MockResponse = {
+        ok: true,
+        json: async () => ({ count: 5 }),
+      };
+      const fetchMock = mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': () => countResponse,
+      });
+      render(<App />);
+      await within(await findNav()).findByRole('link', {
+        name: 'Notifications, 5 unread',
+      });
+      // Returning to the tab refreshes the count through the shared hook.
+      const refresh = async () => {
+        const before = callsTo(fetchMock, '/notifications/unread-count').length;
+        act(() => {
+          document.dispatchEvent(new Event('visibilitychange'));
+        });
+        await waitFor(() =>
+          expect(
+            callsTo(fetchMock, '/notifications/unread-count'),
+          ).toHaveLength(before + 1),
+        );
+      };
+      countResponse = { ok: false, status: 500, json: async () => ({}) };
+      await refresh();
+      // The last known count (5) is kept by the hook but not shown as current.
+      await waitFor(() =>
+        expect(modulesNav().querySelector('.nav-badge')).toBeNull(),
+      );
+      expect(
+        within(modulesNav()).getByRole('link', { name: 'Notifications' }),
+      ).not.toHaveAttribute('aria-label');
+      countResponse = { ok: true, json: async () => ({ count: 2 }) };
+      await refresh();
+      expect(
+        await within(modulesNav()).findByRole('link', {
+          name: 'Notifications, 2 unread',
+        }),
+      ).toBeInTheDocument();
+    });
   });
 
   it('validates a sign-in from another tab through /auth/me before restoring it', async () => {
