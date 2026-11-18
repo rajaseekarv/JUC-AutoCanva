@@ -28,6 +28,9 @@ export type Notifications = {
   countError: boolean;
   // Whether the last list request failed (the list may be out of date).
   listError: boolean;
+  // Whether this session's list has loaded at least once; until then an
+  // empty list means "not loaded yet", not "no notifications".
+  listLoaded: boolean;
   // Why marking read failed; empty once a later attempt succeeds.
   actionError: string;
   // Tells the hook whether the Notifications screen is open: opening it
@@ -95,6 +98,7 @@ export function useNotifications({
   // and cleared only when that kind of request succeeds again.
   const [countError, setCountError] = useState(false);
   const [listError, setListError] = useState(false);
+  const [listLoaded, setListLoaded] = useState(false);
   const [actionError, setActionError] = useState('');
 
   // The token requests are made for. Kept current during render so a screen
@@ -181,6 +185,7 @@ export function useNotifications({
             if (!current(token)) return;
             setItems(list);
             setListError(false);
+            setListLoaded(true);
           } catch (cause) {
             fail(cause, token, 'list');
             return;
@@ -265,6 +270,7 @@ export function useNotifications({
     // up, so a request already started for this session (for example by a
     // screen opened before this effect ran) stays valid.
     setItems([]);
+    setListLoaded(false);
     setCount(0);
     setCountError(false);
     setListError(false);
@@ -365,6 +371,7 @@ export function useNotifications({
     error,
     countError,
     listError,
+    listLoaded,
     actionError,
     setScreenOpen,
     markRead,

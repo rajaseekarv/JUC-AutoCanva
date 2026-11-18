@@ -58,7 +58,13 @@ describe('OrganizationAdmin', () => {
         screen.getByLabelText('Name', { selector: '#organization-name' }),
       ).toHaveValue('AdFlow Local'),
     );
-    expect(screen.getByLabelText('Organization user')).toBeInTheDocument();
+    // No users: an empty state instead of an empty user picker (Phase 3.3).
+    expect(
+      screen.getByText(
+        'There are no users in this organization to give branch access to.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText('Organization user')).toBeNull();
     expect(
       screen.getByRole('button', { name: 'Create branch' }),
     ).toBeInTheDocument();
@@ -229,7 +235,9 @@ describe('OrganizationAdmin Phase 2A', () => {
       ).getByRole('button', { name: 'Revoke access to North' }),
     );
     expect(
-      await screen.findByText('Branch access revoked.'),
+      await screen.findByText(
+        'Branch access revoked: Priya no longer has assigned access to North.',
+      ),
     ).toBeInTheDocument();
     expect(calls(fetchMock, /branches\/branch-1 DELETE/)).toHaveLength(1);
     expect(
@@ -259,7 +267,7 @@ describe('OrganizationAdmin Phase 2A', () => {
       screen.getByRole('group', { name: 'Confirm revoking access to North' }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByText('Branch access revoked.'),
+      screen.queryByText(/^Branch access revoked/),
     ).not.toBeInTheDocument();
   });
 

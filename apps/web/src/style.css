@@ -1781,6 +1781,35 @@ p[role='status'][aria-busy='true'] {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* Audit entries: labelled facts, IDs and details wrap instead of overflowing. */
+.audit-list[aria-busy='true'] {
+  opacity: 0.6;
+}
+.audit-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--space-3);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+.audit-facts dt {
+  color: var(--color-text-subtle);
+}
+.audit-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.audit-list details summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+.audit-list pre {
+  margin: var(--space-2) 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--text-xs);
+}
 /* Brand form: each branch field says whether it is inherited or overridden. */
 .brand-field {
   display: grid;

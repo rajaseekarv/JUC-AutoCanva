@@ -609,7 +609,7 @@ export default function App() {
         icon: 'audit',
         available: permissions.includes('audit:read'),
         content: permissions.includes('audit:read') && (
-          <AuditWorkspace session={session} />
+          <AuditWorkspace session={session} onUnauthorized={onUnauthorized} />
         ),
       },
       {

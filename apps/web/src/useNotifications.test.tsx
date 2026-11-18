@@ -660,3 +660,32 @@ describe('useNotifications countError', () => {
     expect(state()).toBe('count 0');
   });
 });
+
+// Phase 3.3: before the list has loaded, the screen says it is loading
+// rather than that there are no notifications.
+describe('Notifications list loading (Phase 3.3)', () => {
+  it('says "Loading notifications…" until the list arrives, then the empty state', async () => {
+    const api = fakeApi();
+    api.hold.add('/notifications');
+    renderHarness({ open: true });
+    await settle();
+    expect(screen.getByText('Loading notifications…')).toBeInTheDocument();
+    expect(screen.queryByText('No notifications yet.')).toBeNull();
+    api.release('/notifications');
+    await settle();
+    expect(screen.getByText('No notifications yet.')).toBeInTheDocument();
+    expect(screen.queryByText('Loading notifications…')).toBeNull();
+  });
+
+  it('starts loading again for a new session instead of showing the previous empty state', async () => {
+    const api = fakeApi();
+    const view = renderHarness({ open: true });
+    await settle();
+    expect(screen.getByText('No notifications yet.')).toBeInTheDocument();
+    api.hold.add('/notifications');
+    view.rerender({ token: 'token-b' });
+    await settle();
+    expect(screen.getByText('Loading notifications…')).toBeInTheDocument();
+    expect(screen.queryByText('No notifications yet.')).toBeNull();
+  });
+});
