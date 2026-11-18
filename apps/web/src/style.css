@@ -1781,6 +1781,87 @@ p[role='status'][aria-busy='true'] {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* Structured workflow editor (Phase 3.5): one card per stage, with its
+   steps inside; problems sit under what they concern. */
+.workflow-editor {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.workflow-editor label,
+.workflow-editor fieldset {
+  min-width: 0;
+}
+.workflow-stages,
+.workflow-transitions,
+.workflow-problems {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.workflow-stage {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-muted);
+  min-width: 0;
+}
+.workflow-stage-heading {
+  display: grid;
+  gap: 2px;
+}
+.workflow-stage-heading .field-hint,
+.workflow-transition .field-hint {
+  overflow-wrap: anywhere;
+}
+.workflow-stage-flags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+}
+.workflow-reviewer {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+.workflow-reviewer legend {
+  padding: 0 var(--space-1);
+  font-weight: 600;
+}
+.workflow-transition {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.workflow-transition > button {
+  justify-self: start;
+}
+.workflow-stage .template-actions {
+  flex-wrap: wrap;
+}
+.workflow-add-stage {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  align-items: end;
+}
+.workflow-advanced summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.workflow-advanced[open] summary {
+  margin-bottom: var(--space-2);
+}
 /* Creative form validation: a field's problem sits under it; the summary
    by Save names the fields to fix. */
 .field-error {

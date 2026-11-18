@@ -88,6 +88,16 @@ export class WorkflowsController {
     return this.workflows.create(user, parse(definition, body));
   }
 
+  // Read-only list of the people a workflow manager may name as a stage's
+  // reviewer: active users of the organization, with only id, name and
+  // email. Declared before workflows/:workflowId so it is not taken as an
+  // id. GET /users (user access management) is unchanged.
+  @Get('workflows/assignable-users')
+  @RequirePermissions(PERMISSIONS.WORKFLOW_MANAGE)
+  assignableUsers(@CurrentUser() user: AuthenticatedPrincipal) {
+    return this.workflows.assignableUsers(user);
+  }
+
   @Get('workflows/:workflowId')
   @RequirePermissions(PERMISSIONS.WORKFLOW_READ)
   get(

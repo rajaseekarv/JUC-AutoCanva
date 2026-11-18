@@ -1522,3 +1522,46 @@ describe('WorkflowsService review entry and final approval notice', () => {
     });
   });
 });
+
+// Phase 3.5: the reviewer picker's read-only user list.
+describe('WorkflowsService assignable users', () => {
+  const manager: AuthenticatedPrincipal = {
+    ...principal,
+    permissions: [PERMISSIONS.WORKFLOW_MANAGE],
+  };
+  const serviceWith = (findMany: ReturnType<typeof vi.fn>) =>
+    new WorkflowsService(
+      { user: { findMany } } as unknown as PrismaService,
+      { write: vi.fn() } as never,
+      { create: vi.fn() } as never,
+    );
+
+  it('lists only active users of the caller organization, with id, name and email', async () => {
+    const people = [
+      { id: 'user-2', name: 'Priya', email: 'priya@example.local' },
+    ];
+    const findMany = vi.fn().mockResolvedValue(people);
+    await expect(serviceWith(findMany).assignableUsers(manager)).resolves.toBe(
+      people,
+    );
+    expect(findMany).toHaveBeenCalledWith({
+      where: { organizationId: 'org-1', status: 'ACTIVE' },
+      select: { id: true, name: true, email: true },
+      orderBy: [{ name: 'asc' }, { email: 'asc' }],
+    });
+  });
+
+  it('refuses callers without workflows:manage and queries nothing', async () => {
+    const findMany = vi.fn();
+    await expect(
+      serviceWith(findMany).assignableUsers({
+        ...principal,
+        permissions: [
+          PERMISSIONS.WORKFLOW_READ,
+          PERMISSIONS.USER_BRANCH_ACCESS_MANAGE,
+        ],
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(findMany).not.toHaveBeenCalled();
+  });
+});

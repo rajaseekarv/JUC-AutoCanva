@@ -15,6 +15,11 @@ import { approvalSummaryText } from './approvalText';
 import FeedbackMessage from './FeedbackMessage';
 import type { ReportOpen } from './useRecordLinks';
 import { returnFocusToConfirmTrigger } from './confirmFocus';
+import WorkflowStructuredEditor, {
+  type AssignableUser,
+  type AssignableUsers,
+} from './WorkflowStructuredEditor';
+import { checkDefinition, parseDefinition } from './workflowModel';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -325,6 +330,15 @@ export default function WorkflowWorkspace({
   const transitionHintId = useId();
   const unsavedHintId = useId();
   const [confirmingDisable, setConfirmingDisable] = useState(false);
+  // Saving a new version of an enabled workflow takes it offline; this is
+  // the confirmation shown first.
+  const [confirmingSave, setConfirmingSave] = useState(false);
+  // People a stage can name as its reviewer (GET /workflows/assignable-users,
+  // workflow managers only). A reply for an earlier session is ignored.
+  const [assignableUsers, setAssignableUsers] = useState<AssignableUsers>({
+    status: 'loading',
+  });
+  const [assignableKey, setAssignableKey] = useState(0);
   const instanceId = instance?.id;
   useEffect(() => {
     // A different run (or none) is shown: drop any half-entered reason.
@@ -446,6 +460,7 @@ export default function WorkflowWorkspace({
   // first. Choosing none keeps the editor as it is.
   function chooseWorkflow(id: string, origin: 'definitions' | 'start'): void {
     setConfirmingDisable(false);
+    setConfirmingSave(false);
     if (id && editorDirty && id !== editor.workflowId) {
       setPendingWorkflow({ id, origin });
       return;
@@ -599,10 +614,35 @@ export default function WorkflowWorkspace({
     () => void refreshFromOtherScreen(),
   );
 
+  // The reviewer picker's people, loaded once per session for managers.
+  useEffect(() => {
+    if (!canManage) return;
+    let cancelled = false;
+    setAssignableUsers({ status: 'loading' });
+    void request<AssignableUser[] | null>('/workflows/assignable-users')
+      .then((users) => {
+        if (cancelled) return;
+        setAssignableUsers(
+          Array.isArray(users)
+            ? { status: 'loaded', users }
+            : { status: 'failed' },
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setAssignableUsers({ status: 'failed' });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.accessToken, canManage, assignableKey]);
+
   // Saves exactly the text in the editor. Whatever happens, nothing typed is
   // lost: unreadable JSON is not sent, a refusal leaves the edits in place,
   // and edits typed while the save was in flight are kept.
-  async function saveDefinition(): Promise<void> {
+  // `takesOffline`: the user confirmed saving an enabled workflow, which
+  // the API then turns back into a draft.
+  async function saveDefinition(takesOffline = false): Promise<void> {
     setError('');
     setMessage('');
     const submitted = definitionText;
@@ -652,7 +692,12 @@ export default function WorkflowWorkspace({
       ]);
       setPendingWorkflow(null);
       setWorkflowId(saved.id);
-      setMessage('A new editable workflow version was saved.');
+      setMessage(
+        'A new editable workflow version was saved.' +
+          (takesOffline
+            ? ` ${saved.name} is now a draft: enable it again so new reviews can start.`
+            : ''),
+      );
     } catch (cause) {
       setError(
         asSentence(
@@ -676,6 +721,21 @@ export default function WorkflowWorkspace({
       const check = checkDefinitionText(definitionText);
       if (!check.ok) {
         setError(check.problem + ' Your edits are kept.');
+        return;
+      }
+      // The workflow rules, as the API applies them when saving.
+      const parsed = parseDefinition(definitionText);
+      const ruleProblems = parsed.ok ? checkDefinition(parsed.definition) : [];
+      if (ruleProblems.length) {
+        setError(
+          `Your unsaved edits have ${plural(ruleProblems.length, 'problem')} the API would refuse: ` +
+            ruleProblems
+              .slice(0, 3)
+              .map((problem) => problem.message)
+              .join(' ') +
+            (ruleProblems.length > 3 ? ' The form shows them all.' : '') +
+            ' Your edits are kept.',
+        );
         return;
       }
       setMessage(
@@ -1059,20 +1119,43 @@ export default function WorkflowWorkspace({
             {pendingWorkflow?.origin === 'definitions' && pendingWorkflowPanel}
             {canManage && (
               <>
-                <label>
-                  Workflow definition (advanced, JSON format)
-                  <textarea
-                    aria-label="Workflow definition JSON"
-                    aria-describedby={editorDirty ? unsavedHintId : undefined}
-                    rows={18}
-                    spellCheck={false}
-                    value={definitionText}
-                    onChange={(event) => {
-                      const text = event.target.value;
-                      setEditor((current) => ({ ...current, text }));
-                    }}
-                  />
-                </label>
+                <p className="field-hint workflow-version-note">
+                  {selected
+                    ? `Editing version ${selected.currentVersionNumber} (${statusLabel(selected.status)}). Saving creates version ${selected.currentVersionNumber + 1}` +
+                      (selected.status === 'ENABLED'
+                        ? ' and takes this workflow offline until it is enabled again.'
+                        : '.') +
+                      ' Earlier versions and running reviews are not changed.'
+                    : 'A new workflow is saved as version 1, as a draft to enable.'}
+                </p>
+                <WorkflowStructuredEditor
+                  text={definitionText}
+                  onChange={(text) =>
+                    setEditor((current) => ({ ...current, text }))
+                  }
+                  users={assignableUsers}
+                  onRetryUsers={() => setAssignableKey((key) => key + 1)}
+                  busy={busy}
+                />
+                {/* The same definition as JSON: edits in either view are
+                    the same unsaved edits. */}
+                <details className="workflow-advanced">
+                  <summary>Advanced (JSON)</summary>
+                  <label>
+                    Workflow definition (advanced, JSON format)
+                    <textarea
+                      aria-label="Workflow definition JSON"
+                      aria-describedby={editorDirty ? unsavedHintId : undefined}
+                      rows={18}
+                      spellCheck={false}
+                      value={definitionText}
+                      onChange={(event) => {
+                        const text = event.target.value;
+                        setEditor((current) => ({ ...current, text }));
+                      }}
+                    />
+                  </label>
+                </details>
                 {editorDirty && (
                   <div className="inline-actions" id={unsavedHintId}>
                     <p className="field-hint">
@@ -1091,7 +1174,20 @@ export default function WorkflowWorkspace({
                   </div>
                 )}
                 <div className="button-row">
-                  <button disabled={busy} onClick={() => void saveDefinition()}>
+                  <button
+                    disabled={busy}
+                    aria-expanded={
+                      selected?.status === 'ENABLED' && workflowId
+                        ? confirmingSave
+                        : undefined
+                    }
+                    onClick={() =>
+                      // Saving an enabled workflow takes it offline: ask.
+                      selected?.status === 'ENABLED' && workflowId
+                        ? setConfirmingSave(true)
+                        : void saveDefinition()
+                    }
+                  >
                     {workflowId ? 'Save new version' : 'Create workflow'}
                   </button>
                   <button
@@ -1124,6 +1220,44 @@ export default function WorkflowWorkspace({
                     </>
                   )}
                 </div>
+                {selected?.status === 'ENABLED' && confirmingSave && (
+                  <div
+                    className="confirm-panel"
+                    role="group"
+                    aria-label={'Confirm saving ' + selected.name}
+                  >
+                    <p>
+                      Saving creates version {selected.currentVersionNumber + 1}{' '}
+                      and takes {selected.name} offline: no new reviews can
+                      start with it until you enable it again. Reviews already
+                      running carry on with the version they started with.
+                    </p>
+                    <div className="template-actions">
+                      <button
+                        type="button"
+                        className="warning-button"
+                        disabled={busy}
+                        onClick={() => {
+                          setConfirmingSave(false);
+                          void saveDefinition(true);
+                        }}
+                      >
+                        Save and take offline
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          returnFocusToConfirmTrigger(event.currentTarget);
+                          setConfirmingSave(false);
+                        }}
+                      >
+                        Keep editing
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {selected?.status === 'ENABLED' && confirmingDisable && (
                   <div
                     className="confirm-panel"
