@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+} from 'react';
 import type {
   AssetInUseConflictResponse,
   AssetInUseReason,
@@ -38,6 +45,40 @@ type Asset = {
   width: number | null;
   height: number | null;
 };
+
+// The brand fields, in form order. A branch inherits each one from the
+// organization unless the branch overrides it (a non-null value in its
+// override); the API's PATCH changes only the fields it is sent, and null
+// removes an override.
+const BRAND_FIELDS = [
+  'displayName',
+  'primaryColor',
+  'secondaryColor',
+  'accentColor',
+  'fontFamily',
+  'websiteUrl',
+  'logoAssetId',
+] as const;
+type BrandField = (typeof BRAND_FIELDS)[number];
+const brandFieldLabels: Record<BrandField, string> = {
+  displayName: 'Display name',
+  primaryColor: 'Primary color',
+  secondaryColor: 'Secondary color',
+  accentColor: 'Accent color',
+  fontFamily: 'Font family',
+  websiteUrl: 'Website',
+  logoAssetId: 'Logo image',
+};
+// What a colour picker shows for an unset colour (it cannot show none).
+const colorDefaults: Partial<Record<BrandField, string>> = {
+  primaryColor: '#202020',
+  secondaryColor: '#ffffff',
+  accentColor: '#2f6fed',
+};
+// A field in the form: its value, and whether it is set to use the
+// organization's value (branch scope only).
+type FieldState = { value: string; inherited: boolean };
+type BrandPatch = Partial<Record<BrandField, string | null>>;
 
 class RequestError extends Error {
   constructor(
@@ -153,14 +194,32 @@ export default function BrandAssets({
   // to. It is shown, and its form offered, only while that scope is still
   // the selected one, so values loaded or typed for one scope can never be
   // saved to another.
+  // For a branch the profile is the effective one; `organization` is the
+  // organization's own profile, loaded alongside it when the branch can be
+  // edited, so "Use organization value" knows what it restores.
   const [loaded, setLoaded] = useState<{
     scopeId: string;
     brand: Brand;
+    organization: Brand | null;
   } | null>(null);
   const brand = loaded?.scopeId === scopeBranchId ? loaded.brand : null;
+  const organizationBrand =
+    loaded?.scopeId === scopeBranchId ? loaded.organization : null;
   // Only the latest load may apply its reply: a slower reply for a scope
   // chosen earlier is ignored.
   const loadRequest = useRef(0);
+  // The scope selected now, for replies to saves sent earlier.
+  const scopeNow = useRef(scopeBranchId);
+  scopeNow.current = scopeBranchId;
+  // The fields the user has changed in the brand form, for one scope. Fields
+  // not listed show the loaded profile, so a reload (Refresh, an upload)
+  // updates them without discarding what was typed elsewhere in the form.
+  const [edits, setEdits] = useState<{
+    scopeId: string;
+    fields: Partial<Record<BrandField, FieldState>>;
+  }>({ scopeId: '', fields: {} });
+  const scopeEdits = edits.scopeId === scopeBranchId ? edits.fields : {};
+  const fieldId = useId();
   const [assets, setAssets] = useState<Asset[]>([]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -230,8 +289,9 @@ export default function BrandAssets({
     return response.json() as Promise<T>;
   }
 
-  async function reload(): Promise<void> {
-    if (!session.user.permissions.includes('brand:read')) return;
+  // True once this load's reply was applied.
+  async function reload(): Promise<boolean> {
+    if (!session.user.permissions.includes('brand:read')) return false;
     const sequence = ++loadRequest.current;
     const scopeId = scopeBranch?.id ?? '';
     setError('');
@@ -240,7 +300,7 @@ export default function BrandAssets({
     const listAssets = (path: string): Promise<Asset[]> =>
       canReadAssets ? request<Asset[]>(path) : Promise.resolve([]);
     try {
-      const [profile, list] = await Promise.all([
+      const [profile, organization, list] = await Promise.all([
         request<Brand>(
           scopeBranch
             ? '/branches/' +
@@ -248,23 +308,195 @@ export default function BrandAssets({
                 '/brand/effective'
             : '/organization/brand',
         ),
+        scopeBranch && canManageBrand
+          ? request<Brand>('/organization/brand')
+          : Promise.resolve(null),
         listAssets(
           scopeBranch
             ? '/assets?branchId=' + encodeURIComponent(scopeBranch.id)
             : '/assets',
         ),
       ]);
-      if (sequence !== loadRequest.current) return;
-      setLoaded({ scopeId, brand: profile });
+      if (sequence !== loadRequest.current) return false;
+      setLoaded({ scopeId, brand: profile, organization });
       setAssets(list);
+      return true;
     } catch (cause) {
-      if (sequence !== loadRequest.current) return;
+      if (sequence !== loadRequest.current) return false;
       setError(
         cause instanceof Error
           ? cause.message
           : 'Unable to load brand settings.',
       );
+      return false;
     }
+  }
+
+  // ---- Brand form state (organization or one branch) ----
+  const isOverridden = (field: BrandField) =>
+    !!scopeBranch && !!brand?.overriddenFields?.includes(field);
+  const organizationValue = (field: BrandField) =>
+    organizationBrand?.[field] ?? '';
+  function fieldState(field: BrandField): FieldState {
+    return (
+      scopeEdits[field] ?? {
+        value: brand?.[field] ?? '',
+        inherited: !!scopeBranch && !isOverridden(field),
+      }
+    );
+  }
+  // Whether a branch field will use the organization's value once saved:
+  // it was set to, it is empty (null means "inherit" to the API), or it is
+  // an inherited field whose value was not actually changed.
+  function usesOrganization(field: BrandField): boolean {
+    const state = fieldState(field);
+    const value = state.value.trim();
+    return (
+      state.inherited ||
+      value === '' ||
+      (!isOverridden(field) && value === organizationValue(field))
+    );
+  }
+  // A branch save sends only what changes: a new or changed override, or
+  // null to remove one. Inherited fields the user did not change are left
+  // out, so they keep following the organization.
+  function branchPatch(): BrandPatch {
+    const patch: BrandPatch = {};
+    for (const field of BRAND_FIELDS) {
+      if (usesOrganization(field)) {
+        if (isOverridden(field)) patch[field] = null;
+        continue;
+      }
+      const value = fieldState(field).value.trim();
+      if (!isOverridden(field) || value !== (brand?.[field] ?? ''))
+        patch[field] = value;
+    }
+    return patch;
+  }
+  // The organization profile is saved whole, as before; an unset colour is
+  // sent as the colour the picker shows.
+  function organizationPayload(): BrandPatch {
+    return Object.fromEntries(
+      BRAND_FIELDS.map((field) => [
+        field,
+        fieldState(field).value.trim() || colorDefaults[field] || null,
+      ]),
+    );
+  }
+  const pendingPatch: BrandPatch = scopeBranch && brand ? branchPatch() : {};
+  function setField(field: BrandField, state: FieldState): void {
+    const scopeId = scopeBranchId;
+    setEdits((current) => ({
+      scopeId,
+      fields: {
+        ...(current.scopeId === scopeId ? current.fields : {}),
+        [field]: state,
+      },
+    }));
+  }
+  function restoreOrganizationValue(field: BrandField): void {
+    setField(field, { value: organizationValue(field), inherited: true });
+    // The button disappears; keep focus on the field it changed.
+    document.getElementById(fieldId + '-' + field)?.focus();
+  }
+  // One form field. For a branch, a line under it says whether it is
+  // inherited from the organization or overridden (and whether that is not
+  // saved yet), with "Use organization value" for an override.
+  function renderBrandField(
+    field: BrandField,
+    kind: 'text' | 'url' | 'color' | 'logo',
+  ) {
+    const state = fieldState(field);
+    const id = fieldId + '-' + field;
+    const sourceId = id + '-source';
+    const inherited = !!scopeBranch && usesOrganization(field);
+    const pending = field in pendingPatch;
+    const common = {
+      id,
+      name: field,
+      'aria-describedby': scopeBranch ? sourceId : undefined,
+      onChange: (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
+        setField(field, { value: event.target.value, inherited: false }),
+    };
+    const logoOptions = assets.filter((asset) =>
+      scopeBranch
+        ? asset.branchId === null || asset.branchId === scopeBranch.id
+        : asset.branchId === null,
+    );
+    const control =
+      kind === 'logo' ? (
+        <select {...common} value={state.value}>
+          <option value="">
+            {scopeBranch ? 'Same as the organization' : 'No logo selected'}
+          </option>
+          {/* A logo set elsewhere that the asset list does not include (for
+              example without assets:read) stays selected, so saving keeps
+              it instead of clearing it. */}
+          {state.value &&
+            !logoOptions.some((asset) => asset.id === state.value) && (
+              <option value={state.value}>Current logo</option>
+            )}
+          {logoOptions.map((asset) => (
+            <option key={asset.id} value={asset.id}>
+              {asset.originalName}
+            </option>
+          ))}
+        </select>
+      ) : kind === 'color' ? (
+        <input
+          {...common}
+          type="color"
+          value={state.value || colorDefaults[field]}
+        />
+      ) : (
+        <input
+          {...common}
+          type={kind === 'url' ? 'url' : 'text'}
+          maxLength={kind === 'text' ? 120 : undefined}
+          value={state.value}
+          // An emptied branch field uses the organization's value.
+          placeholder={
+            scopeBranch ? organizationValue(field) || undefined : undefined
+          }
+        />
+      );
+    return (
+      <div className="brand-field" key={field}>
+        <label>
+          {brandFieldLabels[field]}
+          {control}
+        </label>
+        {scopeBranch && (
+          <div className="brand-field-source">
+            <span
+              id={sourceId}
+              className={
+                'brand-source ' +
+                (inherited ? 'brand-source-inherited' : 'brand-source-override')
+              }
+            >
+              {inherited
+                ? 'Inherited from the organization'
+                : 'Overridden for ' + scopeBranch.name}
+              {pending ? ' · not saved yet' : ''}
+            </span>
+            {!inherited && (
+              <button
+                type="button"
+                className="secondary-button"
+                aria-label={
+                  'Use organization value for ' + brandFieldLabels[field]
+                }
+                disabled={busy}
+                onClick={() => restoreOrganizationValue(field)}
+              >
+                Use organization value
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    );
   }
   useEffect(() => {
     void reload();
@@ -281,24 +513,18 @@ export default function BrandAssets({
     event.preventDefault();
     if (!brand) return;
     const scopeId = formScope?.id ?? '';
-    setBusy(true);
+    const submitted = scopeEdits;
+    const payload = formScope ? branchPatch() : organizationPayload();
     setError('');
     setMessage('');
-    const form = new FormData(event.currentTarget);
-    const payload = Object.fromEntries(
-      [
-        'displayName',
-        'primaryColor',
-        'secondaryColor',
-        'accentColor',
-        'fontFamily',
-        'websiteUrl',
-        'logoAssetId',
-      ].map((key) => {
-        const value = String(form.get(key) ?? '').trim();
-        return [key, value || null];
-      }),
-    );
+    if (formScope && Object.keys(payload).length === 0) {
+      // The API refuses an empty change; nothing differs from what is saved.
+      setMessage('There are no changes to save.');
+      return;
+    }
+    setBusy(true);
+    const saved =
+      (formScope ? formScope.name : 'Organization') + ' brand profile saved.';
     try {
       const path = formScope
         ? '/branches/' + encodeURIComponent(formScope.id) + '/brand'
@@ -307,14 +533,36 @@ export default function BrandAssets({
         method: 'PATCH',
         body: JSON.stringify(payload),
       });
-      // The saved profile replaces what is loaded only for its own scope.
-      setLoaded((current) =>
-        current?.scopeId === scopeId ? { scopeId, brand: result } : current,
-      );
-      setMessage(
-        (formScope ? formScope.name : 'Organization') + ' brand profile saved.',
-      );
+      // The organization save returns the profile; a branch save returns
+      // only the branch's overrides, so the effective profile is reloaded
+      // (when the branch is still selected) before the form shows it.
+      let current = true;
+      if (!formScope)
+        setLoaded((loadedNow) =>
+          loadedNow?.scopeId === scopeId
+            ? { ...loadedNow, brand: result }
+            : loadedNow,
+        );
+      else if (scopeNow.current === scopeId) current = await reload();
+      if (current) {
+        // Saved edits are now the loaded values; anything typed while the
+        // save was in flight stays.
+        setEdits((now) => {
+          if (now.scopeId !== scopeId) return now;
+          const fields = { ...now.fields };
+          for (const field of BRAND_FIELDS)
+            if (fields[field] && fields[field] === submitted[field])
+              delete fields[field];
+          return { scopeId, fields };
+        });
+        setMessage(saved);
+      } else
+        setError(
+          saved +
+            " However, the latest brand values couldn't be loaded, so this form may be out of date. Use Refresh before making more changes.",
+        );
     } catch (cause) {
+      // Nothing was saved: the form keeps every value.
       setError(failureMessage(cause, 'Unable to save brand profile.'));
     } finally {
       setBusy(false);
@@ -378,6 +626,10 @@ export default function BrandAssets({
     usageRequest.current += 1;
     setUsageAssetId('');
     setPreviewAssetId('');
+    // Unsaved brand edits belong to the scope they were made in: another
+    // scope starts from its own saved values, and so does a return to this
+    // one.
+    setEdits({ scopeId: scopeBranchId, fields: {} });
   }, [scopeBranchId]);
 
   async function remove(asset: Asset): Promise<void> {
@@ -512,75 +764,21 @@ export default function BrandAssets({
                 )
               }
             >
-              <label>
-                Display name
-                <input
-                  name="displayName"
-                  defaultValue={brand.displayName ?? ''}
-                  maxLength={120}
-                />
-              </label>
-              <label>
-                Primary color
-                <input
-                  name="primaryColor"
-                  type="color"
-                  defaultValue={brand.primaryColor ?? '#202020'}
-                />
-              </label>
-              <label>
-                Secondary color
-                <input
-                  name="secondaryColor"
-                  type="color"
-                  defaultValue={brand.secondaryColor ?? '#ffffff'}
-                />
-              </label>
-              <label>
-                Accent color
-                <input
-                  name="accentColor"
-                  type="color"
-                  defaultValue={brand.accentColor ?? '#2f6fed'}
-                />
-              </label>
-              <label>
-                Font family
-                <input
-                  name="fontFamily"
-                  defaultValue={brand.fontFamily ?? ''}
-                  maxLength={120}
-                />
-              </label>
-              <label>
-                Website
-                <input
-                  name="websiteUrl"
-                  type="url"
-                  defaultValue={brand.websiteUrl ?? ''}
-                />
-              </label>
-              <label>
-                Logo image
-                <select
-                  name="logoAssetId"
-                  defaultValue={brand.logoAssetId ?? ''}
-                >
-                  <option value="">No logo selected</option>
-                  {assets
-                    .filter((asset) =>
-                      scopeBranch
-                        ? asset.branchId === null ||
-                          asset.branchId === scopeBranch.id
-                        : asset.branchId === null,
-                    )
-                    .map((asset) => (
-                      <option key={asset.id} value={asset.id}>
-                        {asset.originalName}
-                      </option>
-                    ))}
-                </select>
-              </label>{' '}
+              {scopeBranch && (
+                <p className="field-hint">
+                  Each field shows whether it is inherited from the organization
+                  (and follows it when it changes) or overridden for{' '}
+                  {scopeBranch.name}. Changing a field overrides it; Use
+                  organization value removes the override when you save.
+                </p>
+              )}
+              {renderBrandField('displayName', 'text')}
+              {renderBrandField('primaryColor', 'color')}
+              {renderBrandField('secondaryColor', 'color')}
+              {renderBrandField('accentColor', 'color')}
+              {renderBrandField('fontFamily', 'text')}
+              {renderBrandField('websiteUrl', 'url')}
+              {renderBrandField('logoAssetId', 'logo')}{' '}
               <button type="submit" disabled={busy}>
                 Save brand profile
               </button>
@@ -594,7 +792,13 @@ export default function BrandAssets({
               <dt>Website</dt>
               <dd>{brand.websiteUrl ?? '—'}</dd>
               <dt>Branch overrides</dt>
-              <dd>{brand.overriddenFields?.join(', ') || 'None'}</dd>
+              <dd>
+                {(brand.overriddenFields ?? [])
+                  .map(
+                    (field) => brandFieldLabels[field as BrandField] ?? field,
+                  )
+                  .join(', ') || 'None'}
+              </dd>
             </dl>
           )}
         </section>

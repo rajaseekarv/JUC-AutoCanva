@@ -1781,3 +1781,32 @@ p[role='status'][aria-busy='true'] {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* Brand form: each branch field says whether it is inherited or overridden. */
+.brand-field {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.brand-field-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.brand-source {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.brand-source-inherited {
+  color: var(--color-text-muted);
+  background: var(--color-surface-muted);
+}
+.brand-source-override {
+  color: var(--color-info);
+  background: var(--color-info-soft);
+  border-color: var(--color-info-border);
+}

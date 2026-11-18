@@ -118,20 +118,23 @@ async function chooseScope(value: string, expectedName?: string) {
 }
 
 describe('BrandAssets scope switching (C2)', () => {
-  it("shows each scope its own values after a clean switch, and saves the second branch's values to it (probe C)", async () => {
+  // Since Phase 3.2 a branch save sends only the fields that change, so
+  // each test changes one field and checks exactly what is sent, and where.
+  const fontFamily = () =>
+    screen.getByRole('textbox', { name: 'Font family' }) as HTMLInputElement;
+
+  it("shows each scope its own values after a clean switch, and saves the second branch's change to it (probe C)", async () => {
     const writes = stubApi();
     renderBrand();
     await waitFor(() => expect(displayName().value).toBe('Org name'));
     await chooseScope('b-1', 'North shop');
     await chooseScope('b-2', 'South shop');
     expect(website().value).toBe('https://south.example');
+    fireEvent.change(fontFamily(), { target: { value: 'Lato' } });
     fireEvent.click(save());
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]?.path).toBe('/branches/b-2/brand');
-    expect(writes[0]?.body).toMatchObject({
-      displayName: 'South shop',
-      websiteUrl: 'https://south.example',
-    });
+    expect(writes[0]?.body).toEqual({ fontFamily: 'Lato' });
   });
 
   it("never saves the organization's unsaved values into a branch", async () => {
@@ -140,10 +143,11 @@ describe('BrandAssets scope switching (C2)', () => {
     await waitFor(() => expect(displayName().value).toBe('Org name'));
     fireEvent.change(displayName(), { target: { value: 'Org typed' } });
     await chooseScope('b-1', 'North shop');
+    fireEvent.change(fontFamily(), { target: { value: 'Lato' } });
     fireEvent.click(save());
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]?.path).toBe('/branches/b-1/brand');
-    expect(writes[0]?.body.displayName).toBe('North shop');
+    expect(writes[0]?.body).toEqual({ fontFamily: 'Lato' });
   });
 
   it('offers no form, and so no save, while the chosen scope is still loading', async () => {
@@ -180,10 +184,11 @@ describe('BrandAssets scope switching (C2)', () => {
       screen.getByRole('heading', { name: 'South brand' }),
     ).toBeInTheDocument();
     expect(displayName().value).toBe('South shop');
+    fireEvent.change(fontFamily(), { target: { value: 'Lato' } });
     fireEvent.click(save());
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]?.path).toBe('/branches/b-2/brand');
-    expect(writes[0]?.body.displayName).toBe('South shop');
+    expect(writes[0]?.body).toEqual({ fontFamily: 'Lato' });
   });
 
   it("does not let an earlier scope's save result replace the newly chosen scope", async () => {
