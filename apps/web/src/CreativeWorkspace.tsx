@@ -98,6 +98,108 @@ function fieldDefaults(
   );
 }
 
+// ---- Browser validation (Phase 3.4) ----
+// Mirrors the API's checks for creative values (TemplatesService
+// .validateCreativeValues), in the same order, so a problem is explained
+// beside its field before saving. The API still validates everything, and
+// alone checks that an image exists and is usable in the branch.
+const PHONE_PATTERN = /^\+?[0-9 ()-]{7,24}$/;
+const COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
+const TEXT_LIMIT = 10000;
+const NAME_LIMIT = 120;
+function isHttpUrl(value: string): boolean {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+function isCalendarDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = Date.parse(`${value}T00:00:00Z`);
+  return (
+    !Number.isNaN(parsed) &&
+    new Date(parsed).toISOString().slice(0, 10) === value
+  );
+}
+// The value the API will check for a field: the one sent, or the field's
+// default when the form sends nothing for it.
+function submittedValue(
+  field: TemplateFieldResponse,
+  values: Record<string, unknown>,
+): unknown {
+  return Object.hasOwn(values, field.key)
+    ? values[field.key]
+    : field.defaultValue;
+}
+// Why the API would refuse this field's value, in words that say what to
+// do; null when it would accept it. `unreadable` is set when the browser
+// could not read what was typed (for example "1e" in a number field), which
+// the form would otherwise send as empty.
+function fieldProblem(
+  field: TemplateFieldResponse,
+  values: Record<string, unknown>,
+  unreadable = false,
+): string | null {
+  const label = field.label;
+  if (unreadable)
+    return field.type === 'DATE'
+      ? `${label} must be a complete date.`
+      : `${label} must be a number.`;
+  const value = submittedValue(field, values);
+  if (value === null || value === undefined)
+    return field.required
+      ? field.type === 'IMAGE' || field.type === 'LOGO'
+        ? `Choose an image for ${label}.`
+        : field.type === 'BOOLEAN'
+          ? `${label} is required: tick the box, or tick and clear it to answer no.`
+          : `${label} is required.`
+      : null;
+  if (field.required && typeof value === 'string' && !value.trim())
+    return `${label} is required.`;
+  if (field.type === 'IMAGE' || field.type === 'LOGO')
+    return typeof value === 'string' && value.length <= 128
+      ? null
+      : `Choose an image for ${label}.`;
+  if (field.type === 'NUMBER') {
+    if (typeof value !== 'number' || !Number.isFinite(value))
+      return `${label} must be a number.`;
+  } else if (field.type === 'BOOLEAN') {
+    if (typeof value !== 'boolean')
+      return `${label} must be answered yes or no.`;
+  } else if (typeof value !== 'string' || value.length > TEXT_LIMIT)
+    return `${label} must be text of at most ${TEXT_LIMIT} characters.`;
+  const rules = field.validationRules ?? {};
+  if (typeof value === 'string') {
+    if (rules.minLength !== undefined && value.length < rules.minLength)
+      return `${label} must be at least ${rules.minLength} characters (it has ${value.length}).`;
+    if (rules.maxLength !== undefined && value.length > rules.maxLength)
+      return `${label} must be at most ${rules.maxLength} characters (it has ${value.length}).`;
+    if (field.type === 'URL' && !isHttpUrl(value))
+      return `${label} must be a full web address starting with http:// or https://.`;
+    if (field.type === 'PHONE' && !PHONE_PATTERN.test(value))
+      return `${label} must be a phone number of 7 to 24 digits, spaces, brackets or dashes, optionally starting with +.`;
+    if (field.type === 'COLOR' && !COLOR_PATTERN.test(value))
+      return `${label} must be a colour written as # and six hex digits, for example #1A2B3C.`;
+    if (field.type === 'DATE' && !isCalendarDate(value))
+      return `${label} must be a real date (YYYY-MM-DD).`;
+  }
+  if (typeof value === 'number') {
+    if (rules.min !== undefined && value < rules.min)
+      return `${label} must be at least ${rules.min}.`;
+    if (rules.max !== undefined && value > rules.max)
+      return `${label} must be at most ${rules.max}.`;
+  }
+  return null;
+}
+// The creative name, as the API checks it (trimmed, 1 to 120 characters).
+function nameProblem(name: string): string | null {
+  if (!name.trim()) return 'Enter a name for the creative.';
+  if (name.trim().length > NAME_LIMIT)
+    return `The name must be at most ${NAME_LIMIT} characters.`;
+  return null;
+}
+
 // The values a creative keeps when it moves to another template or template
 // version: the target's defaults, overlaid with each entered value whose key
 // has a field of the same kind there. `from` (the fields the values were
@@ -241,17 +343,50 @@ export default function CreativeWorkspace({
   valuesNow.current = values;
   const fieldsNow = useRef(selectedVersion?.fields);
   fieldsNow.current = selectedVersion?.fields;
-  // Mirrors the server's required-value rule; the server still validates.
-  const missingRequiredValue =
-    selectedVersion?.fields.some((field) => {
-      if (!field.required) return false;
-      const value = values[field.key];
-      return (
-        value === null ||
-        value === undefined ||
-        (typeof value === 'string' && value.trim().length === 0)
-      );
-    }) ?? false;
+  // Browser validation (see fieldProblem): every problem in the form, in
+  // form order. A field's message shows once it was changed or left
+  // (`touched`), once its value was carried over from another template or
+  // version, or after the user asked to see the problems (or tried to save).
+  const [touched, setTouched] = useState<Set<string>>(() => new Set());
+  const [unreadable, setUnreadable] = useState<Set<string>>(() => new Set());
+  const [revealProblems, setRevealProblems] = useState(false);
+  const inputIdPrefix = useId();
+  const problemsId = useId();
+  const inputId = (key: string) => inputIdPrefix + '-' + key;
+  const NAME_KEY = '__name';
+  const problems: { key: string; label: string; message: string }[] = [];
+  const nameMessage = nameProblem(name);
+  if (nameMessage)
+    problems.push({ key: NAME_KEY, label: 'Name', message: nameMessage });
+  for (const field of selectedVersion?.fields ?? []) {
+    const message = fieldProblem(field, values, unreadable.has(field.key));
+    if (message) problems.push({ key: field.key, label: field.label, message });
+  }
+  const problemFor = (key: string) =>
+    problems.find((problem) => problem.key === key)?.message ?? null;
+  const shownProblem = (key: string) =>
+    revealProblems || touched.has(key) ? problemFor(key) : null;
+  function markTouched(key: string): void {
+    setTouched((current) =>
+      current.has(key) ? current : new Set(current).add(key),
+    );
+  }
+  // Clears what the form says about problems, for a form that starts over.
+  function resetValidation(): void {
+    setTouched(new Set());
+    setUnreadable(new Set());
+    setRevealProblems(false);
+  }
+  // What the browser could not read belongs to the version it was typed in.
+  useEffect(() => {
+    setUnreadable(new Set());
+  }, [templateVersionId]);
+  // Shows every problem and moves focus to the first one.
+  function showProblems(): void {
+    setRevealProblems(true);
+    const first = problems[0];
+    if (first) document.getElementById(inputId(first.key))?.focus();
+  }
   // The API refuses a new revision while a run is RUNNING (409). With
   // workflows:read the screen knows this in advance and locks saving; until
   // the run state is known it does not offer a save that may be refused.
@@ -278,8 +413,7 @@ export default function CreativeWorkspace({
     );
   const canSubmit =
     !!selectedVersion?.immutableAt &&
-    name.trim().length > 0 &&
-    !missingRequiredValue &&
+    problems.length === 0 &&
     !editLocked &&
     !awaitingRunState;
 
@@ -400,6 +534,7 @@ export default function CreativeWorkspace({
     setTemplateVersionId('');
     templateChangeRequest.current += 1;
     setTemplateChange(null);
+    resetValidation();
     setCreatives([]);
     setAssets([]);
     setHistory([]);
@@ -563,6 +698,14 @@ export default function CreativeWorkspace({
     setTemplateDetail(detail);
     setTemplateVersionId(versionId);
     setValues(carried.values);
+    // A carried value is checked against the new version's rules at once,
+    // so a value that no longer fits is explained beside its field.
+    setTouched((current) => {
+      const next = new Set(current);
+      for (const [key, value] of Object.entries(carried.values))
+        if (!isBlank(value)) next.add(key);
+      return next;
+    });
     // The form now holds these values; loading the template again must not
     // replace them with its defaults.
     appliedFormSource.current = [
@@ -665,6 +808,7 @@ export default function CreativeWorkspace({
     setSelectedId(id);
     setInspectedRevision(null);
     setSummary('');
+    resetValidation();
     if (!creative) {
       setName('');
       setValues({});
@@ -783,6 +927,12 @@ export default function CreativeWorkspace({
   async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (actionInFlight.current || !canWriteForm()) return;
+    // Enter in a field submits even while Save is disabled: nothing is sent
+    // while a value would be refused; the problems are shown instead.
+    if (problems.length) {
+      showProblems();
+      return;
+    }
     actionInFlight.current = true;
     setBusy(true);
     setError('');
@@ -835,6 +985,7 @@ export default function CreativeWorkspace({
       ]);
       setSelectedId(saved.id);
       setSummary('');
+      resetValidation();
       if (selected) setReviewKey((key) => key + 1);
       onDataChanged?.('creatives');
       return saved;
@@ -931,6 +1082,10 @@ export default function CreativeWorkspace({
   async function saveAndResubmit(): Promise<void> {
     if (!oneClickResubmit || !latestRun || actionInFlight.current) return;
     if (!canWriteForm()) return;
+    if (problems.length) {
+      showProblems();
+      return;
+    }
     const workflowId = latestRun.workflowId;
     actionInFlight.current = true;
     setBusy(true);
@@ -992,6 +1147,53 @@ export default function CreativeWorkspace({
       <small id={helpTextId(field)}>{field.helpText}</small>
     ) : null;
   }
+  const errorId = (key: string) => inputId(key) + '-error';
+  // The id(s) describing an editable field: its help text and, when shown,
+  // its validation message.
+  function describedBy(
+    key: string,
+    help: string | undefined,
+  ): string | undefined {
+    return (
+      [help, shownProblem(key) ? errorId(key) : undefined]
+        .filter(Boolean)
+        .join(' ') || undefined
+    );
+  }
+  // The validation message beside a field, once it is to be shown.
+  function fieldError(key: string) {
+    const message = shownProblem(key);
+    return message ? (
+      <p className="form-message field-error" id={errorId(key)}>
+        {message}
+      </p>
+    ) : null;
+  }
+  // Attributes every editable template field shares.
+  function fieldControl(field: TemplateFieldResponse) {
+    return {
+      id: inputId(field.key),
+      'aria-label': field.label,
+      'aria-describedby': describedBy(field.key, helpTextId(field)),
+      'aria-invalid': shownProblem(field.key) ? true : undefined,
+      onBlur: () => markTouched(field.key),
+    };
+  }
+  // A field whose typed text the browser cannot read (an incomplete number
+  // or date) is sent as empty; it is remembered so it can be explained.
+  function trackReadable(
+    field: TemplateFieldResponse,
+    input: HTMLInputElement,
+  ): void {
+    const bad = !!input.validity?.badInput;
+    setUnreadable((current) => {
+      if (current.has(field.key) === bad) return current;
+      const next = new Set(current);
+      if (bad) next.add(field.key);
+      else next.delete(field.key);
+      return next;
+    });
+  }
   function renderField(
     field: TemplateFieldResponse,
     source: Record<string, unknown>,
@@ -1011,13 +1213,13 @@ export default function CreativeWorkspace({
             />
           ) : (
             <select
-              aria-label={field.label}
-              aria-describedby={helpTextId(field)}
+              {...fieldControl(field)}
               required={field.required}
               value={typeof value === 'string' ? value : ''}
-              onChange={(event) =>
-                updateValue(field, event.target.value || null)
-              }
+              onChange={(event) => {
+                markTouched(field.key);
+                updateValue(field, event.target.value || null);
+              }}
             >
               <option value="">Select image</option>
               {assets
@@ -1033,6 +1235,7 @@ export default function CreativeWorkspace({
             </select>
           )}
           {!readonly && helpText(field)}
+          {!readonly && fieldError(field.key)}
           {!readonly && typeof value === 'string' && value && (
             <AssetReference
               assetId={value}
@@ -1055,13 +1258,16 @@ export default function CreativeWorkspace({
         <label className="checkbox-label" key={field.id}>
           {fieldLabel(field)}
           <input
-            aria-label={field.label}
-            aria-describedby={helpTextId(field)}
+            {...fieldControl(field)}
             type="checkbox"
             checked={value === true}
-            onChange={(event) => updateValue(field, event.target.checked)}
+            onChange={(event) => {
+              markTouched(field.key);
+              updateValue(field, event.target.checked);
+            }}
           />
           {helpText(field)}
+          {fieldError(field.key)}
         </label>
       );
     if (field.type === 'MULTILINE_TEXT')
@@ -1069,14 +1275,19 @@ export default function CreativeWorkspace({
         <label key={field.id}>
           {fieldLabel(field)}
           <textarea
-            aria-label={field.label}
-            aria-describedby={helpTextId(field)}
+            {...fieldControl(field)}
             required={field.required}
-            maxLength={10000}
+            maxLength={TEXT_LIMIT}
             value={typeof value === 'string' ? value : ''}
-            onChange={(event) => updateValue(field, event.target.value)}
+            // Emptied, it is sent as empty (null), like the other text
+            // fields, so an optional paragraph's length rules do not apply.
+            onChange={(event) => {
+              markTouched(field.key);
+              updateValue(field, event.target.value || null);
+            }}
           />
           {helpText(field)}
+          {fieldError(field.key)}
         </label>
       );
     const inputType =
@@ -1093,13 +1304,14 @@ export default function CreativeWorkspace({
       <label key={field.id}>
         {fieldLabel(field)}
         <input
-          aria-label={field.label}
-          aria-describedby={helpTextId(field)}
+          {...fieldControl(field)}
           type={inputType}
           required={field.required}
-          maxLength={field.type === 'NUMBER' ? undefined : 10000}
+          maxLength={field.type === 'NUMBER' ? undefined : TEXT_LIMIT}
           value={value === null || value === undefined ? '' : String(value)}
-          onChange={(event) =>
+          onChange={(event) => {
+            markTouched(field.key);
+            trackReadable(field, event.target);
             updateValue(
               field,
               field.type === 'NUMBER'
@@ -1107,16 +1319,23 @@ export default function CreativeWorkspace({
                   ? Number(event.target.value)
                   : null
                 : event.target.value || null,
-            )
-          }
+            );
+          }}
         />
         {helpText(field)}
+        {fieldError(field.key)}
       </label>
     );
   }
 
   if (!canRead) return null;
   const formShown = (selected && canUpdate) || (!selected && canCreate);
+  // Why saving is unavailable, by Save, once the user has worked on a form
+  // with a template version (or asked to see the problems).
+  const problemsListed =
+    problems.length > 0 &&
+    !!selectedVersion &&
+    (revealProblems || touched.size > 0);
   const changeRequestBanner =
     selected && openRequests.length > 0 ? (
       <ChangeRequestBanner
@@ -1329,12 +1548,21 @@ export default function CreativeWorkspace({
                   <span className="field-hint"> (required)</span>
                 </span>
                 <input
+                  id={inputId(NAME_KEY)}
                   required
-                  maxLength={120}
+                  maxLength={NAME_LIMIT}
                   value={name}
-                  onChange={(event) => setName(event.target.value)}
+                  aria-invalid={shownProblem(NAME_KEY) ? true : undefined}
+                  aria-describedby={describedBy(NAME_KEY, undefined)}
+                  onBlur={() => markTouched(NAME_KEY)}
+                  onChange={(event) => {
+                    markTouched(NAME_KEY);
+                    setName(event.target.value);
+                  }}
                 />
               </label>
+              {/* Outside the label, so it is not part of the field's name. */}
+              {fieldError(NAME_KEY)}
               <label>
                 <span>
                   Template
@@ -1462,13 +1690,37 @@ export default function CreativeWorkspace({
                   Checking whether a workflow is running before saving…
                 </p>
               )}
+              {problemsListed && (
+                <div className="form-problems" id={problemsId}>
+                  <p>
+                    {problems.length === 1
+                      ? 'Fix this before saving: '
+                      : `Fix these ${problems.length} fields before saving: `}
+                    {problems.map((problem) => problem.label).join(', ')}.
+                  </p>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={showProblems}
+                  >
+                    {problems.length === 1
+                      ? 'Show the problem'
+                      : 'Show the first problem'}
+                  </button>
+                </div>
+              )}
               <button
                 type="submit"
                 disabled={busy || !canSubmit}
                 aria-describedby={
-                  selected && (editLocked || awaitingRunState)
-                    ? lockNoticeId
-                    : undefined
+                  [
+                    selected && (editLocked || awaitingRunState)
+                      ? lockNoticeId
+                      : '',
+                    problemsListed ? problemsId : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ') || undefined
                 }
               >
                 {busy
@@ -1482,7 +1734,12 @@ export default function CreativeWorkspace({
                   type="button"
                   disabled={busy || !canSubmit}
                   aria-describedby={
-                    editLocked || awaitingRunState ? lockNoticeId : undefined
+                    [
+                      editLocked || awaitingRunState ? lockNoticeId : '',
+                      problemsListed ? problemsId : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ') || undefined
                   }
                   onClick={() => void saveAndResubmit()}
                 >

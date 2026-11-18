@@ -1781,6 +1781,31 @@ p[role='status'][aria-busy='true'] {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* Creative form validation: a field's problem sits under it; the summary
+   by Save names the fields to fix. */
+.field-error {
+  margin: var(--space-1) 0 0;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+.admin-form [aria-invalid='true'] {
+  border-color: var(--color-danger);
+}
+.form-problems {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  font-size: var(--text-sm);
+}
+.form-problems p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
 /* Audit entries: labelled facts, IDs and details wrap instead of overflowing. */
 .audit-list[aria-busy='true'] {
   opacity: 0.6;
