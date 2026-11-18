@@ -267,7 +267,9 @@ describe('WorkflowWorkspace', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: 'Validate' }));
     expect(
-      await screen.findByText('Workflow definition is valid.'),
+      await screen.findByText(
+        'Workflow definition is valid: saved version 1, which the editor shows, was checked.',
+      ),
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(

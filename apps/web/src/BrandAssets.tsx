@@ -149,7 +149,18 @@ export default function BrandAssets({
   useEffect(() => {
     if (incomingBranchId) setScopeBranchId(incomingBranchId);
   }, [incomingBranchId]);
-  const [brand, setBrand] = useState<Brand | null>(null);
+  // The loaded profile and the scope ('' for the organization) it belongs
+  // to. It is shown, and its form offered, only while that scope is still
+  // the selected one, so values loaded or typed for one scope can never be
+  // saved to another.
+  const [loaded, setLoaded] = useState<{
+    scopeId: string;
+    brand: Brand;
+  } | null>(null);
+  const brand = loaded?.scopeId === scopeBranchId ? loaded.brand : null;
+  // Only the latest load may apply its reply: a slower reply for a scope
+  // chosen earlier is ignored.
+  const loadRequest = useRef(0);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -221,32 +232,33 @@ export default function BrandAssets({
 
   async function reload(): Promise<void> {
     if (!session.user.permissions.includes('brand:read')) return;
+    const sequence = ++loadRequest.current;
+    const scopeId = scopeBranch?.id ?? '';
     setError('');
     // Brand settings need only brand:read; without assets:read the asset
     // list is never requested, so its 403 cannot hide the brand profile.
     const listAssets = (path: string): Promise<Asset[]> =>
       canReadAssets ? request<Asset[]>(path) : Promise.resolve([]);
     try {
-      if (scopeBranch) {
-        const [resolved, list] = await Promise.all([
-          request<Brand>(
-            '/branches/' +
-              encodeURIComponent(scopeBranch.id) +
-              '/brand/effective',
-          ),
-          listAssets('/assets?branchId=' + encodeURIComponent(scopeBranch.id)),
-        ]);
-        setBrand(resolved);
-        setAssets(list);
-      } else {
-        const [profile, list] = await Promise.all([
-          request<Brand>('/organization/brand'),
-          listAssets('/assets'),
-        ]);
-        setBrand(profile);
-        setAssets(list);
-      }
+      const [profile, list] = await Promise.all([
+        request<Brand>(
+          scopeBranch
+            ? '/branches/' +
+                encodeURIComponent(scopeBranch.id) +
+                '/brand/effective'
+            : '/organization/brand',
+        ),
+        listAssets(
+          scopeBranch
+            ? '/assets?branchId=' + encodeURIComponent(scopeBranch.id)
+            : '/assets',
+        ),
+      ]);
+      if (sequence !== loadRequest.current) return;
+      setLoaded({ scopeId, brand: profile });
+      setAssets(list);
     } catch (cause) {
+      if (sequence !== loadRequest.current) return;
       setError(
         cause instanceof Error
           ? cause.message
@@ -260,9 +272,15 @@ export default function BrandAssets({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.accessToken, scopeBranchId]);
 
-  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
+  // Saves the form to the scope it was rendered for (the form is keyed by
+  // scope), whatever is selected by the time the reply arrives.
+  async function save(
+    event: FormEvent<HTMLFormElement>,
+    formScope: { id: string; name: string } | null,
+  ): Promise<void> {
     event.preventDefault();
     if (!brand) return;
+    const scopeId = formScope?.id ?? '';
     setBusy(true);
     setError('');
     setMessage('');
@@ -282,15 +300,20 @@ export default function BrandAssets({
       }),
     );
     try {
-      const path = scopeBranch
-        ? '/branches/' + encodeURIComponent(scopeBranch.id) + '/brand'
+      const path = formScope
+        ? '/branches/' + encodeURIComponent(formScope.id) + '/brand'
         : '/organization/brand';
       const result = await request<Brand>(path, {
         method: 'PATCH',
         body: JSON.stringify(payload),
       });
-      setBrand(result);
-      setMessage('Brand profile saved.');
+      // The saved profile replaces what is loaded only for its own scope.
+      setLoaded((current) =>
+        current?.scopeId === scopeId ? { scopeId, brand: result } : current,
+      );
+      setMessage(
+        (formScope ? formScope.name : 'Organization') + ' brand profile saved.',
+      );
     } catch (cause) {
       setError(failureMessage(cause, 'Unable to save brand profile.'));
     } finally {
@@ -449,6 +472,11 @@ export default function BrandAssets({
       </div>
       <FeedbackMessage tone="error" message={error} />
       <FeedbackMessage tone="success" message={message} />
+      {!brand && !error && (
+        <p className="empty-state" role="status">
+          Loading {scopeBranch ? scopeBranch.name : 'organization'} brand…
+        </p>
+      )}
       {brand && (
         <section className="admin-card">
           <h3>
@@ -467,7 +495,23 @@ export default function BrandAssets({
             source={assetSource}
           />
           {canManageBrand && (scopeBranch || canManageOrganization) ? (
-            <form className="admin-form" onSubmit={(event) => void save(event)}>
+            // Keyed by scope: the inputs start from this scope's values.
+            <form
+              key={scopeBranchId || 'organization'}
+              className="admin-form"
+              aria-label={
+                (scopeBranch ? scopeBranch.name : 'Organization') +
+                ' brand profile'
+              }
+              onSubmit={(event) =>
+                void save(
+                  event,
+                  scopeBranch
+                    ? { id: scopeBranch.id, name: scopeBranch.name }
+                    : null,
+                )
+              }
+            >
               <label>
                 Display name
                 <input
@@ -556,7 +600,10 @@ export default function BrandAssets({
         </section>
       )}
       {canManageAssets && (scopeBranch || canManageOrganization) && (
+        // Keyed by scope: a file chosen for one scope is not uploaded to
+        // another.
         <form
+          key={scopeBranchId || 'organization'}
           className="admin-card admin-form"
           onSubmit={(event) => void upload(event)}
         >

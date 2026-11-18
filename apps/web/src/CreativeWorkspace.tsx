@@ -71,6 +71,66 @@ function comparableValues(values: Record<string, unknown>): string {
   );
 }
 
+const isBlank = (value: unknown) =>
+  value === null ||
+  value === undefined ||
+  (typeof value === 'string' && value.trim() === '');
+const plural = (count: number, noun: string) =>
+  count + ' ' + noun + (count === 1 ? '' : 's');
+// Field types that hold the same kind of value.
+const valueKind = (type: string) =>
+  type === 'MULTILINE_TEXT' ? 'TEXT' : type === 'LOGO' ? 'IMAGE' : type;
+function valueFits(type: string, value: unknown): boolean {
+  if (type === 'NUMBER') return typeof value === 'number';
+  if (type === 'BOOLEAN') return typeof value === 'boolean';
+  return typeof value === 'string';
+}
+function fieldDefaults(
+  fields: TemplateFieldResponse[],
+): Record<string, unknown> {
+  return Object.fromEntries(
+    fields
+      .filter(
+        (field) =>
+          field.defaultValue !== null && field.defaultValue !== undefined,
+      )
+      .map((field) => [field.key, field.defaultValue]),
+  );
+}
+
+// The values a creative keeps when it moves to another template or template
+// version: the target's defaults, overlaid with each entered value whose key
+// has a field of the same kind there. `from` (the fields the values were
+// entered in, when known) separates the user's values from untouched
+// defaults; `lost` names the user's values the target has no field for.
+function carryValues(
+  values: Record<string, unknown>,
+  from: TemplateFieldResponse[] | undefined,
+  to: TemplateFieldResponse[],
+): { values: Record<string, unknown>; kept: string[]; lost: string[] } {
+  const next = fieldDefaults(to);
+  const kept: string[] = [];
+  const lost: string[] = [];
+  for (const [key, value] of Object.entries(values)) {
+    if (isBlank(value)) continue;
+    const source = from?.find((field) => field.key === key);
+    const target = to.find((field) => field.key === key);
+    if (
+      target &&
+      valueFits(target.type, value) &&
+      (!source || valueKind(source.type) === valueKind(target.type))
+    ) {
+      next[key] = value;
+      kept.push(target.label);
+      continue;
+    }
+    // A default the user never changed is not theirs to lose.
+    if (source && source.defaultValue === value) continue;
+    lost.push(source?.label ?? key);
+  }
+  return { values: next, kept, lost };
+}
+
 export default function CreativeWorkspace({
   session,
   branch,
@@ -162,6 +222,25 @@ export default function CreativeWorkspace({
       ) ?? null,
     [templateDetail, templateVersionId],
   );
+  // A template or template version the user chose that would discard some
+  // entered values: loading the template to check (`detail` null), or
+  // waiting for the user to confirm. Null when nothing is waiting.
+  const [templateChange, setTemplateChange] = useState<{
+    kind: 'template' | 'version';
+    templateId: string;
+    name: string;
+    detail: TemplateResponse | null;
+    versionId: string;
+  } | null>(null);
+  // Only the latest change request may act on its reply.
+  const templateChangeRequest = useRef(0);
+  const templateSelect = useRef<HTMLSelectElement>(null);
+  const versionSelect = useRef<HTMLSelectElement>(null);
+  // The values and their fields now, for replies that arrive later.
+  const valuesNow = useRef(values);
+  valuesNow.current = values;
+  const fieldsNow = useRef(selectedVersion?.fields);
+  fieldsNow.current = selectedVersion?.fields;
   // Mirrors the server's required-value rule; the server still validates.
   const missingRequiredValue =
     selectedVersion?.fields.some((field) => {
@@ -319,6 +398,8 @@ export default function CreativeWorkspace({
     setMessage('');
     setSelectedTemplateId('');
     setTemplateVersionId('');
+    templateChangeRequest.current += 1;
+    setTemplateChange(null);
     setCreatives([]);
     setAssets([]);
     setHistory([]);
@@ -447,8 +528,139 @@ export default function CreativeWorkspace({
     setOpenRequests([]);
   }, [selectedId, session.accessToken]);
 
+  function cancelTemplateChange(): void {
+    templateChangeRequest.current += 1;
+    setTemplateChange(null);
+  }
+
+  // The version a creative uses in `detail`: the one its current revision
+  // was made with, otherwise the active version.
+  function versionFor(detail: TemplateResponse): string {
+    const revisionVersion = detail.versions?.find(
+      (version) => version.id === selected?.currentRevision?.templateVersionId,
+    );
+    const active = detail.versions?.find(
+      (version) => version.versionNumber === detail.activeVersionNumber,
+    );
+    return (revisionVersion ?? active)?.id ?? '';
+  }
+  const fieldsOf = (detail: TemplateResponse, versionId: string) =>
+    detail.versions?.find((version) => version.id === versionId)?.fields ?? [];
+
+  // Moves the form to `versionId` of `detail`, keeping every entered value
+  // that has a field there.
+  function applyTemplateChange(
+    detail: TemplateResponse,
+    versionId: string,
+  ): void {
+    const carried = carryValues(
+      valuesNow.current,
+      fieldsNow.current,
+      fieldsOf(detail, versionId),
+    );
+    cancelTemplateChange();
+    setSelectedTemplateId(detail.id);
+    setTemplateDetail(detail);
+    setTemplateVersionId(versionId);
+    setValues(carried.values);
+    // The form now holds these values; loading the template again must not
+    // replace them with its defaults.
+    appliedFormSource.current = [
+      detail.id,
+      selectedId,
+      selected?.currentRevision?.id ?? '',
+    ].join(':');
+  }
+
+  function requestTemplate(templateId: string): void {
+    cancelTemplateChange();
+    if (!templateId) {
+      // No template: nothing can be saved, and the values are kept aside
+      // for the next template chosen.
+      setSelectedTemplateId('');
+      setTemplateVersionId('');
+      return;
+    }
+    if (!carryValues(values, selectedVersion?.fields, []).lost.length) {
+      // Nothing entered: start from the template's own values.
+      setSelectedTemplateId(templateId);
+      setTemplateVersionId('');
+      setValues({});
+      return;
+    }
+    // Which values the template can keep is known only from its fields.
+    const sequence = templateChangeRequest.current;
+    const name =
+      templates.find((item) => item.id === templateId)?.name ?? 'The template';
+    setTemplateChange({
+      kind: 'template',
+      templateId,
+      name,
+      detail: null,
+      versionId: '',
+    });
+    void request<TemplateResponse>(
+      '/templates/' + encodeURIComponent(templateId),
+    )
+      .then((detail) => {
+        if (sequence !== templateChangeRequest.current) return;
+        const versionId = versionFor(detail);
+        const carried = carryValues(
+          valuesNow.current,
+          fieldsNow.current,
+          fieldsOf(detail, versionId),
+        );
+        if (!carried.lost.length) applyTemplateChange(detail, versionId);
+        else
+          setTemplateChange({
+            kind: 'template',
+            templateId,
+            name: detail.name,
+            detail,
+            versionId,
+          });
+      })
+      .catch((cause: unknown) => {
+        if (sequence !== templateChangeRequest.current) return;
+        setTemplateChange(null);
+        setError(
+          name +
+            " couldn't be loaded, so the template was not changed and your values are kept. " +
+            (cause instanceof Error ? cause.message : ''),
+        );
+      });
+  }
+
+  function requestVersion(versionId: string): void {
+    cancelTemplateChange();
+    if (!templateDetail) return;
+    if (!versionId) {
+      // As with no template: the values are kept aside.
+      setTemplateVersionId('');
+      return;
+    }
+    const target = templateDetail.versions?.find(
+      (version) => version.id === versionId,
+    );
+    if (
+      !carryValues(values, selectedVersion?.fields, target?.fields ?? []).lost
+        .length
+    ) {
+      applyTemplateChange(templateDetail, versionId);
+      return;
+    }
+    setTemplateChange({
+      kind: 'version',
+      templateId: templateDetail.id,
+      name: 'Version ' + (target?.versionNumber ?? ''),
+      detail: templateDetail,
+      versionId,
+    });
+  }
+
   function chooseCreative(id: string): void {
     const creative = creatives.find((item) => item.id === id);
+    cancelTemplateChange();
     setPendingOpen(null);
     setSelectedId(id);
     setInspectedRevision(null);
@@ -474,7 +686,14 @@ export default function CreativeWorkspace({
   const formDirty = (() => {
     if (!canRead) return false;
     if (summary.trim()) return true;
-    if (!selected) return canCreate && (!!name.trim() || !!selectedTemplateId);
+    if (!selected)
+      return (
+        canCreate &&
+        (!!name.trim() ||
+          !!selectedTemplateId ||
+          // Values kept aside while no template is chosen.
+          Object.values(values).some((value) => !isBlank(value)))
+      );
     if (!canUpdate) return false;
     const revision = selected.currentRevision;
     if (name !== selected.name) return true;
@@ -915,6 +1134,72 @@ export default function CreativeWorkspace({
         onResubmit={() => void resubmit()}
       />
     ) : null;
+  // A template or version change waiting on the template's fields or on the
+  // user. Lists exactly what would be discarded and what is kept; both
+  // follow the values as they are now.
+  const changePreview =
+    templateChange?.detail &&
+    carryValues(
+      values,
+      selectedVersion?.fields,
+      fieldsOf(templateChange.detail, templateChange.versionId),
+    );
+  const templateChangeNotice = templateChange && (
+    <>
+      {!changePreview ? (
+        <p className="empty-state" role="status">
+          Checking which values {templateChange.name} can keep…
+        </p>
+      ) : (
+        <div
+          className="confirm-panel"
+          role="group"
+          aria-label="Values that cannot be kept"
+        >
+          <p role="alert">
+            {changePreview.lost.length
+              ? templateChange.name +
+                ' has no field for: ' +
+                changePreview.lost.join(', ') +
+                '. '
+              : ''}
+            {changePreview.kept.length
+              ? changePreview.kept.join(', ') + ' will be kept.'
+              : 'None of the values you entered can be kept.'}
+          </p>
+          <div className="template-actions">
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => {
+                const { detail, versionId } = templateChange;
+                if (detail) applyTemplateChange(detail, versionId);
+              }}
+            >
+              {changePreview.lost.length
+                ? 'Switch and discard ' +
+                  plural(changePreview.lost.length, 'value')
+                : 'Switch ' + templateChange.kind}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => {
+                const select =
+                  templateChange.kind === 'template'
+                    ? templateSelect.current
+                    : versionSelect.current;
+                cancelTemplateChange();
+                select?.focus();
+              }}
+            >
+              Keep current {templateChange.kind}
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
   return (
     <section
       className="admin-panel creative-workspace"
@@ -1057,14 +1342,15 @@ export default function CreativeWorkspace({
                 </span>
                 <select
                   aria-label="Template"
+                  ref={templateSelect}
                   required
-                  value={selectedTemplateId}
+                  value={
+                    templateChange?.kind === 'template'
+                      ? templateChange.templateId
+                      : selectedTemplateId
+                  }
                   disabled={loading || (!templates.length && !templateDetail)}
-                  onChange={(event) => {
-                    setSelectedTemplateId(event.target.value);
-                    setTemplateVersionId('');
-                    setValues({});
-                  }}
+                  onChange={(event) => requestTemplate(event.target.value)}
                 >
                   <option value="">
                     {loading
@@ -1088,6 +1374,7 @@ export default function CreativeWorkspace({
                   ))}
                 </select>
               </label>
+              {templateChange?.kind === 'template' && templateChangeNotice}
               {!loading && !error && !templates.length && !templateDetail && (
                 <p className="empty-state template-empty-state" role="status">
                   No active templates are available. Create a draft, add a
@@ -1108,25 +1395,14 @@ export default function CreativeWorkspace({
                   </span>
                   <select
                     aria-label="Template version"
+                    ref={versionSelect}
                     required
-                    value={templateVersionId}
-                    onChange={(event) => {
-                      setTemplateVersionId(event.target.value);
-                      const version = templateDetail.versions?.find(
-                        (item) => item.id === event.target.value,
-                      );
-                      setValues(
-                        Object.fromEntries(
-                          (version?.fields ?? [])
-                            .filter(
-                              (field) =>
-                                field.defaultValue !== null &&
-                                field.defaultValue !== undefined,
-                            )
-                            .map((field) => [field.key, field.defaultValue]),
-                        ),
-                      );
-                    }}
+                    value={
+                      templateChange?.kind === 'version'
+                        ? templateChange.versionId
+                        : templateVersionId
+                    }
+                    onChange={(event) => requestVersion(event.target.value)}
                   >
                     <option value="">Choose version</option>
                     {templateDetail.versions
@@ -1152,6 +1428,7 @@ export default function CreativeWorkspace({
                   </select>
                 </label>
               )}
+              {templateChange?.kind === 'version' && templateChangeNotice}
               {selectedVersion?.fields.map((field) =>
                 renderField(field, values),
               )}

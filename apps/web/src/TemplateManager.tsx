@@ -50,6 +50,9 @@ const UNITS = [
 ] as const;
 const unitShort = (unit: string) =>
   UNITS.find((item) => item.value === unit)?.short ?? unit;
+// An API message as a sentence, so text can follow it.
+const asSentence = (message: string) =>
+  /[.!?]$/.test(message.trim()) ? message.trim() : message.trim() + '.';
 const dataSourceLabels: Record<string, string> = {
   ORGANIZATION_BRAND: 'Organization brand',
   EFFECTIVE_BRAND: 'Effective brand',
@@ -75,6 +78,20 @@ export default function TemplateManager({
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [editingFieldId, setEditingFieldId] = useState('');
+  // Why the open field edit was not saved; shown inside that edit form.
+  const [fieldError, setFieldError] = useState<{
+    fieldId: string;
+    message: string;
+  } | null>(null);
+  const [savingFieldId, setSavingFieldId] = useState('');
+  // The template chosen now and the field being edited now, for replies to
+  // requests sent earlier. Only the latest detail request may apply its
+  // reply, so a slow reply for a previously chosen template can never put
+  // that template (and its forms) back on screen.
+  const selectedIdRef = useRef('');
+  const editingFieldRef = useRef('');
+  editingFieldRef.current = editingFieldId;
+  const detailRequest = useRef(0);
   // The destructive action awaiting confirmation: 'archive', or the ID of the
   // field to remove.
   const [confirming, setConfirming] = useState<
@@ -126,15 +143,33 @@ export default function TemplateManager({
       : ((await response.json()) as T);
   }
 
-  async function refresh(id = selectedId) {
+  // Reloads the list and the template chosen now (not the one chosen when an
+  // earlier action started).
+  async function refresh(id = selectedIdRef.current) {
     if (!canReadTemplates) return;
+    const sequence = ++detailRequest.current;
     const list = await request<TemplateResponse[]>('/templates');
     setTemplates(list);
-    if (id)
-      setSelected(
-        await request<TemplateResponse>(`/templates/${encodeURIComponent(id)}`),
-      );
-    else setSelected(null);
+    const detail = id
+      ? await request<TemplateResponse>(`/templates/${encodeURIComponent(id)}`)
+      : null;
+    if (sequence === detailRequest.current && selectedIdRef.current === id)
+      setSelected(detail);
+  }
+
+  // Everything typed for one template belongs to it alone: choosing another
+  // template closes open edits and confirmations, and its forms only appear
+  // once its own details have loaded (they are keyed by template, so they
+  // start from that template's values).
+  function selectTemplate(id: string) {
+    selectedIdRef.current = id;
+    setSelectedId(id);
+    setSelected(null);
+    setConfirming(null);
+    setEditingFieldId('');
+    setFieldError(null);
+    setCustomPreviewValues({});
+    setPreviewFields(null);
   }
 
   useEffect(() => {
@@ -177,9 +212,13 @@ export default function TemplateManager({
     };
   }, [accessToken, canReadTemplates]);
 
+  // `reportError`, when given, receives the message of a change the API
+  // refused instead of the screen's banner (for example inside the form the
+  // change came from).
   async function mutate(
     action: () => Promise<unknown>,
     success: string,
+    reportError?: (message: string) => void,
   ): Promise<boolean> {
     setBusy(true);
     setError('');
@@ -205,7 +244,7 @@ export default function TemplateManager({
         );
         return true;
       }
-      setError(
+      (reportError ?? setError)(
         cause instanceof Error ? cause.message : 'Template request failed.',
       );
       return false;
@@ -232,7 +271,7 @@ export default function TemplateManager({
           unit: form.get('unit'),
         }),
       });
-      setSelectedId(created.id);
+      selectTemplate(created.id);
       setCreating(false);
       await refresh(created.id);
       onTemplatesChanged?.();
@@ -420,15 +459,17 @@ export default function TemplateManager({
             aria-label="Choose template"
             value={selectedId}
             onChange={(event) => {
-              setSelectedId(event.target.value);
-              setConfirming(null);
-              void refresh(event.target.value).catch((cause: unknown) =>
-                setError(
-                  cause instanceof Error
-                    ? cause.message
-                    : 'Unable to load template.',
-                ),
-              );
+              const id = event.target.value;
+              selectTemplate(id);
+              void refresh(id).catch((cause: unknown) => {
+                // A failure for a template no longer chosen is not reported.
+                if (selectedIdRef.current === id)
+                  setError(
+                    cause instanceof Error
+                      ? cause.message
+                      : 'Unable to load template.',
+                  );
+              });
             }}
           >
             <option value="">Select…</option>
@@ -440,8 +481,15 @@ export default function TemplateManager({
           </select>
         </label>
       )}
+      {selectedId && !selected && !error && (
+        <p className="empty-state" role="status">
+          Loading template…
+        </p>
+      )}
       {selected && (
-        <div className="template-detail">
+        // Keyed by template: every form below starts from this template's
+        // own values, never from what was typed for another template.
+        <div className="template-detail" key={selected.id}>
           <div className="service-heading">
             <div>
               <p className="card-label">
@@ -464,6 +512,7 @@ export default function TemplateManager({
           {editable && (
             <form
               className="template-form"
+              aria-label="Template details"
               onSubmit={(event) => {
                 event.preventDefault();
                 const form = new FormData(event.currentTarget);
@@ -545,11 +594,13 @@ export default function TemplateManager({
                   <button
                     type="button"
                     className="secondary-button"
-                    onClick={() =>
+                    aria-expanded={editingFieldId === field.id}
+                    onClick={() => {
+                      setFieldError(null);
                       setEditingFieldId(
                         editingFieldId === field.id ? '' : field.id,
-                      )
-                    }
+                      );
+                    }}
                   >
                     Edit field
                   </button>
@@ -620,6 +671,7 @@ export default function TemplateManager({
               {editable && editingFieldId === field.id && (
                 <form
                   className="template-form"
+                  aria-label={`Edit ${field.label}`}
                   onSubmit={(event) => {
                     event.preventDefault();
                     const form = new FormData(event.currentTarget);
@@ -644,6 +696,11 @@ export default function TemplateManager({
                       ),
                     );
                     const source = form.get('dataSource') || null;
+                    setFieldError(null);
+                    setSavingFieldId(field.id);
+                    // The form stays open, with everything typed, until the
+                    // API accepts the change; a refusal is explained inside
+                    // it. Only a successful save (or Cancel) closes it.
                     void mutate(
                       () =>
                         request(
@@ -669,8 +726,18 @@ export default function TemplateManager({
                           },
                         ),
                       'Field updated.',
-                    );
-                    setEditingFieldId('');
+                      (message) => {
+                        // The form was closed meanwhile (Cancel, or another
+                        // template): report the refusal on the screen.
+                        if (editingFieldRef.current === field.id)
+                          setFieldError({ fieldId: field.id, message });
+                        else setError(message);
+                      },
+                    ).then((saved) => {
+                      setSavingFieldId('');
+                      if (saved && editingFieldRef.current === field.id)
+                        setEditingFieldId('');
+                    });
                   }}
                 >
                   <label>
@@ -779,7 +846,28 @@ export default function TemplateManager({
                     />{' '}
                     Required
                   </label>
-                  <button disabled={busy}>Save field</button>
+                  {fieldError?.fieldId === field.id && (
+                    <p role="alert" className="form-message">
+                      The field was not saved: {asSentence(fieldError.message)}{' '}
+                      Your changes are still in the form. Correct them and save
+                      again, or cancel to discard them.
+                    </p>
+                  )}
+                  <div className="template-actions">
+                    <button disabled={busy}>
+                      {savingFieldId === field.id ? 'Saving…' : 'Save field'}
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        setFieldError(null);
+                        setEditingFieldId('');
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </form>
               )}
             </div>
@@ -787,6 +875,7 @@ export default function TemplateManager({
           {editable && (
             <form
               className="template-form"
+              aria-label="Add field"
               onSubmit={(event) => void addField(event)}
             >
               <h4>Add field</h4>

@@ -135,6 +135,118 @@ function defaultDefinition(): string {
   );
 }
 
+// The saved current version of a workflow as the editor shows it, or null
+// when that version is missing from the reply.
+function savedDefinitionText(workflow: Workflow): string | null {
+  const version = workflow.versions.find(
+    (item) => item.versionNumber === workflow.currentVersionNumber,
+  );
+  if (!version) return null;
+  return JSON.stringify(
+    {
+      name: workflow.name,
+      description: workflow.description,
+      stages: version.stages.map(
+        ({
+          key,
+          name,
+          displayOrder,
+          isEntry,
+          isTerminal,
+          requiredPermission,
+          assignedUserId,
+          assignedPermission,
+          requiresReview,
+        }) => ({
+          key,
+          name,
+          displayOrder,
+          isEntry,
+          isTerminal,
+          requiredPermission,
+          assignedUserId,
+          assignedPermission,
+          requiresReview,
+        }),
+      ),
+      transitions: version.transitions.map((transition) => ({
+        key: transition.key,
+        label: transition.label,
+        from: version.stages.find(
+          (stage) => stage.id === transition.sourceStageId,
+        )?.key,
+        to: version.stages.find(
+          (stage) => stage.id === transition.destinationStageId,
+        )?.key,
+        requiredPermission: transition.requiredPermission,
+        reviewDecision: transition.reviewDecision,
+      })),
+    },
+    null,
+    2,
+  );
+}
+
+const plural = (count: number, noun: string) =>
+  count + ' ' + noun + (count === 1 ? '' : 's');
+const asSentence = (text: string) =>
+  /[.!?]$/.test(text.trim()) ? text.trim() : text.trim() + '.';
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+const isText = (value: unknown) =>
+  typeof value === 'string' && value.trim().length > 0;
+
+// What the browser can check in the editor's text without saving it: that
+// it is JSON with the parts every definition needs. The workflow rules
+// themselves (one entry stage, reviewers, transitions between known stages,
+// …) are the API's, and are checked when the definition is saved.
+function checkDefinitionText(
+  text: string,
+):
+  | { ok: true; stages: number; transitions: number }
+  | { ok: false; problem: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (cause) {
+    return {
+      ok: false,
+      problem:
+        "The definition isn't valid JSON (" +
+        (cause instanceof Error ? cause.message : 'it could not be read') +
+        ').',
+    };
+  }
+  if (!isRecord(parsed))
+    return { ok: false, problem: 'The definition must be a JSON object.' };
+  if (!isText(parsed.name))
+    return { ok: false, problem: '"name" must be a non-empty text value.' };
+  const { stages, transitions } = parsed;
+  if (!Array.isArray(stages))
+    return { ok: false, problem: '"stages" must be a list.' };
+  if (!Array.isArray(transitions))
+    return { ok: false, problem: '"transitions" must be a list.' };
+  const badStage = stages.findIndex(
+    (stage) => !isRecord(stage) || !isText(stage.key) || !isText(stage.name),
+  );
+  if (badStage >= 0)
+    return {
+      ok: false,
+      problem: `Stage ${badStage + 1} needs a "key" and a "name".`,
+    };
+  const badTransition = transitions.findIndex(
+    (transition) =>
+      !isRecord(transition) ||
+      !['key', 'label', 'from', 'to'].every((part) => isText(transition[part])),
+  );
+  if (badTransition >= 0)
+    return {
+      ok: false,
+      problem: `Transition ${badTransition + 1} needs a "key", "label", "from" and "to".`,
+    };
+  return { ok: true, stages: stages.length, transitions: transitions.length };
+}
+
 export default function WorkflowWorkspace({
   session,
   branch,
@@ -164,7 +276,30 @@ export default function WorkflowWorkspace({
   );
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [workflowId, setWorkflowId] = useState('');
-  const [definitionText, setDefinitionText] = useState(defaultDefinition());
+  // The definition editor: its text, the saved text it started from (or the
+  // starter definition), and the workflow that saved text belongs to. The
+  // text differs from the baseline only through the user's own typing, so
+  // only that counts as unsaved. `newerVersion` is set when the workflow was
+  // saved again (elsewhere) while the editor held unsaved edits.
+  const [editor, setEditor] = useState(() => {
+    const starter = defaultDefinition();
+    return {
+      workflowId: '',
+      baseline: starter,
+      text: starter,
+      newerVersion: null as number | null,
+    };
+  });
+  const definitionText = editor.text;
+  const editorDirty = editor.text !== editor.baseline;
+  // A workflow chosen while the editor held unsaved edits, waiting for the
+  // user to discard them or keep editing; `origin` is the picker used.
+  const [pendingWorkflow, setPendingWorkflow] = useState<{
+    id: string;
+    origin: 'definitions' | 'start';
+  } | null>(null);
+  const definitionPicker = useRef<HTMLSelectElement>(null);
+  const startPicker = useRef<HTMLSelectElement>(null);
   const [creatives, setCreatives] = useState<Creative[]>([]);
   const [creativeId, setCreativeId] = useState('');
   const [instance, setInstance] = useState<Instance | null>(null);
@@ -188,6 +323,7 @@ export default function WorkflowWorkspace({
   const startBlockedId = useId();
   const startHintId = useId();
   const transitionHintId = useId();
+  const unsavedHintId = useId();
   const [confirmingDisable, setConfirmingDisable] = useState(false);
   const instanceId = instance?.id;
   useEffect(() => {
@@ -275,58 +411,55 @@ export default function WorkflowWorkspace({
     setCreativeId('');
     void reload(); /* Reload is scoped to user and selected branch. */ // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.accessToken, branch?.id]);
+  // The selected workflow's saved definition goes into the editor when that
+  // workflow is opened, and again after a reload only while the editor has
+  // no unsaved edits. Validate, Refresh and list reloads never replace what
+  // the user typed; a newer saved version is only reported.
+  const savedText = selected ? savedDefinitionText(selected) : null;
+  const selectedVersionNumber = selected?.currentVersionNumber ?? null;
   useEffect(() => {
-    if (!selected) return;
-    const version = selected.versions.find(
-      (item) => item.versionNumber === selected.currentVersionNumber,
-    );
-    if (!version) return;
-    setDefinitionText(
-      JSON.stringify(
-        {
-          name: selected.name,
-          description: selected.description,
-          stages: version.stages.map(
-            ({
-              key,
-              name,
-              displayOrder,
-              isEntry,
-              isTerminal,
-              requiredPermission,
-              assignedUserId,
-              assignedPermission,
-              requiresReview,
-            }) => ({
-              key,
-              name,
-              displayOrder,
-              isEntry,
-              isTerminal,
-              requiredPermission,
-              assignedUserId,
-              assignedPermission,
-              requiresReview,
-            }),
-          ),
-          transitions: version.transitions.map((transition) => ({
-            key: transition.key,
-            label: transition.label,
-            from: version.stages.find(
-              (stage) => stage.id === transition.sourceStageId,
-            )?.key,
-            to: version.stages.find(
-              (stage) => stage.id === transition.destinationStageId,
-            )?.key,
-            requiredPermission: transition.requiredPermission,
-            reviewDecision: transition.reviewDecision,
-          })),
-        },
-        null,
-        2,
-      ),
-    );
-  }, [selected, workflowId, workflows]);
+    if (!selected || savedText === null) return;
+    setEditor((current) => {
+      if (
+        current.workflowId !== selected.id ||
+        current.text === current.baseline
+      )
+        return {
+          workflowId: selected.id,
+          baseline: savedText,
+          text: savedText,
+          newerVersion: null,
+        };
+      if (current.baseline === savedText) return current;
+      return {
+        ...current,
+        baseline: savedText,
+        newerVersion: selectedVersionNumber,
+      };
+    });
+    // `selected` is a new object after every reload; the saved text decides.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected?.id, savedText, selectedVersionNumber]);
+
+  // Choosing a workflow (in either picker) opens its saved definition in the
+  // editor; with unsaved edits for another definition the user is asked
+  // first. Choosing none keeps the editor as it is.
+  function chooseWorkflow(id: string, origin: 'definitions' | 'start'): void {
+    setConfirmingDisable(false);
+    if (id && editorDirty && id !== editor.workflowId) {
+      setPendingWorkflow({ id, origin });
+      return;
+    }
+    setPendingWorkflow(null);
+    setWorkflowId(id);
+  }
+  function discardEdits(): void {
+    setEditor((current) => ({
+      ...current,
+      text: current.baseline,
+      newerVersion: null,
+    }));
+  }
   // Revision numbers with an OPEN or IN_PROGRESS change request for the
   // selected creative. The API refuses a run for such a revision (409); this
   // only explains it before Start is pressed, so it is loaded only for users
@@ -466,12 +599,27 @@ export default function WorkflowWorkspace({
     () => void refreshFromOtherScreen(),
   );
 
+  // Saves exactly the text in the editor. Whatever happens, nothing typed is
+  // lost: unreadable JSON is not sent, a refusal leaves the edits in place,
+  // and edits typed while the save was in flight are kept.
   async function saveDefinition(): Promise<void> {
-    setBusy(true);
     setError('');
     setMessage('');
+    const submitted = definitionText;
+    let definition: unknown;
     try {
-      const definition: unknown = JSON.parse(definitionText);
+      definition = JSON.parse(submitted);
+    } catch {
+      // Explains where the JSON breaks.
+      const check = checkDefinitionText(submitted);
+      setError(
+        (check.ok ? "The definition isn't valid JSON." : check.problem) +
+          ' Nothing was saved; your edits are still in the editor.',
+      );
+      return;
+    }
+    setBusy(true);
+    try {
       const saved = await request<Workflow>(
         workflowId
           ? `/workflows/${encodeURIComponent(workflowId)}`
@@ -481,52 +629,109 @@ export default function WorkflowWorkspace({
           body: JSON.stringify(definition),
         },
       );
+      const savedJson = savedDefinitionText(saved);
+      if (savedJson !== null)
+        setEditor((current) =>
+          current.text === submitted
+            ? {
+                workflowId: saved.id,
+                baseline: savedJson,
+                text: savedJson,
+                newerVersion: null,
+              }
+            : {
+                ...current,
+                workflowId: saved.id,
+                baseline: savedJson,
+                newerVersion: null,
+              },
+        );
       setWorkflows((current) => [
         saved,
         ...current.filter((item) => item.id !== saved.id),
       ]);
+      setPendingWorkflow(null);
       setWorkflowId(saved.id);
       setMessage('A new editable workflow version was saved.');
     } catch (cause) {
       setError(
-        cause instanceof Error
-          ? cause.message
-          : 'Definition must be valid JSON.',
+        asSentence(
+          cause instanceof Error
+            ? cause.message
+            : 'Unable to save the workflow definition',
+        ) + ' Nothing was saved; your edits are still in the editor.',
       );
     } finally {
       setBusy(false);
     }
   }
 
-  async function mutateDefinition(
-    action: 'validate' | 'enable' | 'disable',
-  ): Promise<void> {
+  // Checks what the editor holds. Unsaved edits are checked here (the API
+  // can only validate a saved version); when the editor matches the saved
+  // version, the API validates that version with the full workflow rules.
+  async function validateDefinition(): Promise<void> {
+    setError('');
+    setMessage('');
+    if (!selected || editorDirty) {
+      const check = checkDefinitionText(definitionText);
+      if (!check.ok) {
+        setError(check.problem + ' Your edits are kept.');
+        return;
+      }
+      setMessage(
+        'Your unsaved edits are well-formed: valid JSON with a name, ' +
+          plural(check.stages, 'stage') +
+          ' and ' +
+          plural(check.transitions, 'transition') +
+          '. The workflow rules (one entry stage, end stages, reviewers and transitions) are checked in full when you save them as a new version' +
+          (selected
+            ? `; saved version ${selected.currentVersionNumber} has not changed.`
+            : '.'),
+      );
+      return;
+    }
+    const checkedVersion = selected.currentVersionNumber;
+    setBusy(true);
+    try {
+      const result = await request<{ valid: boolean; errors: string[] }>(
+        `/workflows/${encodeURIComponent(selected.id)}/validate`,
+        { method: 'POST' },
+      );
+      if (result.valid)
+        setMessage(
+          `Workflow definition is valid: saved version ${checkedVersion}, which the editor shows, was checked.`,
+        );
+      else
+        setError(
+          `Saved version ${checkedVersion} has problems: ` +
+            result.errors.join(' '),
+        );
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : 'Unable to validate workflow.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function mutateDefinition(action: 'enable' | 'disable'): Promise<void> {
     if (!selected) return;
     setBusy(true);
     setError('');
     setMessage('');
     try {
-      const result = await request<
-        { valid?: boolean; errors?: string[] } | Workflow
-      >(`/workflows/${encodeURIComponent(selected.id)}/${action}`, {
-        method: 'POST',
-      });
-      if (action === 'validate')
-        setMessage(
-          (result as { valid: boolean; errors: string[] }).valid
-            ? 'Workflow definition is valid.'
-            : (result as { errors: string[] }).errors.join(' '),
-        );
-      else {
-        const updated = result as Workflow;
-        setWorkflows((current) =>
-          current.map((item) =>
-            item.id === updated.id ? { ...item, ...updated } : item,
-          ),
-        );
-        setMessage(`Workflow ${action}d.`);
-        setConfirmingDisable(false);
-      }
+      const updated = await request<Workflow>(
+        `/workflows/${encodeURIComponent(selected.id)}/${action}`,
+        { method: 'POST' },
+      );
+      setWorkflows((current) =>
+        current.map((item) =>
+          item.id === updated.id ? { ...item, ...updated } : item,
+        ),
+      );
+      setMessage(`Workflow ${action}d.`);
+      setConfirmingDisable(false);
       await reload();
     } catch (cause) {
       setError(
@@ -764,6 +969,49 @@ export default function WorkflowWorkspace({
       );
     return "You can't take this step: it is assigned to someone else.";
   }
+  // Asks before a chosen workflow replaces unsaved definition edits.
+  const pendingName =
+    workflows.find((item) => item.id === pendingWorkflow?.id)?.name ??
+    'the chosen workflow';
+  const pendingWorkflowPanel = pendingWorkflow && (
+    <div
+      className="confirm-panel"
+      role="group"
+      aria-label="Unsaved workflow definition"
+    >
+      <p role="alert">
+        Your edits to the workflow definition are not saved. Opening{' '}
+        {pendingName} replaces them with its saved definition.
+      </p>
+      <div className="template-actions">
+        <button
+          type="button"
+          className="danger-button"
+          onClick={() => {
+            const id = pendingWorkflow.id;
+            setPendingWorkflow(null);
+            setWorkflowId(id);
+          }}
+        >
+          Discard edits and switch
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => {
+            const picker =
+              pendingWorkflow.origin === 'start'
+                ? startPicker.current
+                : definitionPicker.current;
+            setPendingWorkflow(null);
+            picker?.focus();
+          }}
+        >
+          Keep editing
+        </button>
+      </div>
+    </div>
+  );
   return (
     <section
       className="admin-panel"
@@ -793,11 +1041,11 @@ export default function WorkflowWorkspace({
               Workflow
               <select
                 aria-label="Workflow definition"
+                ref={definitionPicker}
                 value={workflowId}
-                onChange={(event) => {
-                  setWorkflowId(event.target.value);
-                  setConfirmingDisable(false);
-                }}
+                onChange={(event) =>
+                  chooseWorkflow(event.target.value, 'definitions')
+                }
               >
                 <option value="">Choose workflow</option>
                 {workflows.map((item) => (
@@ -808,31 +1056,53 @@ export default function WorkflowWorkspace({
                 ))}
               </select>
             </label>
+            {pendingWorkflow?.origin === 'definitions' && pendingWorkflowPanel}
             {canManage && (
               <>
                 <label>
                   Workflow definition (advanced, JSON format)
                   <textarea
                     aria-label="Workflow definition JSON"
+                    aria-describedby={editorDirty ? unsavedHintId : undefined}
                     rows={18}
                     spellCheck={false}
                     value={definitionText}
-                    onChange={(event) => setDefinitionText(event.target.value)}
+                    onChange={(event) => {
+                      const text = event.target.value;
+                      setEditor((current) => ({ ...current, text }));
+                    }}
                   />
                 </label>
+                {editorDirty && (
+                  <div className="inline-actions" id={unsavedHintId}>
+                    <p className="field-hint">
+                      You have unsaved changes to this definition.
+                      {editor.newerVersion !== null &&
+                        ` The workflow was saved again (version ${editor.newerVersion}) since you started editing; your edits are kept, and saving them creates a newer version.`}
+                    </p>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={busy}
+                      onClick={discardEdits}
+                    >
+                      Discard changes
+                    </button>
+                  </div>
+                )}
                 <div className="button-row">
                   <button disabled={busy} onClick={() => void saveDefinition()}>
                     {workflowId ? 'Save new version' : 'Create workflow'}
                   </button>
+                  <button
+                    className="secondary-button"
+                    disabled={busy}
+                    onClick={() => void validateDefinition()}
+                  >
+                    Validate
+                  </button>
                   {selected && (
                     <>
-                      <button
-                        className="secondary-button"
-                        disabled={busy}
-                        onClick={() => void mutateDefinition('validate')}
-                      >
-                        Validate
-                      </button>
                       {selected.status === 'ENABLED' ? (
                         <button
                           className="secondary-button"
@@ -978,11 +1248,11 @@ export default function WorkflowWorkspace({
                   Enabled workflow
                   <select
                     aria-label="Workflow to start"
+                    ref={startPicker}
                     value={workflowId}
-                    onChange={(event) => {
-                      setWorkflowId(event.target.value);
-                      setConfirmingDisable(false);
-                    }}
+                    onChange={(event) =>
+                      chooseWorkflow(event.target.value, 'start')
+                    }
                   >
                     <option value="">Choose workflow</option>
                     {enabledWorkflows.map((item) => (
@@ -992,6 +1262,7 @@ export default function WorkflowWorkspace({
                     ))}
                   </select>
                 </label>
+                {pendingWorkflow?.origin === 'start' && pendingWorkflowPanel}
                 {startBlockedByRequests && (
                   <p className="empty-state" id={startBlockedId}>
                     Revision {currentRevisionNumber} has unresolved change
