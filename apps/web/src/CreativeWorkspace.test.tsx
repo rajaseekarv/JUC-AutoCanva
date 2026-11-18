@@ -1179,8 +1179,9 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
         name: 'Resubmit for review',
       }),
     );
+    // The API's 404 for an offline workflow is explained (hardening fix 11).
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Enabled workflow not found',
+      /The workflow( ".*")? used for the last review is offline, so the creative can't be resubmitted with it right now. A workflow manager needs to enable it again in Workflows; then use Resubmit for review./,
     );
     expect(requests[0]!.status).toBe('OPEN');
     expect(await banner()).toBeInTheDocument();
@@ -1399,7 +1400,7 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
       });
       fireEvent.click(oneClick()!);
       expect(await screen.findByRole('alert')).toHaveTextContent(
-        'Revision 2 was saved, but it could not be resubmitted: Enabled workflow not found Use Resubmit for review to try again.',
+        /^Revision 2 was saved, but it could not be resubmitted. The workflow( ".*")? used for the last review is offline/,
       );
       expect(writes(fetchMock).map((write) => write.method)).toEqual([
         'PATCH',

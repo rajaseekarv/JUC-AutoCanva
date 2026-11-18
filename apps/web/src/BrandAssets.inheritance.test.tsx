@@ -440,3 +440,71 @@ describe('Brand inheritance (Phase 3.2)', () => {
     ).toBe(false);
   });
 });
+
+// Hardening fix 2: an organization save keeps unset colours unset; it never
+// sends the colour the picker shows for them.
+describe('Organization brand colours', () => {
+  const orgAdmin = userWith([
+    'brand:read',
+    'brand:manage',
+    'organizations:update',
+  ]);
+  async function openOrganization(
+    server: ReturnType<typeof stubApi>['server'],
+  ) {
+    server.organization.secondaryColor = null;
+    server.organization.accentColor = null;
+    renderBrand(orgAdmin, '');
+    await waitFor(() => expect(box('Display name').value).toBe('Acme'));
+  }
+
+  it('sends untouched unset colours as unset, and keeps an existing colour', async () => {
+    const api = stubApi();
+    await openOrganization(api.server);
+    // The pickers show a colour even though none is set.
+    expect(control('Secondary color').value).toBe('#ffffff');
+    fireEvent.change(box('Font family'), { target: { value: 'Lato' } });
+    save();
+    await screen.findByText('Organization brand profile saved.');
+    expect(api.writes[0]?.body).toMatchObject({
+      primaryColor: '#111111',
+      secondaryColor: null,
+      accentColor: null,
+      fontFamily: 'Lato',
+    });
+    expect(api.server.organization.secondaryColor).toBeNull();
+  });
+
+  it('sends a colour the user chose', async () => {
+    const api = stubApi();
+    await openOrganization(api.server);
+    fireEvent.change(control('Accent color'), { target: { value: '#ff0000' } });
+    fireEvent.change(control('Primary color'), {
+      target: { value: '#123456' },
+    });
+    save();
+    await screen.findByText('Organization brand profile saved.');
+    expect(api.writes[0]?.body).toMatchObject({
+      primaryColor: '#123456',
+      secondaryColor: null,
+      accentColor: '#ff0000',
+    });
+  });
+
+  it('leaves branches inheriting the unset colours, with nothing to save', async () => {
+    const api = stubApi();
+    await openOrganization(api.server);
+    save();
+    await screen.findByText('Organization brand profile saved.');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Brand scope' }), {
+      target: { value: 'b-1' },
+    });
+    await openNorth();
+    expect(control('Secondary color')).toHaveAccessibleDescription(INHERITED);
+    save();
+    expect(
+      await screen.findByText('There are no changes to save.'),
+    ).toBeInTheDocument();
+    expect(api.writes).toHaveLength(1);
+  });
+});

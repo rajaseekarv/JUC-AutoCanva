@@ -98,6 +98,26 @@ function fieldDefaults(
   );
 }
 
+// The API answers a resubmission with 404 "Enabled workflow not found" when
+// the workflow of the last review is offline (disabled, or a new version was
+// saved and not enabled yet). Explained in words; null for anything else.
+function offlineWorkflowMessage(
+  cause: unknown,
+  workflowName: string | undefined,
+): string | null {
+  if (
+    !(cause instanceof RequestError) ||
+    cause.status !== 404 ||
+    cause.message !== 'Enabled workflow not found'
+  )
+    return null;
+  const named = workflowName ? ' "' + workflowName + '"' : '';
+  return (
+    `The workflow${named} used for the last review is offline, so the creative can't be resubmitted with it right now. ` +
+    'A workflow manager needs to enable it again in Workflows; then use Resubmit for review.'
+  );
+}
+
 // ---- Browser validation (Phase 3.4) ----
 // Mirrors the API's checks for creative values (TemplatesService
 // .validateCreativeValues), in the same order, so a problem is explained
@@ -872,18 +892,9 @@ export default function CreativeWorkspace({
     }
     setPendingOpen(id);
   }
-  // Leaving the page (reload, tab close, another site) with unsaved changes
-  // gets the browser's own confirmation.
-  useEffect(() => {
-    if (!formDirty) return;
-    function onBeforeUnload(event: BeforeUnloadEvent): void {
-      event.preventDefault();
-      // Older browsers show the prompt only when returnValue is set.
-      event.returnValue = '';
-    }
-    window.addEventListener('beforeunload', onBeforeUnload);
-    return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, [formDirty]);
+  // Leaving the page with unsaved changes gets the browser's confirmation
+  // from the app (one handler for every screen), which learns about this
+  // form through onFormStateChange above.
 
   // A notification asked to open a creative: once this branch's creatives
   // have loaded, select it (keeping the form when it is already open) and
@@ -1064,9 +1075,10 @@ export default function CreativeWorkspace({
       afterStart();
     } catch (cause) {
       setError(
-        cause instanceof Error
-          ? cause.message
-          : 'Unable to resubmit for review.',
+        offlineWorkflowMessage(cause, latestRun.workflow?.name) ??
+          (cause instanceof Error
+            ? cause.message
+            : 'Unable to resubmit for review.'),
       );
     } finally {
       actionInFlight.current = false;
@@ -1111,11 +1123,14 @@ export default function CreativeWorkspace({
         );
         afterStart();
       } catch (cause) {
+        const offline = offlineWorkflowMessage(cause, latestRun.workflow?.name);
         setError(
-          label +
-            ' was saved, but it could not be resubmitted: ' +
-            (cause instanceof Error ? cause.message : 'unknown error') +
-            ' Use Resubmit for review to try again.',
+          offline
+            ? label + ' was saved, but it could not be resubmitted. ' + offline
+            : label +
+                ' was saved, but it could not be resubmitted: ' +
+                (cause instanceof Error ? cause.message : 'unknown error') +
+                ' Use Resubmit for review to try again.',
         );
       }
     } finally {

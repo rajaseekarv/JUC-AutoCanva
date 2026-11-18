@@ -157,7 +157,9 @@ describe('WorkflowWorkspace definition editor (M2)', () => {
     const result = await screen.findByRole('status');
     expect(result).toHaveTextContent(/unsaved edits/i);
     expect(result).toHaveTextContent(/2 stages and 1 transition/);
-    expect(result).toHaveTextContent(/checked in full when you save/i);
+    expect(result).toHaveTextContent(
+      /follow the workflow rules.*The API checks them again when you save/i,
+    );
     // The saved version's validate endpoint is not called: its answer would
     // describe a different definition.
     expect(writes).toHaveLength(0);

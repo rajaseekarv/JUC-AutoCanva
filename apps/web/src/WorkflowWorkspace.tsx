@@ -20,6 +20,7 @@ import WorkflowStructuredEditor, {
   type AssignableUsers,
 } from './WorkflowStructuredEditor';
 import { checkDefinition, parseDefinition } from './workflowModel';
+import { useReportUnsaved } from './useReportUnsaved';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -260,6 +261,7 @@ export default function WorkflowWorkspace({
   onUnauthorized,
   openRequest = null,
   onOpenResult,
+  onUnsavedChange,
 }: {
   session: Session;
   branch: BranchResponse | null;
@@ -269,6 +271,8 @@ export default function WorkflowWorkspace({
   // A request (from a notification) to select one creative of a branch.
   openRequest?: { key: number; branchId: string; creativeId: string } | null;
   onOpenResult?: ReportOpen;
+  // Told whether the definition editor holds unsaved edits.
+  onUnsavedChange?: (dirty: boolean) => void;
 }) {
   // Bumped to reload the selected creative's run after another screen
   // changed it.
@@ -297,6 +301,8 @@ export default function WorkflowWorkspace({
   });
   const definitionText = editor.text;
   const editorDirty = editor.text !== editor.baseline;
+  // Only managers can edit, so only their edits are unsaved work.
+  useReportUnsaved(canManage && editorDirty, onUnsavedChange);
   // A workflow chosen while the editor held unsaved edits, waiting for the
   // user to discard them or keep editing; `origin` is the picker used.
   const [pendingWorkflow, setPendingWorkflow] = useState<{
@@ -739,11 +745,13 @@ export default function WorkflowWorkspace({
         return;
       }
       setMessage(
-        'Your unsaved edits are well-formed: valid JSON with a name, ' +
+        // Both the JSON and the workflow rules were checked here; only the
+        // API knows whether permissions and reviewers exist.
+        'Your unsaved edits are well-formed and follow the workflow rules: valid JSON with a name, ' +
           plural(check.stages, 'stage') +
           ' and ' +
           plural(check.transitions, 'transition') +
-          '. The workflow rules (one entry stage, end stages, reviewers and transitions) are checked in full when you save them as a new version' +
+          ', one starting stage, finishing stages, reviewers and steps that fit together. The API checks them again when you save them as a new version, including that their permissions and reviewers exist' +
           (selected
             ? `; saved version ${selected.currentVersionNumber} has not changed.`
             : '.'),
@@ -1129,6 +1137,10 @@ export default function WorkflowWorkspace({
                     : 'A new workflow is saved as version 1, as a draft to enable.'}
                 </p>
                 <WorkflowStructuredEditor
+                  // A fresh editor per workflow: confirmations, a pending
+                  // "One person" choice or a half-typed stage name never
+                  // carry over to another workflow.
+                  key={workflowId || 'new-workflow'}
                   text={definitionText}
                   onChange={(text) =>
                     setEditor((current) => ({ ...current, text }))

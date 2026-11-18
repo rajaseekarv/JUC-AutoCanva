@@ -580,3 +580,49 @@ describe('Structured workflow editor (Phase 3.5)', () => {
     expect(definition().stages[1]).toMatchObject({ name: 'Legal review' });
   });
 });
+
+// Hardening fix 1: the editor starts fresh for each workflow.
+describe('Structured workflow editor: switching workflows', () => {
+  it('does not carry an open confirmation, a pending choice or a half-typed stage into another workflow', async () => {
+    stubApi();
+    renderWorkspace();
+    await open();
+    // An open Remove confirmation, a pending "One person" choice and a
+    // half-typed new stage, none of which changes the definition.
+    fireEvent.click(
+      card('Review').getByRole('button', { name: 'Remove stage Review' }),
+    );
+    expect(
+      screen.getByRole('group', { name: 'Confirm removing Review' }),
+    ).toBeInTheDocument();
+    fireEvent.click(card('Draft').getByRole('radio', { name: 'One person' }));
+    expect(
+      card('Draft').getByRole('combobox', { name: 'Person for Draft' }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('textbox', { name: 'New stage name' }), {
+      target: { value: 'Half typed' },
+    });
+    expect(unsaved()).toBeNull();
+    // Another workflow with stages of the same keys.
+    fireEvent.change(
+      screen.getByRole('combobox', { name: 'Workflow definition' }),
+      { target: { value: 'wf-2' } },
+    );
+    await waitFor(() => expect(definition().name).toBe('Old review'));
+    expect(
+      screen.queryByRole('group', { name: 'Confirm removing Review' }),
+    ).toBeNull();
+    expect(
+      card('Draft').getByRole('radio', {
+        name: 'Anyone allowed to take its steps',
+      }),
+    ).toBeChecked();
+    expect(
+      card('Draft').queryByRole('combobox', { name: 'Person for Draft' }),
+    ).toBeNull();
+    expect(screen.getByRole('textbox', { name: 'New stage name' })).toHaveValue(
+      '',
+    );
+    expect(unsaved()).toBeNull();
+  });
+});

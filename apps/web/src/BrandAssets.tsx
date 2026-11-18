@@ -22,6 +22,7 @@ import {
   type AssetSource,
 } from './assetFiles';
 import FeedbackMessage from './FeedbackMessage';
+import { useReportUnsaved } from './useReportUnsaved';
 
 const apiBase =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
@@ -172,10 +173,13 @@ export default function BrandAssets({
   session,
   branch,
   onUnauthorized,
+  onUnsavedChange,
 }: {
   session: Session;
   branch: BranchResponse | null;
   onUnauthorized: () => void;
+  // Told whether the brand form holds unsaved edits.
+  onUnsavedChange?: (dirty: boolean) => void;
 }) {
   const canManageBrand = session.user.permissions.includes('brand:manage');
   const canManageOrganization = session.user.permissions.includes(
@@ -373,17 +377,34 @@ export default function BrandAssets({
     }
     return patch;
   }
-  // The organization profile is saved whole, as before; an unset colour is
-  // sent as the colour the picker shows.
+  // The organization profile is saved whole, as before. Each field is sent
+  // as its value: an existing or newly chosen colour as that colour, and an
+  // unset colour the user did not choose as null (it stays unset), never as
+  // the colour the picker happens to show. Branches inheriting it are not
+  // given a colour nobody chose.
   function organizationPayload(): BrandPatch {
     return Object.fromEntries(
       BRAND_FIELDS.map((field) => [
         field,
-        fieldState(field).value.trim() || colorDefaults[field] || null,
+        fieldState(field).value.trim() || null,
       ]),
     );
   }
   const pendingPatch: BrandPatch = scopeBranch && brand ? branchPatch() : {};
+  // Unsaved brand edits, only where the form can be saved: for a branch,
+  // anything a save would send; for the organization, any field that
+  // differs from what was loaded.
+  const brandFormShown =
+    !!brand && canManageBrand && (!!scopeBranch || canManageOrganization);
+  const brandDirty =
+    brandFormShown &&
+    (scopeBranch
+      ? Object.keys(pendingPatch).length > 0
+      : BRAND_FIELDS.some((field) => {
+          const edit = scopeEdits[field];
+          return !!edit && edit.value.trim() !== (brand?.[field] ?? '').trim();
+        }));
+  useReportUnsaved(brandDirty, onUnsavedChange);
   function setField(field: BrandField, state: FieldState): void {
     const scopeId = scopeBranchId;
     setEdits((current) => ({

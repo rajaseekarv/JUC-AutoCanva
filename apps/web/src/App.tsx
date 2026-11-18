@@ -36,6 +36,33 @@ import type {
 // Stable empty lists while signed out.
 const NO_ITEMS: readonly string[] = [];
 const NO_BRANCHES: readonly BranchSummary[] = [];
+// Screens that can hold unsaved edits, in the order they are named.
+type UnsavedSource = 'creatives' | 'workflows' | 'brand' | 'templates';
+const UNSAVED_SOURCES: readonly UnsavedSource[] = [
+  'creatives',
+  'workflows',
+  'brand',
+  'templates',
+];
+const UNSAVED_LABELS: Record<UnsavedSource, string> = {
+  creatives: 'Creatives',
+  workflows: 'Workflows',
+  brand: 'Brand & images',
+  templates: 'Templates',
+};
+const NOTHING_UNSAVED: Record<UnsavedSource, boolean> = {
+  creatives: false,
+  workflows: false,
+  brand: false,
+  templates: false,
+};
+// "Creatives", "Creatives and Workflows", "Creatives, Workflows and Templates".
+function unsavedList(sources: readonly UnsavedSource[]): string {
+  const names = sources.map((source) => UNSAVED_LABELS[source]);
+  return names.length <= 1
+    ? (names[0] ?? 'this screen')
+    : names.slice(0, -1).join(', ') + ' and ' + names.at(-1);
+}
 
 type ApiStatus =
   | { state: 'checking' }
@@ -114,11 +141,45 @@ export default function App() {
   const [confirmingSignOut, setConfirmingSignOut] = useState(false);
   // Set once signing out has started, so a repeated click sends nothing.
   const signingOut = useRef(false);
-  const reportCreativeForm = useCallback((state: CreativeFormState) => {
-    creativeForm.current = state;
-    // Nothing left to protect (saved or reverted): stop asking.
-    if (!state.dirty) setConfirmingSignOut(false);
-  }, []);
+  // Which screens hold unsaved edits. Every screen stays mounted, so moving
+  // between modules keeps them; only leaving the page or signing out would
+  // discard them, and both ask first while any screen is listed here.
+  const [unsaved, setUnsaved] =
+    useState<Record<UnsavedSource, boolean>>(NOTHING_UNSAVED);
+  const unsavedNow = useRef(unsaved);
+  unsavedNow.current = unsaved;
+  const reportUnsaved = useCallback(
+    (source: UnsavedSource, dirty: boolean) =>
+      setUnsaved((current) =>
+        current[source] === dirty ? current : { ...current, [source]: dirty },
+      ),
+    [],
+  );
+  const reportCreativeForm = useCallback(
+    (state: CreativeFormState) => {
+      creativeForm.current = state;
+      reportUnsaved('creatives', state.dirty);
+    },
+    [reportUnsaved],
+  );
+  const unsavedScreens = UNSAVED_SOURCES.filter((source) => unsaved[source]);
+  // Nothing left to protect (saved or reverted): stop asking.
+  const anyUnsaved = unsavedScreens.length > 0;
+  useEffect(() => {
+    if (!anyUnsaved) setConfirmingSignOut(false);
+  }, [anyUnsaved]);
+  // Leaving the page (reload, tab close, another site) with unsaved edits on
+  // any screen gets the browser's own confirmation: one handler for all.
+  useEffect(() => {
+    if (!anyUnsaved) return;
+    function onBeforeUnload(event: BeforeUnloadEvent): void {
+      event.preventDefault();
+      // Older browsers show the prompt only when returnValue is set.
+      event.returnValue = '';
+    }
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [anyUnsaved]);
   // A branch chosen in the Branch selector while the Creatives form has
   // unsaved changes; switching waits for the user to confirm discarding them.
   const [pendingBranchId, setPendingBranchId] = useState('');
@@ -131,6 +192,9 @@ export default function App() {
     // The previous session's form is gone. Creatives reports its new form
     // when it mounts; without Creatives there is nothing to protect.
     if (!sessionToken) creativeForm.current = { creativeId: '', dirty: false };
+    // A new (or no) session starts with nothing unsaved; screens report
+    // again as soon as they are edited.
+    setUnsaved(NOTHING_UNSAVED);
   }, [sessionToken]);
   const selectBranchForLink = useCallback((branchId: string) => {
     // A notification link asked (or had nothing to ask) on its own.
@@ -328,11 +392,11 @@ export default function App() {
     }
   }
 
-  // Sign out from the workspace. Signing out discards the Creatives form, so
-  // unsaved edits are only discarded after an explicit confirmation.
+  // Sign out from the workspace. Signing out discards every screen's unsaved
+  // edits, so they are only discarded after an explicit confirmation.
   function requestSignOut(accessToken: string): void {
     if (signingOut.current) return;
-    if (creativeForm.current.dirty) {
+    if (UNSAVED_SOURCES.some((source) => unsavedNow.current[source])) {
       setConfirmingSignOut(true);
       return;
     }
@@ -487,6 +551,7 @@ export default function App() {
             session={session}
             branch={branch}
             onUnauthorized={onUnauthorized}
+            onUnsavedChange={(dirty) => reportUnsaved('brand', dirty)}
           />
         ),
       },
@@ -502,6 +567,7 @@ export default function App() {
               setTemplateRefreshKey((current) => current + 1)
             }
             onUnauthorized={onUnauthorized}
+            onUnsavedChange={(dirty) => reportUnsaved('templates', dirty)}
           />
         ),
       },
@@ -555,6 +621,7 @@ export default function App() {
             dataChange={dataChange}
             onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
+            onUnsavedChange={(dirty) => reportUnsaved('workflows', dirty)}
             openRequest={
               openRequest?.module === 'workflows' ? openRequest : null
             }
@@ -653,11 +720,11 @@ export default function App() {
             <div
               className="confirm-panel"
               role="group"
-              aria-label="Unsaved changes in Creatives"
+              aria-label={'Unsaved changes in ' + unsavedList(unsavedScreens)}
             >
               <p role="alert">
-                You have unsaved changes in Creatives. Signing out discards
-                them.
+                You have unsaved changes in {unsavedList(unsavedScreens)}.
+                Signing out discards them.
               </p>
               <div className="template-actions">
                 <button

@@ -7,6 +7,7 @@ import type {
 import StatusBadge from './StatusBadge';
 import { statusLabel } from './statusDisplay';
 import FeedbackMessage from './FeedbackMessage';
+import { useReportUnsaved } from './useReportUnsaved';
 import { returnFocusToConfirmTrigger } from './confirmFocus';
 
 const apiBase =
@@ -50,6 +51,30 @@ const UNITS = [
 ] as const;
 const unitShort = (unit: string) =>
   UNITS.find((item) => item.value === unit)?.short ?? unit;
+// Whether a form holds anything other than what it started with. A select
+// whose default is its first option has no defaultSelected option, so it is
+// compared with that first option.
+function formIsDirty(form: HTMLFormElement): boolean {
+  for (const element of Array.from(form.elements)) {
+    if (element instanceof HTMLInputElement) {
+      if (element.type === 'checkbox' || element.type === 'radio') {
+        if (element.checked !== element.defaultChecked) return true;
+      } else if (element.type === 'file') {
+        if (element.files?.length) return true;
+      } else if (element.value !== element.defaultValue) return true;
+    } else if (element instanceof HTMLTextAreaElement) {
+      if (element.value !== element.defaultValue) return true;
+    } else if (element instanceof HTMLSelectElement && !element.multiple) {
+      const options = Array.from(element.options);
+      const defaultIndex = Math.max(
+        0,
+        options.findIndex((option) => option.defaultSelected),
+      );
+      if (options.length && element.selectedIndex !== defaultIndex) return true;
+    }
+  }
+  return false;
+}
 // An API message as a sentence, so text can follow it.
 const asSentence = (message: string) =>
   /[.!?]$/.test(message.trim()) ? message.trim() : message.trim() + '.';
@@ -64,10 +89,13 @@ export default function TemplateManager({
   session,
   onTemplatesChanged,
   onUnauthorized,
+  onUnsavedChange,
 }: {
   session: Session;
   onTemplatesChanged?: () => void;
   onUnauthorized: () => void;
+  // Told whether any template form holds unsaved edits.
+  onUnsavedChange?: (dirty: boolean) => void;
 }) {
   const [templates, setTemplates] = useState<TemplateResponse[]>([]);
   const [selectedId, setSelectedId] = useState('');
@@ -113,6 +141,18 @@ export default function TemplateManager({
   }> | null>(null);
   const accessToken = session.accessToken;
   const lifecycleHelpId = useId();
+  const sectionRef = useRef<HTMLElement>(null);
+  const [formsDirty, setFormsDirty] = useState(false);
+  // Forms also become clean without an input event: when the template is
+  // reloaded (a save), a form closes or is replaced, or an action finishes
+  // (Add field resets its form). Checked after each of those.
+  useEffect(() => {
+    const root = sectionRef.current;
+    setFormsDirty(
+      !!root && [...root.querySelectorAll('form')].some(formIsDirty),
+    );
+  }, [selected, selectedId, editingFieldId, creating, busy]);
+  useReportUnsaved(formsDirty, onUnsavedChange);
   const canReadTemplates = session.user.permissions.includes('templates:read');
   const unauthorizedHandler = useRef(onUnauthorized);
   unauthorizedHandler.current = onUnauthorized;
@@ -371,6 +411,16 @@ export default function TemplateManager({
     }
   }
 
+  // Unsaved edits in any of this screen's forms (new template, details,
+  // field edit, Add field). The forms are uncontrolled, so each control is
+  // compared with its own default: a form React resets or remounts with
+  // saved values reads as clean again.
+  function checkForms(): void {
+    const root = sectionRef.current;
+    setFormsDirty(
+      !!root && [...root.querySelectorAll('form')].some(formIsDirty),
+    );
+  }
   if (!canReadTemplates) return null;
   // An unfrozen current version is the draft being edited; an ACTIVE template
   // keeps its frozen active version usable while such a draft exists.
@@ -385,9 +435,11 @@ export default function TemplateManager({
   const editable = hasDraft && can(session, 'templates:edit');
   return (
     <section
+      ref={sectionRef}
       className="service-card template-manager"
       id="templates"
       aria-labelledby="templates-title"
+      onChange={checkForms}
     >
       <p className="card-label">DESIGN TEMPLATES</p>
       <div className="service-heading">
