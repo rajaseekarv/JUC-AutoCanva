@@ -9,7 +9,33 @@ export type WorkspaceModule = {
   // and cannot be opened.
   available: boolean;
   content: ReactNode;
+  // An optional count shown beside the nav label, such as unread items. The
+  // module owner decides when there is a count to show; the shell hides the
+  // badge when it is absent or the count is not positive.
+  badge?: ModuleBadge;
 };
+
+export type ModuleBadge = {
+  count: number;
+  // Spoken after the module label, e.g. "5 unread" gives the link the name
+  // "Notifications, 5 unread". It should state the exact count.
+  description: string;
+};
+
+// Counts above this are shown as "99+"; the accessible name keeps the exact
+// count.
+const BADGE_MAX = 99;
+
+function badgeText(count: number): string {
+  return count > BADGE_MAX ? `${BADGE_MAX}+` : String(count);
+}
+
+function visibleBadge(module: WorkspaceModule): ModuleBadge | null {
+  const badge = module.badge;
+  return badge && Number.isFinite(badge.count) && badge.count > 0
+    ? badge
+    : null;
+}
 
 // The URL hash stays the source of truth, so existing links such as
 // "#templates" or "#notifications-title" keep working. A hash naming an
@@ -44,7 +70,9 @@ export default function WorkspaceShell({
   contextLabel,
   userName,
   onSignOut,
+  signOutConfirmation = null,
   footer,
+  onActiveModuleChange,
 }: {
   modules: WorkspaceModule[];
   defaultModuleId: string;
@@ -53,7 +81,12 @@ export default function WorkspaceShell({
   contextLabel?: string;
   userName: string;
   onSignOut: () => void;
+  // An inline confirmation shown under Sign out while signing out waits for
+  // the user (for example, to discard unsaved edits); null when none.
+  signOutConfirmation?: ReactNode;
   footer: ReactNode;
+  // Told which module is shown, on mount and after every change.
+  onActiveModuleChange?: (moduleId: string) => void;
 }) {
   const navigable = modules.filter((module) => module.available);
   const moduleKey = navigable.map((module) => module.id).join('|');
@@ -64,6 +97,11 @@ export default function WorkspaceShell({
       defaultModuleId,
     ),
   );
+  const activeModuleChange = useRef(onActiveModuleChange);
+  activeModuleChange.current = onActiveModuleChange;
+  useEffect(() => {
+    activeModuleChange.current?.(activeId);
+  }, [activeId]);
   const [collapsed, setCollapsed] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
@@ -178,11 +216,16 @@ export default function WorkspaceShell({
         >
           <NavIcon name={drawerOpen ? 'close' : 'menu'} />
         </button>
-        <a ref={brandRef} className="brand" href="/" aria-label="AdFlow home">
+        <a
+          ref={brandRef}
+          className="brand"
+          href="/"
+          aria-label="JUC-AutoCanva home"
+        >
           <span className="brand-mark" aria-hidden="true">
-            A
+            J
           </span>
-          <span>adflow</span>
+          <span>JUC-AutoCanva</span>
         </a>
         <div ref={topbarActionsRef} className="app-topbar-actions">
           {statusChip}
@@ -191,10 +234,19 @@ export default function WorkspaceShell({
             <span className="topbar-label">Notifications</span>
           </a>
           <span className="account-name">{userName}</span>
-          <button className="secondary-button" onClick={onSignOut}>
-            <NavIcon name="signOut" />
-            <span className="topbar-label">Sign out</span>
-          </button>
+          {/* The confirmation sits under the button that opened it, so its
+              Keep button can return focus there (see confirmFocus). */}
+          <div className="sign-out-action">
+            <button
+              className="secondary-button"
+              aria-expanded={signOutConfirmation ? true : undefined}
+              onClick={onSignOut}
+            >
+              <NavIcon name="signOut" />
+              <span className="topbar-label">Sign out</span>
+            </button>
+            {signOutConfirmation}
+          </div>
         </div>
       </header>
       <div
@@ -205,19 +257,35 @@ export default function WorkspaceShell({
       <aside id="workspace-sidebar" ref={sidebarRef} className="app-sidebar">
         <nav aria-label="Workspace modules">
           <ul>
-            {navigable.map((module) => (
-              <li key={module.id}>
-                <a
-                  href={`#${module.id}`}
-                  aria-current={module.id === activeId ? 'page' : undefined}
-                  title={collapsed ? module.label : undefined}
-                  onClick={() => setDrawerOpen(false)}
-                >
-                  <NavIcon name={module.icon} />
-                  <span className="nav-label">{module.label}</span>
-                </a>
-              </li>
-            ))}
+            {navigable.map((module) => {
+              const badge = visibleBadge(module);
+              // With a badge the count joins the link's name, and the badge
+              // itself is hidden from assistive technology so the count is
+              // announced once. Without one, the link is unchanged.
+              const name = badge
+                ? `${module.label}, ${badge.description}`
+                : module.label;
+              return (
+                <li key={module.id}>
+                  <a
+                    href={`#${module.id}`}
+                    aria-current={module.id === activeId ? 'page' : undefined}
+                    aria-label={badge ? name : undefined}
+                    title={collapsed ? name : undefined}
+                    onClick={() => setDrawerOpen(false)}
+                  >
+                    <NavIcon name={module.icon} />
+                    <span className="nav-label">{module.label}</span>
+                    {badge && (
+                      // Collapsed (desktop only), CSS shows it as a dot.
+                      <span className="nav-badge" aria-hidden="true">
+                        {badgeText(badge.count)}
+                      </span>
+                    )}
+                  </a>
+                </li>
+              );
+            })}
           </ul>
         </nav>
         {contextLabel && (

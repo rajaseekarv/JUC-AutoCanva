@@ -431,6 +431,60 @@ describe('HTTP API with mocked Prisma', () => {
     });
   });
 
+  // Phase 3.5: GET /workflows/assignable-users for the reviewer picker.
+  describe('workflow assignable users', () => {
+    it('returns active organization users with only id, name and email to workflow managers', async () => {
+      grantedPermissions = [PERMISSIONS.WORKFLOW_MANAGE];
+      model('user').findMany = vi.fn(async () => [
+        { id: 'user-2', name: 'Priya', email: 'priya@example.local' },
+      ]);
+      const response = await request(server())
+        .get('/api/v1/workflows/assignable-users')
+        .set(auth())
+        .expect(200);
+      expect(response.body).toEqual([
+        { id: 'user-2', name: 'Priya', email: 'priya@example.local' },
+      ]);
+      expect(model('user').findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { organizationId: 'org-1', status: 'ACTIVE' },
+          select: { id: true, name: true, email: true },
+        }),
+      );
+      // Not taken as GET /workflows/:workflowId.
+      expect(models.has('workflow')).toBe(false);
+    });
+
+    it.each([
+      [[PERMISSIONS.WORKFLOW_READ]],
+      [[PERMISSIONS.USER_BRANCH_ACCESS_MANAGE]],
+      [[]],
+    ])(
+      'returns 403 without workflows:manage (%j) and reads no users',
+      async (permissions) => {
+        grantedPermissions = permissions;
+        const response = await request(server())
+          .get('/api/v1/workflows/assignable-users')
+          .set(auth())
+          .expect(403);
+        expect(response.body.message).toBe('Permission denied');
+        expect(models.has('user')).toBe(false);
+      },
+    );
+
+    it('returns 401 without a session', async () => {
+      await request(server())
+        .get('/api/v1/workflows/assignable-users')
+        .expect(401);
+    });
+
+    it('leaves GET /users requiring users:branch-access:manage', async () => {
+      grantedPermissions = [PERMISSIONS.WORKFLOW_MANAGE];
+      await request(server()).get('/api/v1/users').set(auth()).expect(403);
+      expect(models.has('user')).toBe(false);
+    });
+  });
+
   describe('Canva job request validation', () => {
     beforeEach(() => {
       grantedPermissions = [PERMISSIONS.CANVA_JOB_CREATE];

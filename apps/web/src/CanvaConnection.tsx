@@ -47,11 +47,11 @@ const canvaOutcomeMessages: Record<CanvaOAuthOutcome, Notice> = {
   },
   account_ineligible: {
     tone: 'error',
-    text: 'This Canva account does not have the Autofill and brand template features AdFlow needs.',
+    text: 'This Canva account does not have the Autofill and brand template features JUC-AutoCanva needs.',
   },
   insufficient_scope: {
     tone: 'error',
-    text: 'Canva did not grant every permission AdFlow needs. Start again and allow all requested permissions.',
+    text: 'Canva did not grant every permission JUC-AutoCanva needs. Start again and allow all requested permissions.',
   },
   retry_connect: {
     tone: 'error',
@@ -484,8 +484,8 @@ export default function CanvaConnection({
       )}
       {details?.configurationError && (
         <p role="alert" className="form-message">
-          Canva rejected AdFlow&apos;s app configuration. An administrator must
-          check the Canva integration settings.
+          Canva rejected JUC-AutoCanva&apos;s app configuration. An
+          administrator must check the Canva integration settings.
         </p>
       )}
       {!!details?.pendingRevocations && (
@@ -638,7 +638,7 @@ export default function CanvaConnection({
           <p>
             Canva did not confirm these revocations after every retry. Retry
             sends them again; Dismiss deletes the stored token without revoking
-            it, and the Canva user can still remove AdFlow in Canva.
+            it, and the Canva user can still remove JUC-AutoCanva in Canva.
           </p>
           <ul aria-label="Exhausted Canva revocations">
             {revocations.map((revocation) => (

@@ -421,6 +421,7 @@ input[type='file'] {
   overflow: hidden;
 }
 .app-topbar {
+  position: relative;
   z-index: 20;
   display: flex;
   grid-area: topbar;
@@ -438,9 +439,25 @@ input[type='file'] {
   min-width: 0;
   margin-left: auto;
 }
-.app-topbar-actions .secondary-button {
+/* The top bar's own buttons, not those of the Sign out confirmation. */
+.app-topbar-actions > .secondary-button,
+.sign-out-action > .secondary-button {
   min-height: var(--control-height-sm);
   padding: 0 var(--space-3);
+}
+/* Sign out with unsaved Creatives edits: the confirmation opens below the
+   top bar at its right edge, over the page, and stays within the screen on
+   phones. The top bar is its containing block. */
+.sign-out-action {
+  display: flex;
+}
+.sign-out-action > .confirm-panel {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: var(--space-2);
+  width: min(360px, calc(100vw - 2 * var(--space-2)));
+  margin-top: 0;
+  box-shadow: var(--shadow-md);
 }
 .account-name {
   overflow: hidden;
@@ -520,6 +537,25 @@ input[type='file'] {
   box-shadow: inset 3px 0 0 var(--color-brand);
   color: var(--color-brand-strong);
   font-weight: 700;
+}
+/* A module's count, e.g. unread notifications. Hidden from assistive
+   technology: the link's accessible name carries the count. */
+.app-sidebar a {
+  position: relative;
+}
+.nav-badge {
+  min-width: 20px;
+  height: 20px;
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-brand);
+  color: #fff;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 20px;
+  text-align: center;
 }
 .sidebar-context {
   display: grid;
@@ -633,6 +669,29 @@ input[type='file'] {
   .sidebar-collapsed .sidebar-context {
     display: none;
   }
+  /* Collapsed, the count becomes a dot on the icon; the link's name and
+     tooltip still state it. */
+  .sidebar-collapsed .nav-badge {
+    position: absolute;
+    top: 8px;
+    left: calc(50% + 4px);
+    width: 9px;
+    min-width: 0;
+    height: 9px;
+    padding: 0;
+    overflow: hidden;
+    box-shadow: 0 0 0 2px var(--color-surface);
+    font-size: 0;
+  }
+}
+/* Forced colors drop backgrounds; keep the badge and dot visible. */
+@media (forced-colors: active) {
+  .nav-badge {
+    border: 1px solid CanvasText;
+    forced-color-adjust: none;
+    background: CanvasText;
+    color: Canvas;
+  }
 }
 
 /* Narrow screens: the sidebar becomes an off-canvas drawer. A closed drawer
@@ -702,7 +761,8 @@ input[type='file'] {
     clip: rect(0 0 0 0);
     white-space: nowrap;
   }
-  .app-topbar-actions .secondary-button {
+  .app-topbar-actions > .secondary-button,
+  .sign-out-action > .secondary-button {
     width: var(--control-height-sm);
     padding: 0;
   }
@@ -782,7 +842,8 @@ input[type='file'] {
   font-size: var(--text-sm);
   line-height: 1.6;
 }
-.empty-state a {
+.empty-state a,
+.run-summary a {
   color: var(--color-brand);
   font-weight: 700;
   text-decoration: underline;
@@ -815,6 +876,45 @@ input[type='file'] {
 }
 .admin-list li:last-child {
   border-bottom: 0;
+}
+/* A row asking to discard unsaved edits: the confirmation takes a full line
+   under the row (Phase 2B). */
+.admin-list li.has-confirm {
+  flex-wrap: wrap;
+}
+.admin-list li.has-confirm > .confirm-panel {
+  flex-basis: 100%;
+  margin-top: 0;
+}
+/* Workflows: the selected run's state and actions (Phase 2B). */
+.run-summary {
+  display: grid;
+  gap: var(--space-1);
+}
+.run-summary p {
+  margin: 0;
+  font-weight: 600;
+}
+.run-actions,
+.run-cancel,
+.run-load-error {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+}
+.run-actions .field-hint {
+  margin: 0;
+}
+.run-cancel > .confirm-panel,
+.run-cancel > .confirm-panel textarea {
+  justify-self: stretch;
+}
+.new-creative-action {
+  display: grid;
+  justify-items: start;
+}
+.new-creative-action > .confirm-panel {
+  justify-self: stretch;
 }
 .admin-list li > div:first-child {
   display: grid;
@@ -1152,6 +1252,23 @@ strong.badge-danger {
   justify-self: start;
   min-height: var(--control-height-sm);
   font-size: var(--text-sm);
+}
+/* A notification's actions: open its record, mark it read (Phase 2B). */
+.notification-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+.notification-actions button,
+.notification-link-error button {
+  min-height: var(--control-height-sm);
+  font-size: var(--text-sm);
+}
+.notification-link-error {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
 }
 .activity-list .unread-marker {
   color: var(--color-brand);
@@ -1533,4 +1650,298 @@ p[role='status'][aria-busy='true'] {
   .comment-replies {
     margin-left: var(--space-2);
   }
+}
+
+/* Inline confirmation for a destructive action: states the consequence, then
+   a confirm and a keep button (Phase 2A). */
+.confirm-panel {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-md);
+  background: var(--color-warning-soft);
+  color: var(--color-text);
+}
+.confirm-panel p {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.confirm-panel .template-actions {
+  flex-wrap: wrap;
+}
+.lifecycle-help {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-5) 0 0;
+  padding-left: var(--space-5);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.field-hint {
+  color: var(--color-text-subtle);
+  font-size: var(--text-sm);
+  font-weight: 400;
+}
+/* A confirmation inside a list row takes the full width below the row. */
+.admin-list li:has(> .confirm-panel) {
+  flex-wrap: wrap;
+}
+.admin-list li > .confirm-panel {
+  flex-basis: 100%;
+  margin-top: 0;
+}
+/* Rows are columns on phones (see the asset rows above): stack the
+   confirmation below the row instead of wrapping into a new column. */
+@media (max-width: 640px) {
+  .admin-list li:has(> .confirm-panel) {
+    flex-wrap: nowrap;
+  }
+  .admin-list li > .confirm-panel {
+    flex-basis: auto;
+    align-self: stretch;
+  }
+}
+
+/* Raw identifiers kept for administrators, collapsed by default. */
+.admin-details {
+  margin-top: var(--space-4);
+  font-size: var(--text-sm);
+}
+.admin-details summary {
+  cursor: pointer;
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+.admin-details dd {
+  overflow-wrap: anywhere;
+}
+
+.notification-count {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-subtle);
+  font-size: var(--text-sm);
+}
+
+/* A screen message scrolled into view after an action keeps a little space
+   around it; it is focusable only by script (see FeedbackMessage). */
+.feedback-message {
+  scroll-margin: var(--space-4);
+}
+
+/* Approvals decision form (Phase 2B): the reviewer picks a decision first,
+   then sees only that decision's fields. */
+.decision-choice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.decision-choice legend {
+  width: 100%;
+  margin-bottom: var(--space-2);
+  padding: 0;
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.decision-choice .checkbox-label {
+  min-height: var(--control-height);
+  margin: 0;
+}
+.decision-form small {
+  color: var(--color-text-subtle);
+  font-weight: 400;
+}
+.decision-form .field-error {
+  color: var(--color-danger);
+  font-weight: 600;
+}
+.decision-form textarea[aria-invalid='true'] {
+  border-color: var(--color-danger);
+}
+.decision-summary {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+.decision-summary dt {
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+.decision-summary dd {
+  margin: 0 0 var(--space-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Structured workflow editor (Phase 3.5): one card per stage, with its
+   steps inside; problems sit under what they concern. */
+.workflow-editor {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.workflow-editor label,
+.workflow-editor fieldset {
+  min-width: 0;
+}
+.workflow-stages,
+.workflow-transitions,
+.workflow-problems {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.workflow-stage {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-muted);
+  min-width: 0;
+}
+.workflow-stage-heading {
+  display: grid;
+  gap: 2px;
+}
+.workflow-stage-heading .field-hint,
+.workflow-transition .field-hint {
+  overflow-wrap: anywhere;
+}
+.workflow-stage-flags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+}
+.workflow-reviewer {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+.workflow-reviewer legend {
+  padding: 0 var(--space-1);
+  font-weight: 600;
+}
+.workflow-transition {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.workflow-transition > button {
+  justify-self: start;
+}
+.workflow-stage .template-actions {
+  flex-wrap: wrap;
+}
+.workflow-add-stage {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  align-items: end;
+}
+.workflow-advanced summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.workflow-advanced[open] summary {
+  margin-bottom: var(--space-2);
+}
+/* Creative form validation: a field's problem sits under it; the summary
+   by Save names the fields to fix. */
+.field-error {
+  margin: var(--space-1) 0 0;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+.admin-form [aria-invalid='true'] {
+  border-color: var(--color-danger);
+}
+.form-problems {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  font-size: var(--text-sm);
+}
+.form-problems p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+/* Audit entries: labelled facts, IDs and details wrap instead of overflowing. */
+.audit-list[aria-busy='true'] {
+  opacity: 0.6;
+}
+.audit-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--space-3);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+.audit-facts dt {
+  color: var(--color-text-subtle);
+}
+.audit-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.audit-list details summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+.audit-list pre {
+  margin: var(--space-2) 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--text-xs);
+}
+/* Brand form: each branch field says whether it is inherited or overridden. */
+.brand-field {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.brand-field-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.brand-source {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.brand-source-inherited {
+  color: var(--color-text-muted);
+  background: var(--color-surface-muted);
+}
+.brand-source-override {
+  color: var(--color-info);
+  background: var(--color-info-soft);
+  border-color: var(--color-info-border);
 }

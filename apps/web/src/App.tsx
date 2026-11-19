@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react';
 import {
   SESSION_STORAGE_KEY,
   loadStoredSession,
@@ -16,12 +22,47 @@ import CanvaIntegration from './CanvaIntegration';
 import StatusBadge from './StatusBadge';
 import WorkspaceShell, { type WorkspaceModule } from './WorkspaceShell';
 import { useDataChanges } from './dataChanges';
+import { returnFocusToConfirmTrigger } from './confirmFocus';
+import { useNotifications } from './useNotifications';
+import { useRecordLinks, type CreativeFormState } from './useRecordLinks';
 import type {
   AuthenticatedUserResponse,
   BranchResponse,
+  BranchSummary,
   HealthResponse,
   LoginResponse,
 } from '@adflow/shared-types';
+
+// Stable empty lists while signed out.
+const NO_ITEMS: readonly string[] = [];
+const NO_BRANCHES: readonly BranchSummary[] = [];
+// Screens that can hold unsaved edits, in the order they are named.
+type UnsavedSource = 'creatives' | 'workflows' | 'brand' | 'templates';
+const UNSAVED_SOURCES: readonly UnsavedSource[] = [
+  'creatives',
+  'workflows',
+  'brand',
+  'templates',
+];
+const UNSAVED_LABELS: Record<UnsavedSource, string> = {
+  creatives: 'Creatives',
+  workflows: 'Workflows',
+  brand: 'Brand & images',
+  templates: 'Templates',
+};
+const NOTHING_UNSAVED: Record<UnsavedSource, boolean> = {
+  creatives: false,
+  workflows: false,
+  brand: false,
+  templates: false,
+};
+// "Creatives", "Creatives and Workflows", "Creatives, Workflows and Templates".
+function unsavedList(sources: readonly UnsavedSource[]): string {
+  const names = sources.map((source) => UNSAVED_LABELS[source]);
+  return names.length <= 1
+    ? (names[0] ?? 'this screen')
+    : names.slice(0, -1).join(', ') + ' and ' + names.at(-1);
+}
 
 type ApiStatus =
   | { state: 'checking' }
@@ -32,6 +73,21 @@ type AuthSession = { accessToken: string; user: AuthenticatedUserResponse };
 
 const apiBaseUrl =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000/api/v1';
+
+// What a failed sign-in tells the user. Only a rejected email or password
+// says so; anything else is a problem on our side or with the connection,
+// and the browser's own network error text is never shown.
+function loginFailureMessage(status: number | null): string {
+  if (status === 401) return 'The email or password is incorrect.';
+  if (status === 400) return 'Enter a valid email address and password.';
+  if (status === 429)
+    return 'Too many sign-in attempts. Wait a few minutes, then try again.';
+  if (status === null)
+    return "We couldn't reach JUC-AutoCanva. Check your internet connection and try again.";
+  return "We couldn't sign you in right now. Please try again in a moment.";
+}
+
+class LoginFailure extends Error {}
 
 export default function App() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>({ state: 'checking' });
@@ -66,6 +122,112 @@ export default function App() {
     },
     [],
   );
+  // Notifications are owned here and shared, so only one copy is polled. A
+  // 401 signs out through the same path as every other screen.
+  const notifications = useNotifications({
+    accessToken: session?.accessToken ?? null,
+    dataChange,
+    onUnauthorized: (accessToken) => clearSession(true, accessToken),
+  });
+  const { setScreenOpen: setNotificationsOpen } = notifications;
+  // What the Creatives form holds, so a notification link or the Branch
+  // selector can ask before discarding unsaved edits.
+  const creativeForm = useRef<CreativeFormState>({
+    creativeId: '',
+    dirty: false,
+  });
+  // Sign out pressed while the Creatives form has unsaved changes: signing
+  // out waits for the user to confirm discarding them.
+  const [confirmingSignOut, setConfirmingSignOut] = useState(false);
+  // Set once signing out has started, so a repeated click sends nothing.
+  const signingOut = useRef(false);
+  // Which screens hold unsaved edits. Every screen stays mounted, so moving
+  // between modules keeps them; only leaving the page or signing out would
+  // discard them, and both ask first while any screen is listed here.
+  const [unsaved, setUnsaved] =
+    useState<Record<UnsavedSource, boolean>>(NOTHING_UNSAVED);
+  const unsavedNow = useRef(unsaved);
+  unsavedNow.current = unsaved;
+  const reportUnsaved = useCallback(
+    (source: UnsavedSource, dirty: boolean) =>
+      setUnsaved((current) =>
+        current[source] === dirty ? current : { ...current, [source]: dirty },
+      ),
+    [],
+  );
+  const reportCreativeForm = useCallback(
+    (state: CreativeFormState) => {
+      creativeForm.current = state;
+      reportUnsaved('creatives', state.dirty);
+    },
+    [reportUnsaved],
+  );
+  const unsavedScreens = UNSAVED_SOURCES.filter((source) => unsaved[source]);
+  // Nothing left to protect (saved or reverted): stop asking.
+  const anyUnsaved = unsavedScreens.length > 0;
+  useEffect(() => {
+    if (!anyUnsaved) setConfirmingSignOut(false);
+  }, [anyUnsaved]);
+  // Leaving the page (reload, tab close, another site) with unsaved edits on
+  // any screen gets the browser's own confirmation: one handler for all.
+  useEffect(() => {
+    if (!anyUnsaved) return;
+    function onBeforeUnload(event: BeforeUnloadEvent): void {
+      event.preventDefault();
+      // Older browsers show the prompt only when returnValue is set.
+      event.returnValue = '';
+    }
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [anyUnsaved]);
+  // A branch chosen in the Branch selector while the Creatives form has
+  // unsaved changes; switching waits for the user to confirm discarding them.
+  const [pendingBranchId, setPendingBranchId] = useState('');
+  const branchSelectRef = useRef<HTMLSelectElement>(null);
+  const sessionToken = session?.accessToken ?? null;
+  useEffect(() => {
+    setPendingBranchId('');
+    setConfirmingSignOut(false);
+    signingOut.current = false;
+    // The previous session's form is gone. Creatives reports its new form
+    // when it mounts; without Creatives there is nothing to protect.
+    if (!sessionToken) creativeForm.current = { creativeId: '', dirty: false };
+    // A new (or no) session starts with nothing unsaved; screens report
+    // again as soon as they are edited.
+    setUnsaved(NOTHING_UNSAVED);
+  }, [sessionToken]);
+  const selectBranchForLink = useCallback((branchId: string) => {
+    // A notification link asked (or had nothing to ask) on its own.
+    setPendingBranchId('');
+    setBranchError('');
+    setSelectedBranchId(branchId);
+  }, []);
+  function chooseBranch(branchId: string): void {
+    if (branchId === selectedBranchId) {
+      setPendingBranchId('');
+      return;
+    }
+    // Switching branch resets the Creatives form, so unsaved edits are only
+    // discarded after an explicit confirmation.
+    if (creativeForm.current.dirty) {
+      setPendingBranchId(branchId);
+      return;
+    }
+    setPendingBranchId('');
+    setSelectedBranchId(branchId);
+  }
+  // Following a notification to its record (one pending request at a time).
+  const recordLinks = useRecordLinks({
+    accessToken: session?.accessToken ?? null,
+    permissions: session?.user.permissions ?? NO_ITEMS,
+    branches: session?.user.branches ?? NO_BRANCHES,
+    selectedBranchId,
+    selectBranch: selectBranchForLink,
+    branchError,
+    creativeForm,
+    markRead: notifications.markRead,
+  });
+  const { openRequest, reportOpen } = recordLinks;
 
   useEffect(() => {
     if (!restoringToken) return;
@@ -86,7 +248,7 @@ export default function App() {
         // Temporary outages keep the saved token so the user can retry.
         if (!response.ok) {
           setRestoreError(
-            `Unable to restore your session (HTTP ${response.status}).`,
+            "JUC-AutoCanva isn't responding right now, so we couldn't confirm your sign-in.",
           );
           return;
         }
@@ -98,7 +260,9 @@ export default function App() {
         setRestoringToken(null);
       } catch {
         if (controller.signal.aborted) return;
-        setRestoreError('Unable to reach the API to restore your session.');
+        setRestoreError(
+          "We couldn't reach JUC-AutoCanva to confirm your sign-in. Check your internet connection.",
+        );
       }
     }
     void restoreSession();
@@ -193,15 +357,22 @@ export default function App() {
     setIsSubmitting(true);
     const form = new FormData(event.currentTarget);
     try {
-      const response = await fetch(`${apiBaseUrl}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: form.get('email'),
-          password: form.get('password'),
-        }),
-      });
-      if (!response.ok) throw new Error('Invalid email or password');
+      let response: Response;
+      try {
+        response = await fetch(`${apiBaseUrl}/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: form.get('email'),
+            password: form.get('password'),
+          }),
+        });
+      } catch {
+        // The request never reached the server (offline, DNS, CORS).
+        throw new LoginFailure(loginFailureMessage(null));
+      }
+      if (!response.ok)
+        throw new LoginFailure(loginFailureMessage(response.status));
       const result = (await response.json()) as LoginResponse;
       saveStoredSession(result.accessToken, result.expiresIn);
       setRestoringToken(null);
@@ -209,12 +380,33 @@ export default function App() {
       setSelectedBranchId(result.user.branches[0]?.id ?? '');
       setSessionExpired(false);
     } catch (error: unknown) {
+      // Only our own messages are shown; an unexpected error (for example an
+      // unreadable response) gets the generic one.
       setLoginError(
-        error instanceof Error ? error.message : 'Unable to sign in',
+        error instanceof LoginFailure
+          ? error.message
+          : loginFailureMessage(500),
       );
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  // Sign out from the workspace. Signing out discards every screen's unsaved
+  // edits, so they are only discarded after an explicit confirmation.
+  function requestSignOut(accessToken: string): void {
+    if (signingOut.current) return;
+    if (UNSAVED_SOURCES.some((source) => unsavedNow.current[source])) {
+      setConfirmingSignOut(true);
+      return;
+    }
+    signOut(accessToken);
+  }
+  function signOut(accessToken: string): void {
+    if (signingOut.current) return;
+    signingOut.current = true;
+    setConfirmingSignOut(false);
+    void logout(accessToken);
   }
 
   async function logout(accessToken: string): Promise<void> {
@@ -230,23 +422,26 @@ export default function App() {
     }
   }
 
-  const statusLabel =
-    apiStatus.state === 'checking'
-      ? 'Checking API'
-      : apiStatus.state === 'online'
-        ? 'API online'
-        : 'API unavailable';
-
-  const statusChip = (
-    <span className={`status-chip status-${apiStatus.state}`} role="status">
+  // Nothing is shown while the service is reachable (or still being
+  // checked); only an outage gets a notice, in the top bar and as a short
+  // explanation above the page content.
+  const serviceUnavailable = apiStatus.state === 'offline';
+  const statusChip = serviceUnavailable ? (
+    <span className="status-chip status-offline">
       <span className="status-dot" aria-hidden="true" />
-      {statusLabel}
+      Service unavailable
     </span>
-  );
+  ) : null;
+  const serviceNotice = serviceUnavailable ? (
+    <p role="alert" className="form-message">
+      We can&apos;t reach JUC-AutoCanva right now, so some information may not
+      load or save. Check your internet connection, then refresh the page.
+    </p>
+  ) : null;
   const footer = (
     <footer className="footer">
-      <span>AdFlow infrastructure</span>
-      <span>Multi-branch operations</span>
+      <span>JUC-AutoCanva</span>
+      <span>Advertising operations for every branch</span>
     </footer>
   );
 
@@ -267,12 +462,17 @@ export default function App() {
             id="branch-context"
             aria-labelledby="branch-title"
           >
-            <p className="card-label">PERMITTED BRANCH CONTEXT</p>
+            <p className="card-label">YOUR BRANCH</p>
+            <p className="service-copy">
+              Choose the branch you are working for. Creatives, brand settings
+              and workflows on other screens follow this choice.
+            </p>
             <label htmlFor="branch-select">Select branch</label>
             <select
               id="branch-select"
+              ref={branchSelectRef}
               value={selectedBranchId}
-              onChange={(event) => setSelectedBranchId(event.target.value)}
+              onChange={(event) => chooseBranch(event.target.value)}
             >
               {session.user.branches.map((permittedBranch) => (
                 <option key={permittedBranch.id} value={permittedBranch.id}>
@@ -280,6 +480,46 @@ export default function App() {
                 </option>
               ))}
             </select>
+            {pendingBranchId && (
+              // The selector keeps showing the current branch until the
+              // switch is confirmed.
+              <div
+                className="confirm-panel"
+                role="group"
+                aria-label="Unsaved changes in Creatives"
+              >
+                <p role="alert">
+                  You have unsaved changes in Creatives. Switching to the{' '}
+                  {session.user.branches.find(
+                    (item) => item.id === pendingBranchId,
+                  )?.name ?? 'selected'}{' '}
+                  branch discards them.
+                </p>
+                <div className="template-actions">
+                  <button
+                    type="button"
+                    className="danger-button"
+                    onClick={() => {
+                      const next = pendingBranchId;
+                      setPendingBranchId('');
+                      setSelectedBranchId(next);
+                    }}
+                  >
+                    Discard changes and continue
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      setPendingBranchId('');
+                      branchSelectRef.current?.focus();
+                    }}
+                  >
+                    Keep my changes
+                  </button>
+                </div>
+              </div>
+            )}
             {branch && (
               <div className="branch-summary">
                 <h2 id="branch-title">{branch.name}</h2>
@@ -311,6 +551,7 @@ export default function App() {
             session={session}
             branch={branch}
             onUnauthorized={onUnauthorized}
+            onUnsavedChange={(dirty) => reportUnsaved('brand', dirty)}
           />
         ),
       },
@@ -326,6 +567,7 @@ export default function App() {
               setTemplateRefreshKey((current) => current + 1)
             }
             onUnauthorized={onUnauthorized}
+            onUnsavedChange={(dirty) => reportUnsaved('templates', dirty)}
           />
         ),
       },
@@ -342,12 +584,17 @@ export default function App() {
             dataChange={dataChange}
             onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
+            openRequest={
+              openRequest?.module === 'creatives' ? openRequest : null
+            }
+            onOpenResult={reportOpen}
+            onFormStateChange={reportCreativeForm}
           />
         ),
       },
       {
         id: 'canva-integration',
-        label: 'Canva mock',
+        label: 'Canva (demo)',
         icon: 'canva',
         available: permissions.some((permission) =>
           permission.startsWith('canva:'),
@@ -374,6 +621,11 @@ export default function App() {
             dataChange={dataChange}
             onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
+            onUnsavedChange={(dirty) => reportUnsaved('workflows', dirty)}
+            openRequest={
+              openRequest?.module === 'workflows' ? openRequest : null
+            }
+            onOpenResult={reportOpen}
           />
         ),
       },
@@ -390,6 +642,10 @@ export default function App() {
             dataChange={dataChange}
             onDataChanged={onDataChanged}
             onUnauthorized={onUnauthorized}
+            openRequest={
+              openRequest?.module === 'approvals' ? openRequest : null
+            }
+            onOpenResult={reportOpen}
           />
         ),
       },
@@ -398,7 +654,21 @@ export default function App() {
         label: 'Notifications',
         icon: 'notifications',
         available: true,
-        content: <NotificationsWorkspace session={session} />,
+        // The shared unread count; no badge while the count is unavailable
+        // (its last request failed). Before the first reply the count is 0,
+        // which the shell does not show.
+        badge: notifications.countError
+          ? undefined
+          : {
+              count: notifications.count,
+              description: `${notifications.count} unread`,
+            },
+        content: (
+          <NotificationsWorkspace
+            notifications={notifications}
+            navigation={recordLinks.navigation}
+          />
+        ),
       },
       {
         id: 'audit',
@@ -406,7 +676,7 @@ export default function App() {
         icon: 'audit',
         available: permissions.includes('audit:read'),
         content: permissions.includes('audit:read') && (
-          <AuditWorkspace session={session} />
+          <AuditWorkspace session={session} onUnauthorized={onUnauthorized} />
         ),
       },
       {
@@ -431,18 +701,57 @@ export default function App() {
         defaultModuleId="branch-context"
         statusChip={statusChip}
         heading={
-          <div className="app-heading workspace-greeting">
-            <div>
-              <p className="eyebrow">YOUR WORKSPACE</p>
-              <h1 id="page-title">Hello, {session.user.name}.</h1>
-              <p className="intro">{session.user.email}</p>
+          <>
+            <div className="app-heading workspace-greeting">
+              <div>
+                <p className="eyebrow">YOUR WORKSPACE</p>
+                <h1 id="page-title">Hello, {session.user.name}.</h1>
+                <p className="intro">{session.user.email}</p>
+              </div>
             </div>
-          </div>
+            {serviceNotice}
+          </>
         }
         contextLabel={branch?.name}
         userName={session.user.name}
-        onSignOut={() => void logout(session.accessToken)}
+        onSignOut={() => requestSignOut(session.accessToken)}
+        signOutConfirmation={
+          confirmingSignOut ? (
+            <div
+              className="confirm-panel"
+              role="group"
+              aria-label={'Unsaved changes in ' + unsavedList(unsavedScreens)}
+            >
+              <p role="alert">
+                You have unsaved changes in {unsavedList(unsavedScreens)}.
+                Signing out discards them.
+              </p>
+              <div className="template-actions">
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={() => signOut(session.accessToken)}
+                >
+                  Discard changes and continue
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={(event) => {
+                    returnFocusToConfirmTrigger(event.currentTarget);
+                    setConfirmingSignOut(false);
+                  }}
+                >
+                  Keep my changes
+                </button>
+              </div>
+            </div>
+          ) : null
+        }
         footer={footer}
+        onActiveModuleChange={(moduleId) =>
+          setNotificationsOpen(moduleId === 'notifications')
+        }
       />
     );
   }
@@ -450,14 +759,15 @@ export default function App() {
   return (
     <main className="page-shell">
       <header className="topbar">
-        <a className="brand" href="/" aria-label="AdFlow home">
+        <a className="brand" href="/" aria-label="JUC-AutoCanva home">
           <span className="brand-mark" aria-hidden="true">
-            A
+            J
           </span>
-          <span>adflow</span>
+          <span>JUC-AutoCanva</span>
         </a>
         {statusChip}
       </header>
+      {serviceNotice}
       {restoringToken ? (
         <section className="auth-panel" aria-labelledby="page-title">
           <p className="eyebrow">ADVERTISING OPERATIONS</p>
@@ -465,7 +775,8 @@ export default function App() {
           {restoreError ? (
             <>
               <p role="alert" className="form-message">
-                {restoreError} Your saved sign-in was kept.
+                {restoreError} Your saved sign-in has been kept, so you can try
+                again in a moment, or sign out to use a different account.
               </p>
               <div className="login-form">
                 <button

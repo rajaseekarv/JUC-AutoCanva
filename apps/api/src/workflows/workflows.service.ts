@@ -213,6 +213,20 @@ export class WorkflowsService {
     });
   }
 
+  // The people a stage can name as its reviewer: the same rule the API
+  // applies when a definition is saved (active users of the organization),
+  // returning only what is needed to tell them apart.
+  async assignableUsers(
+    user: AuthenticatedPrincipal,
+  ): Promise<{ id: string; name: string; email: string }[]> {
+    this.require(user, PERMISSIONS.WORKFLOW_MANAGE);
+    return this.prisma.user.findMany({
+      where: { organizationId: user.organizationId, status: 'ACTIVE' },
+      select: { id: true, name: true, email: true },
+      orderBy: [{ name: 'asc' }, { email: 'asc' }],
+    });
+  }
+
   async get(user: AuthenticatedPrincipal, id: string) {
     this.require(user, PERMISSIONS.WORKFLOW_READ);
     const workflow = await this.prisma.workflow.findFirst({

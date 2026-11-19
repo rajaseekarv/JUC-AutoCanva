@@ -136,15 +136,91 @@ describe('CreativeWorkspace', () => {
       '#templates',
     );
     expect(screen.getByRole('combobox', { name: 'Template' })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText('Name'), {
+    fireEvent.change(screen.getByLabelText('Name (required)'), {
       target: { value: 'Launch' },
     });
-    fireEvent.change(screen.getByLabelText('Revision summary'), {
+    fireEvent.change(screen.getByLabelText('What changed? (optional)'), {
       target: { value: 'Initial revision' },
     });
     expect(
       screen.getByRole('button', { name: 'Create creative' }),
     ).toBeDisabled();
+  });
+
+  // Phase 2A Q10: every editable field says whether it is required, and
+  // help text is shown, and announced, for every field type.
+  it('marks required and optional fields and shows help text for every type', async () => {
+    const field = (
+      id: string,
+      key: string,
+      label: string,
+      type: string,
+      required: boolean,
+    ) => ({
+      ...version.fields[0],
+      id,
+      key,
+      label,
+      type,
+      required,
+      helpText: label + ' help',
+    });
+    const helpVersion = {
+      ...version,
+      fields: [
+        field('f1', 'headline', 'Headline', 'TEXT', true),
+        field('f2', 'body', 'Body', 'MULTILINE_TEXT', false),
+        field('f3', 'photo', 'Photo', 'IMAGE', true),
+        field('f4', 'promo', 'Promo', 'BOOLEAN', false),
+      ],
+    } as unknown as typeof version;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => ({
+        ok: true,
+        status: 200,
+        json: async () =>
+          url.endsWith('/templates')
+            ? [template]
+            : url.endsWith('/templates/template-1')
+              ? { ...template, versions: [helpVersion] }
+              : [],
+      })),
+    );
+    render(
+      <CreativeWorkspace
+        session={{ accessToken: 'token', user }}
+        branch={branch}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'New creative' }),
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Template' }),
+      { target: { value: 'template-1' } },
+    );
+    fireEvent.change(
+      await screen.findByRole('combobox', { name: 'Template version' }),
+      { target: { value: 'version-1' } },
+    );
+    expect(screen.getByLabelText('Name (required)')).toBeRequired();
+    expect(screen.getByLabelText('Template (required)')).toBeRequired();
+    expect(
+      screen.getByLabelText('What changed? (optional)'),
+    ).not.toBeRequired();
+    const cases: Array<[string, string, string]> = [
+      ['textbox', 'Headline', ' (required)'],
+      ['textbox', 'Body', ' (optional)'],
+      ['combobox', 'Photo', ' (required)'],
+      ['checkbox', 'Promo', ' (optional)'],
+    ];
+    for (const [role, name, hint] of cases) {
+      const input = await screen.findByRole(role, { name });
+      expect(input.closest('label')).toHaveTextContent(name + hint);
+      expect(input).toHaveAccessibleDescription(name + ' help');
+    }
   });
 
   it('reloads eligible templates after the template manager changes them', async () => {
@@ -216,7 +292,7 @@ describe('CreativeWorkspace', () => {
       { target: { value: template.id } },
     );
     const headline = await screen.findByRole('textbox', { name: 'Headline' });
-    fireEvent.change(screen.getByLabelText('Name'), {
+    fireEvent.change(screen.getByLabelText('Name (required)'), {
       target: { value: 'Launch' },
     });
     fireEvent.change(headline, { target: { value: 'Fresh headline' } });
@@ -259,7 +335,7 @@ describe('CreativeWorkspace', () => {
     const createButton = screen.getByRole('button', {
       name: 'Create creative',
     });
-    const nameInput = screen.getByLabelText('Name');
+    const nameInput = screen.getByLabelText('Name (required)');
 
     // Missing version: a valid name alone is not enough.
     fireEvent.change(nameInput, { target: { value: 'Launch' } });
@@ -367,7 +443,7 @@ describe('CreativeWorkspace', () => {
     expect(
       screen.queryByRole('textbox', { name: 'Draft only' }),
     ).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText('Name'), {
+    fireEvent.change(screen.getByLabelText('Name (required)'), {
       target: { value: 'Launch' },
     });
     fireEvent.change(headline, { target: { value: 'Live headline' } });
@@ -433,9 +509,9 @@ describe('CreativeWorkspace', () => {
       expect.stringContaining('/creatives/creative-1'),
       expect.objectContaining({ method: 'PATCH' }),
     );
-    fireEvent.click(await screen.findByRole('button', { name: 'Inspect' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'View' }));
     await waitFor(() =>
-      expect(screen.getByText('Revision 1 · read only')).toBeInTheDocument(),
+      expect(screen.getByText('Revision 1 (view only)')).toBeInTheDocument(),
     );
     expect(screen.getByText('Original')).toBeInTheDocument();
   });
@@ -674,12 +750,12 @@ describe('CreativeWorkspace images', () => {
     ).toHaveAttribute('src', expect.stringMatching(/^blob:test\/asset-new\//));
 
     const inspectButtons = await screen.findAllByRole('button', {
-      name: 'Inspect',
+      name: 'View',
     });
     fireEvent.click(inspectButtons[1]!);
-    await screen.findByText('Revision 1 · read only');
+    await screen.findByText('Revision 1 (view only)');
     const inspection = screen
-      .getByText('Revision 1 · read only')
+      .getByText('Revision 1 (view only)')
       .closest('.creative-inspection') as HTMLElement;
     expect(
       await within(inspection).findByRole('img', {
@@ -691,7 +767,7 @@ describe('CreativeWorkspace images', () => {
     expect(within(inspection).queryByText('asset-old')).toBeNull();
 
     fireEvent.click(inspectButtons[0]!);
-    await screen.findByText('Revision 2 · read only');
+    await screen.findByText('Revision 2 (view only)');
     expect(
       await within(inspection).findByRole('img', {
         name: 'Hero image: new-hero.png',
@@ -718,7 +794,7 @@ describe('CreativeWorkspace images', () => {
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
     const inspectButtons = await screen.findAllByRole('button', {
-      name: 'Inspect',
+      name: 'View',
     });
     fireEvent.click(inspectButtons[1]!);
     expect(
@@ -748,10 +824,10 @@ describe('CreativeWorkspace images', () => {
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
     const inspectButtons = await screen.findAllByRole('button', {
-      name: 'Inspect',
+      name: 'View',
     });
     fireEvent.click(inspectButtons[1]!);
-    await screen.findByText('Revision 1 · read only');
+    await screen.findByText('Revision 1 (view only)');
     expect(
       screen.getAllByText(
         'Image selected · you do not have permission to view assets',
@@ -1103,8 +1179,9 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
         name: 'Resubmit for review',
       }),
     );
+    // The API's 404 for an offline workflow is explained (hardening fix 11).
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Enabled workflow not found',
+      /The workflow( ".*")? used for the last review is offline, so the creative can't be resubmitted with it right now. A workflow manager needs to enable it again in Workflows; then use Resubmit for review./,
     );
     expect(requests[0]!.status).toBe('OPEN');
     expect(await banner()).toBeInTheDocument();
@@ -1230,7 +1307,7 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
       const { fetchMock, requests, onDataChanged } =
         await openWithRequestOnCurrent();
       expect(await banner()).toHaveTextContent(
-        'Save and resubmit for review in the form below does both in one step.',
+        'Save and resubmit for review, at the end of this form, does both in one step.',
       );
       fireEvent.click(oneClick()!);
       expect(await screen.findByRole('status')).toHaveTextContent(
@@ -1257,6 +1334,39 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
           screen.queryByRole('region', { name: 'Open change requests' }),
         ).not.toBeInTheDocument(),
       );
+    });
+
+    // Phase 2A Q2: the request sits at the top of the edit form, so "at
+    // the end of this form" is true on every layout.
+    it('shows the change request at the top of the edit form, before the fields', async () => {
+      await openWithRequestOnCurrent();
+      const region = await banner();
+      const form = region.closest('form');
+      expect(form).not.toBeNull();
+      const name = within(form!).getByLabelText('Name (required)');
+      const oneClickButton = within(form!).getByRole('button', {
+        name: 'Save and resubmit for review',
+      });
+      expect(
+        region.compareDocumentPosition(name) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        region.compareDocumentPosition(oneClickButton) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it('still shows the change request, outside any form, without creatives:update', async () => {
+      serveReview({ current: revision });
+      await openCreative({
+        ...submitter,
+        permissions: submitter.permissions.filter(
+          (permission) => permission !== 'creatives:update',
+        ),
+      });
+      const region = await banner();
+      expect(region.closest('form')).toBeNull();
+      expect(screen.queryByRole('textbox', { name: 'Headline' })).toBeNull();
     });
 
     it('says where the run waits when the workflow starts at a non-review stage', async () => {
@@ -1290,7 +1400,7 @@ describe('CreativeWorkspace review feedback and resubmission', () => {
       });
       fireEvent.click(oneClick()!);
       expect(await screen.findByRole('alert')).toHaveTextContent(
-        'Revision 2 was saved, but it could not be resubmitted: Enabled workflow not found Use Resubmit for review to try again.',
+        /^Revision 2 was saved, but it could not be resubmitted. The workflow( ".*")? used for the last review is offline/,
       );
       expect(writes(fetchMock).map((write) => write.method)).toEqual([
         'PATCH',
@@ -1659,7 +1769,7 @@ describe('CreativeWorkspace edit lock during a running workflow', () => {
     fireEvent.change(await screen.findByRole('textbox', { name: 'Headline' }), {
       target: { value: 'Fresh' },
     });
-    fireEvent.change(screen.getByLabelText('Name'), {
+    fireEvent.change(screen.getByLabelText('Name (required)'), {
       target: { value: 'Second' },
     });
     const create = screen.getByRole('button', { name: 'Create creative' });

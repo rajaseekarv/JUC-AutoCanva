@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import App from './App';
 import { SESSION_STORAGE_KEY } from './authStorage';
@@ -40,20 +41,53 @@ const loginResponse = {
   },
 };
 
-describe('AdFlow Sprint 1 application shell', () => {
+describe('JUC-AutoCanva application shell', () => {
   beforeEach(() => localStorage.clear());
 
-  it('continues to show API availability', async () => {
+  // Phase 2A Q14: a reachable service shows nothing; only an outage is
+  // explained.
+  it('shows no service status while the service is reachable', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({ ok: true, json: async () => healthResponse }),
     );
     render(<App />);
-    expect(await screen.findByRole('status')).toHaveTextContent('API online');
-    expect(fetch).toHaveBeenCalledWith(
-      'http://localhost:3000/api/v1/health',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        'http://localhost:3000/api/v1/health',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
     );
+    await act(async () => undefined);
+    expect(screen.queryByText(/API online/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Service unavailable')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('link', { name: 'JUC-AutoCanva home' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('contentinfo')).toHaveTextContent('JUC-AutoCanva');
+    expect(screen.getByRole('contentinfo')).not.toHaveTextContent(
+      'infrastructure',
+    );
+  });
+
+  it.each([
+    [
+      'the health check fails',
+      () => Promise.resolve({ ok: false, status: 503 }),
+    ],
+    [
+      'the network is down',
+      () => Promise.reject(new TypeError('Failed to fetch')),
+    ],
+  ])('explains an unavailable service when %s', async (_label, health) => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(health));
+    render(<App />);
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "We can't reach JUC-AutoCanva right now, so some information may not load or save. Check your internet connection, then refresh the page.",
+    );
+    expect(screen.getByText('Service unavailable')).toBeInTheDocument();
+    expect(screen.queryByText(/Failed to fetch|HTTP 503/)).toBeNull();
   });
 
   it('logs in and shows the current identity and permitted branch context', async () => {
@@ -102,12 +136,12 @@ describe('AdFlow Sprint 1 application shell', () => {
       'href',
       '#creatives',
     );
-    expect(screen.getByRole('link', { name: 'Canva mock' })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: 'Canva (demo)' })).toHaveAttribute(
       'href',
       '#canva-integration',
     );
     expect(
-      screen.queryByText('ORGANIZATION ADMINISTRATION'),
+      screen.queryByRole('heading', { name: 'Organization & branches' }),
     ).not.toBeInTheDocument();
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -124,11 +158,58 @@ describe('AdFlow Sprint 1 application shell', () => {
     );
   });
 
-  it('shows a generic login error when credentials are rejected', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => healthResponse })
-      .mockResolvedValueOnce({ ok: false, status: 401 });
+  // Phase 2A Q3: only a rejected email or password says so; server, rate
+  // limit and network failures say what happened, and the browser's own
+  // error text is never shown.
+  it.each([
+    [
+      'rejected credentials (401)',
+      () => Promise.resolve({ ok: false, status: 401 }),
+      'The email or password is incorrect.',
+    ],
+    [
+      'a malformed request (400)',
+      () => Promise.resolve({ ok: false, status: 400 }),
+      'Enter a valid email address and password.',
+    ],
+    [
+      'rate limiting (429)',
+      () => Promise.resolve({ ok: false, status: 429 }),
+      'Too many sign-in attempts. Wait a few minutes, then try again.',
+    ],
+    [
+      'a server error (500)',
+      () => Promise.resolve({ ok: false, status: 500 }),
+      "We couldn't sign you in right now. Please try again in a moment.",
+    ],
+    [
+      'an unavailable server (503)',
+      () => Promise.resolve({ ok: false, status: 503 }),
+      "We couldn't sign you in right now. Please try again in a moment.",
+    ],
+    [
+      'a network failure',
+      () => Promise.reject(new TypeError('Failed to fetch')),
+      "We couldn't reach JUC-AutoCanva. Check your internet connection and try again.",
+    ],
+    [
+      'an unreadable success response',
+      () =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new SyntaxError('Unexpected end of JSON input');
+          },
+        }),
+      "We couldn't sign you in right now. Please try again in a moment.",
+    ],
+  ])('explains %s at sign-in', async (_label, loginReply, expected) => {
+    const fetchMock = vi.fn(async (input: string) =>
+      input.endsWith('/health')
+        ? { ok: true, json: async () => healthResponse }
+        : loginReply(),
+    );
     vi.stubGlobal('fetch', fetchMock);
     render(<App />);
     fireEvent.change(screen.getByLabelText('Email'), {
@@ -138,10 +219,11 @@ describe('AdFlow Sprint 1 application shell', () => {
       target: { value: 'bad-password' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Invalid email or password',
-    );
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(expected);
+    expect(alert).not.toHaveTextContent(/Failed to fetch|Unexpected end/);
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeEnabled();
   });
 });
 
@@ -356,15 +438,24 @@ describe('session persistence across reloads and tabs', () => {
     mockApi({ '/auth/me': meHandler });
     render(<App />);
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Unable to restore your session (HTTP 503). Your saved sign-in was kept.',
+      "JUC-AutoCanva isn't responding right now, so we couldn't confirm your sign-in. Your saved sign-in has been kept, so you can try again in a moment, or sign out to use a different account.",
     );
-    expect(screen.getByRole('alert')).not.toHaveTextContent('saved-token');
+    // No status codes, API wording or token in the message.
+    expect(screen.getByRole('alert')).not.toHaveTextContent(
+      /saved-token|HTTP|503|API/,
+    );
+    expect(
+      screen.getByRole('button', { name: 'Sign out' }),
+    ).toBeInTheDocument();
     expect(storedSession()).toMatchObject({ accessToken: 'saved-token' });
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Unable to reach the API to restore your session.',
+      "We couldn't reach JUC-AutoCanva to confirm your sign-in. Check your internet connection.",
+    );
+    expect(screen.getByRole('alert')).not.toHaveTextContent(
+      /Failed to fetch|API/,
     );
     expect(storedSession()).toMatchObject({ accessToken: 'saved-token' });
 
@@ -424,6 +515,192 @@ describe('session persistence across reloads and tabs', () => {
     render(<App />);
     expect(await screen.findByLabelText('Password')).toBeInTheDocument();
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+  });
+
+  // Phase 2B step 2: the app owns the notification state.
+  it('clears the saved session when the unread count returns 401', async () => {
+    saveSession('saved-token');
+    mockApi({
+      '/auth/me': meOk,
+      '/notifications/unread-count': () => ({ ok: false, status: 401 }),
+    });
+    render(<App />);
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
+    expect(
+      screen.getByText('Your session expired. Please sign in again.'),
+    ).toBeInTheDocument();
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+  });
+
+  it('loads the unread count on sign-in, and the list only when Notifications opens', async () => {
+    saveSession('saved-token');
+    window.location.hash = '';
+    const fetchMock = mockApi({ '/auth/me': meOk });
+    render(<App />);
+    await screen.findByText('Hello, Server Admin.');
+    await waitFor(() =>
+      expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(1),
+    );
+    expect(callsTo(fetchMock, '/notifications')).toHaveLength(0);
+    try {
+      act(() => {
+        window.location.hash = '#notifications';
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      });
+      await waitFor(() =>
+        expect(callsTo(fetchMock, '/notifications')).toHaveLength(1),
+      );
+      expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(2);
+      expect(
+        await screen.findByText('No unread notifications'),
+      ).toBeInTheDocument();
+    } finally {
+      window.location.hash = '';
+    }
+  });
+
+  // Phase 2B step 3: the Notifications nav item shows the shared count.
+  describe('Notifications navigation badge', () => {
+    const modulesNav = () =>
+      screen.getByRole('navigation', { name: 'Workspace modules' });
+    const findNav = () =>
+      screen.findByRole('navigation', { name: 'Workspace modules' });
+    const countReply =
+      (count: number): RouteHandler =>
+      () => ({ ok: true, json: async () => ({ count }) });
+
+    it('shows the unread count from the shared notification state', async () => {
+      saveSession('saved-token');
+      const fetchMock = mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': countReply(5),
+      });
+      render(<App />);
+      const link = await within(await findNav()).findByRole('link', {
+        name: 'Notifications, 5 unread',
+      });
+      expect(link).toHaveAttribute('href', '#notifications');
+      expect(link.querySelector('.nav-badge')).toHaveTextContent(/^5$/);
+      expect(link.querySelector('.nav-badge')).toHaveAttribute(
+        'aria-hidden',
+        'true',
+      );
+      // The badge reuses the count request; nothing else is fetched for it.
+      expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(1);
+      expect(callsTo(fetchMock, '/notifications')).toHaveLength(0);
+      // Other modules are unchanged.
+      expect(
+        within(modulesNav()).getByRole('link', { name: 'Branch' }),
+      ).not.toHaveAttribute('aria-label');
+    });
+
+    it('names one unread notification and caps large counts at 99+', async () => {
+      saveSession('saved-token');
+      mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': countReply(1),
+      });
+      render(<App />);
+      expect(
+        await within(await findNav()).findByRole('link', {
+          name: 'Notifications, 1 unread',
+        }),
+      ).toBeInTheDocument();
+      cleanup();
+      mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': countReply(250),
+      });
+      render(<App />);
+      const link = await within(await findNav()).findByRole('link', {
+        name: 'Notifications, 250 unread',
+      });
+      expect(link.querySelector('.nav-badge')).toHaveTextContent(/^99\+$/);
+    });
+
+    it('shows no badge for zero unread', async () => {
+      saveSession('saved-token');
+      const fetchMock = mockApi({ '/auth/me': meOk });
+      render(<App />);
+      await screen.findByText('Hello, Server Admin.');
+      await waitFor(() =>
+        expect(callsTo(fetchMock, '/notifications/unread-count')).toHaveLength(
+          1,
+        ),
+      );
+      const link = within(modulesNav()).getByRole('link', {
+        name: 'Notifications',
+      });
+      expect(link.querySelector('.nav-badge')).toBeNull();
+    });
+
+    it('shows no badge before the count loads or while it is unavailable', async () => {
+      saveSession('saved-token');
+      let reply: (response: MockResponse) => void = () => undefined;
+      mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': () =>
+          new Promise<MockResponse>((resolve) => {
+            reply = resolve;
+          }),
+      });
+      render(<App />);
+      await screen.findByText('Hello, Server Admin.');
+      // Not loaded yet.
+      expect(modulesNav().querySelector('.nav-badge')).toBeNull();
+      // Unavailable: the count request failed.
+      await act(async () => {
+        reply({ ok: false, status: 500, json: async () => ({}) });
+      });
+      expect(modulesNav().querySelector('.nav-badge')).toBeNull();
+      expect(
+        within(modulesNav()).getByRole('link', { name: 'Notifications' }),
+      ).not.toHaveAttribute('aria-label');
+    });
+
+    it('hides a loaded count once a refresh fails, and shows it again on recovery', async () => {
+      saveSession('saved-token');
+      let countResponse: MockResponse = {
+        ok: true,
+        json: async () => ({ count: 5 }),
+      };
+      const fetchMock = mockApi({
+        '/auth/me': meOk,
+        '/notifications/unread-count': () => countResponse,
+      });
+      render(<App />);
+      await within(await findNav()).findByRole('link', {
+        name: 'Notifications, 5 unread',
+      });
+      // Returning to the tab refreshes the count through the shared hook.
+      const refresh = async () => {
+        const before = callsTo(fetchMock, '/notifications/unread-count').length;
+        act(() => {
+          document.dispatchEvent(new Event('visibilitychange'));
+        });
+        await waitFor(() =>
+          expect(
+            callsTo(fetchMock, '/notifications/unread-count'),
+          ).toHaveLength(before + 1),
+        );
+      };
+      countResponse = { ok: false, status: 500, json: async () => ({}) };
+      await refresh();
+      // The last known count (5) is kept by the hook but not shown as current.
+      await waitFor(() =>
+        expect(modulesNav().querySelector('.nav-badge')).toBeNull(),
+      );
+      expect(
+        within(modulesNav()).getByRole('link', { name: 'Notifications' }),
+      ).not.toHaveAttribute('aria-label');
+      countResponse = { ok: true, json: async () => ({ count: 2 }) };
+      await refresh();
+      expect(
+        await within(modulesNav()).findByRole('link', {
+          name: 'Notifications, 2 unread',
+        }),
+      ).toBeInTheDocument();
+    });
   });
 
   it('validates a sign-in from another tab through /auth/me before restoring it', async () => {

@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import type {
   AuthenticatedUserResponse,
   TemplateResponse,
@@ -308,6 +315,406 @@ describe('TemplateManager', () => {
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole('heading', { name: 'Add field' }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+// Phase 2A: confirmations, readable labels and visible lifecycle help.
+describe('TemplateManager Phase 2A', () => {
+  const headline = {
+    id: 'field-1',
+    key: 'headline',
+    label: 'Headline',
+    type: 'TEXT',
+    required: true,
+    displayOrder: 0,
+    defaultValue: null,
+    helpText: null,
+    dataSource: 'EFFECTIVE_BRAND',
+    sourceKey: 'displayName',
+    validationRules: null,
+  } as unknown as NonNullable<
+    TemplateResponse['currentVersion']
+  >['fields'][number];
+  const draftVersion = { ...template.currentVersion!, fields: [headline] };
+  const draft: TemplateResponse = {
+    ...template,
+    currentVersion: draftVersion,
+    versions: [draftVersion],
+  };
+  const frozen = {
+    ...template.currentVersion!,
+    immutableAt: '2026-01-02T00:00:00Z',
+  };
+  const active: TemplateResponse = {
+    ...template,
+    status: 'ACTIVE',
+    activeVersionNumber: 1,
+    currentVersion: frozen,
+    versions: [frozen],
+  };
+
+  function serve(initial: TemplateResponse) {
+    let current = initial;
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/archive') && init?.method === 'POST') {
+        current = { ...current, status: 'ARCHIVED' };
+        return { ok: true, status: 200, json: async () => current };
+      }
+      if (url.endsWith('/fields/field-1') && init?.method === 'DELETE') {
+        const emptied = { ...draftVersion, fields: [] };
+        current = { ...current, currentVersion: emptied, versions: [emptied] };
+        return { ok: true, status: 204, json: async () => undefined };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          url.endsWith('/templates/template-1') ? current : [current],
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+  const calls = (fetchMock: ReturnType<typeof serve>, suffix: string) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).endsWith(suffix));
+
+  async function open() {
+    render(
+      <TemplateManager
+        session={{ accessToken: 'token', user }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    await screen.findByRole('option', { name: /Spring post/ });
+    fireEvent.change(
+      screen.getByRole('combobox', { name: 'Choose template' }),
+      { target: { value: 'template-1' } },
+    );
+    await screen.findByRole('heading', { name: 'Spring post' });
+  }
+
+  it('archives a template only after confirming that it cannot be undone', async () => {
+    const fetchMock = serve(active);
+    await open();
+    fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    const group = screen.getByRole('group', {
+      name: 'Confirm archiving Spring post',
+    });
+    expect(group).toHaveTextContent(
+      'Archive “Spring post”? This cannot be undone. The template can no longer be edited, activated or chosen for new creatives. Creatives already made from it keep their saved revisions.',
+    );
+    fireEvent.click(
+      within(group).getByRole('button', { name: 'Keep template' }),
+    );
+    expect(
+      screen.queryByRole('group', { name: /Confirm archiving/ }),
+    ).not.toBeInTheDocument();
+    expect(calls(fetchMock, '/archive')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: 'Archive' })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    fireEvent.click(
+      within(
+        screen.getByRole('group', { name: /Confirm archiving/ }),
+      ).getByRole('button', { name: 'Archive template' }),
+    );
+    // Q1: success uses the success style, not the error style.
+    expect(await screen.findByText('Template archived.')).toHaveClass(
+      'success-message',
+    );
+    expect(calls(fetchMock, '/archive')).toHaveLength(1);
+    expect(
+      screen.queryByRole('group', { name: /Confirm archiving/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('removes a draft field only after confirmation', async () => {
+    const fetchMock = serve(draft);
+    await open();
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Remove Headline' }),
+    );
+    const group = screen.getByRole('group', {
+      name: 'Confirm removing Headline',
+    });
+    expect(group).toHaveTextContent(
+      'Remove the “Headline” field from draft version 1? Creatives made from earlier, activated versions are not affected.',
+    );
+    fireEvent.click(within(group).getByRole('button', { name: 'Keep field' }));
+    expect(calls(fetchMock, '/fields/field-1')).toHaveLength(0);
+    expect(
+      screen.getByRole('button', { name: 'Remove Headline' }),
+    ).toHaveFocus();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove Headline' }));
+    fireEvent.click(
+      within(
+        screen.getByRole('group', { name: 'Confirm removing Headline' }),
+      ).getByRole('button', { name: 'Remove field' }),
+    );
+    expect(await screen.findByText('Field removed.')).toHaveClass(
+      'success-message',
+    );
+    expect(calls(fetchMock, '/fields/field-1')).toHaveLength(1);
+  });
+
+  it('shows readable field types and units while sending the API codes', async () => {
+    serve(draft);
+    await open();
+    // The field summary uses words; the key stays visible for admins.
+    expect(
+      screen.getByText(
+        /Short text · required · filled from Effective brand \(displayName\)/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText('headline')).toBeInTheDocument();
+    expect(
+      screen.getByText(/spring-post · Square · 1080 × 1080 px/),
+    ).toBeInTheDocument();
+    const addField = screen
+      .getByRole('heading', { name: 'Add field' })
+      .closest('form')!;
+    const typeSelect = within(addField).getByLabelText('Type');
+    expect(
+      within(typeSelect).getByRole('option', { name: 'Paragraph' }),
+    ).toHaveValue('MULTILINE_TEXT');
+    expect(
+      within(typeSelect).getByRole('option', { name: 'Yes / no' }),
+    ).toHaveValue('BOOLEAN');
+    expect(
+      within(typeSelect).queryByRole('option', { name: 'MULTILINE_TEXT' }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'New template' }));
+    const unit = screen.getByLabelText('Unit');
+    expect(
+      within(unit).getByRole('option', { name: 'Pixels (px)' }),
+    ).toHaveValue('PX');
+    expect(
+      within(unit).getByRole('option', { name: 'Inches (in)' }),
+    ).toHaveValue('IN');
+  });
+
+  it('explains Activate and New draft in visible text linked to the buttons', async () => {
+    serve(draft);
+    await open();
+    const activate = screen.getByRole('button', {
+      name: 'Activate draft version',
+    });
+    const newDraft = screen.getByRole('button', {
+      name: 'Create new draft version',
+    });
+    expect(activate).not.toHaveAttribute('title');
+    expect(newDraft).not.toHaveAttribute('title');
+    expect(
+      screen.getByText(/locks draft version 1 so it can no longer be edited/),
+    ).toBeVisible();
+    expect(activate).toHaveAccessibleDescription(
+      /Activate draft version: locks draft version 1/,
+    );
+    expect(newDraft).toHaveAccessibleDescription(
+      /Create new draft version: a draft version is already in progress; activate it first\./,
+    );
+  });
+});
+
+// Phase 2A polish: activating a draft version is confirmed first.
+describe('TemplateManager activation confirmation', () => {
+  it('explains activation and activates only after confirmation', async () => {
+    const frozenV1 = {
+      ...template.currentVersion!,
+      immutableAt: '2026-01-02T00:00:00Z',
+    };
+    const draftV2 = {
+      ...frozenV1,
+      id: 'version-2',
+      versionNumber: 2,
+      immutableAt: null,
+    };
+    let current: TemplateResponse = {
+      ...template,
+      status: 'ACTIVE',
+      activeVersionNumber: 1,
+      currentVersionNumber: 2,
+      currentVersion: draftV2,
+      versions: [draftV2, frozenV1],
+    };
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/activate') && init?.method === 'POST') {
+        const frozenV2 = { ...draftV2, immutableAt: '2026-01-03T00:00:00Z' };
+        current = {
+          ...current,
+          activeVersionNumber: 2,
+          currentVersion: frozenV2,
+          versions: [frozenV2, frozenV1],
+        };
+        return { ok: true, status: 200, json: async () => current };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          url.endsWith('/templates/template-1') ? current : [current],
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const activateCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/activate'));
+    render(
+      <TemplateManager
+        session={{ accessToken: 'token', user }}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    await screen.findByRole('option', { name: /Spring post/ });
+    fireEvent.change(
+      screen.getByRole('combobox', { name: 'Choose template' }),
+      { target: { value: 'template-1' } },
+    );
+    const activate = await screen.findByRole('button', {
+      name: 'Activate draft version',
+    });
+    fireEvent.click(activate);
+    expect(activate).toHaveAttribute('aria-expanded', 'true');
+    const group = screen.getByRole('group', {
+      name: 'Confirm activating version 2',
+    });
+    expect(group).toHaveTextContent(
+      'Activate draft version 2 of “Spring post”? The version is locked for good and can no longer be edited (to make later changes, create a new draft version), and new creatives will use it. Version 1 will no longer be offered for new creatives. Creatives already made keep their saved revisions.',
+    );
+    expect(activateCalls()).toHaveLength(0);
+
+    fireEvent.click(
+      within(group).getByRole('button', { name: 'Keep current version' }),
+    );
+    // Keep returns focus to the button that opened the confirmation.
+    expect(activate).toHaveFocus();
+    expect(
+      screen.queryByRole('group', { name: /Confirm activating/ }),
+    ).not.toBeInTheDocument();
+    expect(activateCalls()).toHaveLength(0);
+
+    fireEvent.click(activate);
+    const confirmActivate = within(
+      screen.getByRole('group', { name: 'Confirm activating version 2' }),
+    ).getByRole('button', { name: 'Activate version 2' });
+    // A real click focuses the button; it disappears with the confirmation.
+    confirmActivate.focus();
+    fireEvent.click(confirmActivate);
+    expect(await screen.findByText('Template version activated.')).toHaveClass(
+      'success-message',
+    );
+    expect(activateCalls()).toHaveLength(1);
+    // The confirm button is gone, so the result takes focus.
+    await waitFor(() =>
+      expect(screen.getByText('Template version activated.')).toHaveFocus(),
+    );
+    expect(
+      screen.queryByRole('group', { name: /Confirm activating/ }),
+    ).not.toBeInTheDocument();
+    expect(activate).toBeDisabled();
+  });
+});
+
+describe('TemplateManager activation when a request fails', () => {
+  const frozenV1 = {
+    ...template.currentVersion!,
+    immutableAt: '2026-01-02T00:00:00Z',
+  };
+  const draftV2 = {
+    ...frozenV1,
+    id: 'version-2',
+    versionNumber: 2,
+    immutableAt: null,
+  };
+  const withDraft: TemplateResponse = {
+    ...template,
+    status: 'ACTIVE',
+    activeVersionNumber: 1,
+    currentVersionNumber: 2,
+    currentVersion: draftV2,
+    versions: [draftV2, frozenV1],
+  };
+  function serve(failure: 'activate' | 'reload') {
+    let activated = false;
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/activate') && init?.method === 'POST') {
+        if (failure === 'activate')
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({ message: 'There is no draft to activate' }),
+          };
+        activated = true;
+        return { ok: true, status: 200, json: async () => withDraft };
+      }
+      // Once the activation went through, reloading the templates fails.
+      if (activated && failure === 'reload')
+        return { ok: false, status: 503, json: async () => ({}) };
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          url.endsWith('/templates/template-1') ? withDraft : [withDraft],
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+  async function confirmActivation(onTemplatesChanged = vi.fn()) {
+    render(
+      <TemplateManager
+        session={{ accessToken: 'token', user }}
+        onTemplatesChanged={onTemplatesChanged}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+    await screen.findByRole('option', { name: /Spring post/ });
+    fireEvent.change(
+      screen.getByRole('combobox', { name: 'Choose template' }),
+      { target: { value: 'template-1' } },
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Activate draft version' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Activate version 2' }));
+  }
+  const activateCalls = (fetchMock: ReturnType<typeof serve>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/activate'));
+
+  it('closes the confirmation and says the screen may be out of date when only the reload fails', async () => {
+    const fetchMock = serve('reload');
+    const onTemplatesChanged = vi.fn();
+    await confirmActivation(onTemplatesChanged);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      "Template version activated. However, the latest template details couldn't be loaded, so this screen may be out of date. Reload the page before making more changes.",
+    );
+    // The activation is not offered again from the open confirmation, and
+    // it is not retried.
+    expect(
+      screen.queryByRole('group', { name: /Confirm activating/ }),
+    ).not.toBeInTheDocument();
+    expect(activateCalls(fetchMock)).toHaveLength(1);
+    // Other screens still learn that templates changed.
+    expect(onTemplatesChanged).toHaveBeenCalled();
+  });
+
+  it('keeps the confirmation open with the reason when activation fails', async () => {
+    const fetchMock = serve('activate');
+    const onTemplatesChanged = vi.fn();
+    await confirmActivation(onTemplatesChanged);
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'There is no draft to activate',
+    );
+    expect(
+      screen.getByRole('group', { name: 'Confirm activating version 2' }),
+    ).toBeInTheDocument();
+    expect(activateCalls(fetchMock)).toHaveLength(1);
+    expect(onTemplatesChanged).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText('Template version activated.'),
     ).not.toBeInTheDocument();
   });
 });
